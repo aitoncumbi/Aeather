@@ -8,7 +8,7 @@ pub fn init_logger() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt()
+    let result = tracing_subscriber::fmt()
         .with_writer(std::io::stdout.and(file_appender))
         .with_env_filter(env_filter)
         .with_target(true)
@@ -17,6 +17,10 @@ pub fn init_logger() {
         .with_line_number(true)
         // .json()
         .compact()
-        .init();
+        .try_init();
 
+    if let Err(e) = result {
+        // Use println! here since tracing might not be set up yet
+        println!("Warning: Logger already initialized: {}", e);
+    }
 }

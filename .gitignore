@@ -440,6 +440,8 @@ docs/_book
 # TODO: where does this rule come from?
 test/
 
+dev/
+
 ### Vuejs ###
 # Recommended template: Node.gitignore
 
