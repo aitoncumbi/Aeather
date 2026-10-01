@@ -6,8 +6,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use axum::body::{Body, HttpBody};
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderName, HeaderValue};
+use axum::http::{HeaderName, HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use tracing::{Instrument, info, info_span};
@@ -68,6 +69,9 @@ pub async fn observe(State(observer): State<Observer>, mut request: Request, nex
     if let Ok(value) = HeaderValue::from_str(&id) {
         response.headers_mut().insert(observer.id_header.clone(), value);
     }
+    if observer.api == "s3" && (response.status().is_client_error() || response.status().is_server_error()) {
+        response = add_request_id_to_error(response, &id).await;
+    }
     let Facts { operation, access_key } = facts.take();
     let operation = operation.unwrap_or_else(|| default_operation(observer.api, &path, method.as_str()));
     let status = response.status().as_u16();
@@ -89,6 +93,32 @@ pub async fn observe(State(observer): State<Observer>, mut request: Request, nex
         );
     }
     response
+}
+
+/// S3 error documents carry the request id too (`<RequestId>`), which is what
+/// SDKs show in error messages. Errors come from s3s as well as from
+/// handlers, so the id is added here, to the small, fully buffered XML body.
+async fn add_request_id_to_error(response: Response, id: &str) -> Response {
+    const MAX_ERROR_BODY: u64 = 64 * 1024;
+    let is_xml =
+        response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|v| v.contains("xml"));
+    let small = response.body().size_hint().exact().is_some_and(|n| n > 0 && n <= MAX_ERROR_BODY);
+    if !is_xml || !small {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_ERROR_BODY as usize).await else {
+        return Response::from_parts(parts, Body::empty());
+    };
+    let body = match std::str::from_utf8(&bytes) {
+        Ok(xml) if !xml.contains("<RequestId>") && xml.trim_end().ends_with("</Error>") => {
+            let end = xml.rfind("</Error>").expect("checked above");
+            format!("{}<RequestId>{id}</RequestId>{}", &xml[..end], &xml[end..]).into_bytes().into()
+        }
+        _ => bytes,
+    };
+    parts.headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body.len()));
+    Response::from_parts(parts, Body::from(body))
 }
 
 /// Label for requests that never reached an S3 operation (health checks,

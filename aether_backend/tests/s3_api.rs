@@ -287,6 +287,49 @@ async fn conditional_requests() {
     let err = c.get_object().bucket("bkt").key("k").if_match(&etag).send().await.unwrap_err();
     assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(412));
     c.get_object().bucket("bkt").key("k").if_match(current_etag).send().await.unwrap();
+    // A 304 repeats the validators.
+    let headers = err_headers(c.get_object().bucket("bkt").key("k").if_none_match(current_etag).send().await);
+    assert_eq!(headers.get("etag").map(String::as_str), Some(current_etag));
+    assert!(headers.contains_key("last-modified"));
+
+    // If-None-Match: <etag> writes unless the key holds that object.
+    let put_v3 = |cond: &str| {
+        c.put_object().bucket("bkt").key("k").if_none_match(cond).body(ByteStream::from_static(b"v3")).send()
+    };
+    assert_eq!(put_v3(current_etag).await.unwrap_err().code(), Some("PreconditionFailed"));
+    put_v3("\"other\"").await.unwrap();
+    // If-Match: * writes only over an existing object.
+    let put_star = |key: &'static str| {
+        c.put_object().bucket("bkt").key(key).if_match("*").body(ByteStream::from_static(b"v4")).send()
+    };
+    put_star("k").await.unwrap();
+    assert_eq!(put_star("absent").await.unwrap_err().code(), Some("NoSuchKey"));
+
+    // Conditional deletes; a missing key is deleted whatever the condition.
+    let latest = c.head_object().bucket("bkt").key("k").send().await.unwrap();
+    let err = c.delete_object().bucket("bkt").key("k").if_match("\"other\"").send().await.unwrap_err();
+    assert_eq!(err.code(), Some("PreconditionFailed"));
+    let err = c.delete_object().bucket("bkt").key("k").if_match_size(99).send().await.unwrap_err();
+    assert_eq!(err.code(), Some("PreconditionFailed"));
+    c.delete_object()
+        .bucket("bkt")
+        .key("k")
+        .if_match(latest.e_tag().unwrap())
+        .if_match_size(2)
+        .if_match_last_modified_time(*latest.last_modified().unwrap())
+        .send()
+        .await
+        .unwrap();
+    c.delete_object().bucket("bkt").key("k").if_match("\"other\"").send().await.unwrap();
+}
+
+/// Response headers of a request that failed with an HTTP error.
+fn err_headers<T, E: std::fmt::Debug>(
+    result: Result<T, aws_sdk_s3::error::SdkError<E>>,
+) -> std::collections::HashMap<String, String> {
+    let Err(err) = result else { panic!("the request succeeded") };
+    let response = err.raw_response().expect("an HTTP response");
+    response.headers().iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect()
 }
 
 #[tokio::test]
@@ -339,6 +382,13 @@ async fn listing_with_pagination_and_delimiter() {
         marker = page.next_marker().map(str::to_owned);
     }
     assert_eq!(seen, ["a.txt", "dir/", "other/", "z y+z.txt"]);
+
+    let v1 = c.list_objects().bucket("bkt").delimiter("").send().await.unwrap();
+    assert_eq!(v1.marker(), Some(""), "v1 always returns Marker");
+    assert_eq!(v1.delimiter(), None, "an empty delimiter is not echoed");
+    assert_eq!(v1.contents().len(), 6);
+    let none = c.list_objects_v2().bucket("bkt").max_keys(0).send().await.unwrap();
+    assert_eq!((none.key_count(), none.is_truncated()), (Some(0), Some(false)));
 }
 
 #[tokio::test]
@@ -357,6 +407,43 @@ async fn batch_delete() {
 
     let left = c.list_objects_v2().bucket("bkt").send().await.unwrap();
     assert_eq!(left.contents().iter().map(|o| o.key().unwrap()).collect::<Vec<_>>(), ["c"]);
+
+    // Per-key conditions: a mismatch is reported for that key only.
+    for key in ["d", "e"] {
+        c.put_object().bucket("bkt").key(key).body(ByteStream::from_static(b"x")).send().await.unwrap();
+    }
+    let ids = [
+        ObjectIdentifier::builder().key("c").e_tag("\"wrong\"").build().unwrap(),
+        ObjectIdentifier::builder().key("d").e_tag(format!("\"{}\"", md5_hex(b"x"))).build().unwrap(),
+        ObjectIdentifier::builder().key("e").size(1).build().unwrap(),
+    ];
+    let delete = Delete::builder().set_objects(Some(ids.to_vec())).build().unwrap();
+    let out = c.delete_objects().bucket("bkt").delete(delete).send().await.unwrap();
+    let deleted: Vec<_> = out.deleted().iter().map(|d| d.key().unwrap()).collect();
+    assert_eq!(deleted, ["d", "e"]);
+    assert_eq!(out.errors().len(), 1);
+    assert_eq!((out.errors()[0].key(), out.errors()[0].code()), (Some("c"), Some("PreconditionFailed")));
+}
+
+#[tokio::test]
+async fn list_buckets_in_pages() {
+    let s = start().await;
+    let c = &s.client;
+    for name in ["b-one", "b-two", "b-three", "other"] {
+        c.create_bucket().bucket(name).send().await.unwrap();
+    }
+    let mut names = Vec::new();
+    let mut token = None;
+    loop {
+        let page = c.list_buckets().max_buckets(2).prefix("b-").set_continuation_token(token).send().await.unwrap();
+        names.extend(page.buckets().iter().map(|b| b.name().unwrap().to_owned()));
+        token = page.continuation_token().map(str::to_owned);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(names, ["b-one", "b-three", "b-two"]);
+    assert_eq!(c.list_buckets().send().await.unwrap().buckets().len(), 4);
 }
 
 #[tokio::test]
@@ -640,6 +727,41 @@ async fn multipart_errors() {
 }
 
 #[tokio::test]
+async fn retried_completion_succeeds() {
+    let s = start().await;
+    let c = &s.client;
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let upload_id =
+        c.create_multipart_upload().bucket("bkt").key("k").send().await.unwrap().upload_id().unwrap().to_owned();
+    let part = c
+        .upload_part()
+        .bucket("bkt")
+        .key("k")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"only part"))
+        .send()
+        .await
+        .unwrap();
+    let complete = || {
+        c.complete_multipart_upload()
+            .bucket("bkt")
+            .key("k")
+            .upload_id(&upload_id)
+            .multipart_upload(completed(&[(1, part.e_tag().unwrap().to_owned())]))
+            .send()
+    };
+    let first = complete().await.unwrap();
+    // The response was lost and the client retries: same answer.
+    let again = complete().await.unwrap();
+    assert_eq!(first.e_tag(), again.e_tag());
+
+    // Once the key holds another object, the upload is gone for good.
+    c.put_object().bucket("bkt").key("k").body(ByteStream::from_static(b"newer")).send().await.unwrap();
+    assert_eq!(complete().await.unwrap_err().code(), Some("NoSuchUpload"));
+}
+
+#[tokio::test]
 async fn copy_object() {
     let s = start().await;
     let c = &s.client;
@@ -760,7 +882,7 @@ async fn upload_part_copy_assembles_ranges() {
         .send()
         .await
         .unwrap_err();
-    assert_eq!(err.code(), Some("InvalidArgument"));
+    assert_eq!(err.code(), Some("InvalidRange"));
 
     c.complete_multipart_upload()
         .bucket("bkt")
@@ -827,6 +949,10 @@ async fn keys_only_reach_their_buckets() {
 
     assert_eq!(get(&app, "other", "x").await, denied());
     assert_eq!(put(&app, "other", "k").await, denied());
+    // Like S3, a missing bucket is reported as missing, not as forbidden.
+    assert_eq!(get(&app, "missing", "x").await, Err("NoSuchBucket".into()));
+    let err = app.copy_object().bucket("app").key("c").copy_source("missing/x").send().await.unwrap_err();
+    assert_eq!(code(err), "NoSuchBucket");
     assert_eq!(code(app.list_objects_v2().bucket("other").send().await.unwrap_err()), "AccessDenied");
     assert!(app.head_bucket().bucket("other").send().await.is_err());
     let err = app.copy_object().bucket("app").key("stolen").copy_source("other/x").send().await.unwrap_err();

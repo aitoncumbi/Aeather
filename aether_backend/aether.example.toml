@@ -68,7 +68,8 @@ interval_secs = 604800   # 7 days
 bytes_per_sec = 67108864 # 64 MiB/s
 
 [log]
-# Filter directive; RUST_LOG overrides it.
+# Filter directive; RUST_LOG overrides it. The S3 protocol library's own
+# per-request error logs stay off unless named, e.g. "info,s3s=debug".
 level = "info"
 # "text" or "json"
 format = "text"

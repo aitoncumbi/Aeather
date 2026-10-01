@@ -67,6 +67,9 @@ async fn bucket_lifecycle() {
     assert!(matches!(engine.create_bucket("photos").await, Err(Error::BucketAlreadyExists)));
     assert!(matches!(engine.create_bucket("Bad_Name").await, Err(Error::InvalidBucketName(_))));
     assert!(matches!(engine.create_bucket("../escape").await, Err(Error::InvalidBucketName(_))));
+    for name in ["foo.-bar", "foo-.bar", "a..b", "-ab", "192.168.5.4"] {
+        assert!(matches!(engine.create_bucket(name).await, Err(Error::InvalidBucketName(_))), "{name}");
+    }
 
     let names: Vec<_> = engine.list_buckets().await.unwrap().into_iter().map(|b| b.name).collect();
     assert_eq!(names, ["docs", "photos"]);

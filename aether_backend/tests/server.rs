@@ -158,6 +158,8 @@ async fn responses_carry_request_ids() {
     assert_eq!(s3.status(), 403);
     let id = s3.headers()["x-amz-request-id"].to_str().unwrap().to_owned();
     assert_eq!(id.len(), 16);
+    let body = s3.text().await.unwrap();
+    assert!(body.contains(&format!("<RequestId>{id}</RequestId></Error>")), "{body}");
     let admin = reqwest::get(format!("http://{}/api/v1/status", server.admin)).await.unwrap();
     assert_eq!(admin.status(), 401);
     assert_ne!(admin.headers()["x-request-id"].to_str().unwrap(), id);

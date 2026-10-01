@@ -70,15 +70,18 @@ pub enum Command {
         /// When blocks released by an overwrite may be deleted.
         gc_due_at: Millis,
     },
+    /// Fails with `PreconditionFailed` if the key exists and does not meet `condition`.
     DeleteObject {
         bucket: String,
         key: String,
+        condition: DeleteCondition,
         gc_due_at: Millis,
     },
-    /// Deletes many keys in one transaction (S3 DeleteObjects).
+    /// Deletes many keys in one transaction (S3 DeleteObjects). Keys whose
+    /// condition fails are left in place and listed in `Outcome::Failed`.
     DeleteObjects {
         bucket: String,
-        keys: Vec<String>,
+        objects: Vec<(String, DeleteCondition)>,
         gc_due_at: Millis,
     },
     CreateUpload {
@@ -156,6 +159,9 @@ pub enum Outcome {
     /// The object record that was replaced or deleted, if any.
     Object(Option<ObjectRecord>),
     Key(AccessKeyRecord),
+    /// Indexes of the entries a batch command skipped because their
+    /// precondition failed.
+    Failed(Vec<usize>),
 }
 
 pub struct MetaStore {
@@ -256,7 +262,7 @@ impl MetaStore {
                 let okey = object_key(&bucket.id, key.as_bytes());
                 let previous: Option<ObjectRecord> =
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                check_condition(&condition, previous.as_ref())?;
+                condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
                 usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
 
@@ -317,7 +323,7 @@ impl MetaStore {
                 let okey = object_key(&bucket.id, key.as_bytes());
                 let previous: Option<ObjectRecord> =
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                check_condition(&condition, previous.as_ref())?;
+                condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
                 drop(objects);
                 usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
@@ -364,7 +370,7 @@ impl MetaStore {
                 let okey = object_key(&dst_bucket.id, dst_key.as_bytes());
                 let previous: Option<ObjectRecord> =
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                check_condition(&condition, previous.as_ref())?;
+                condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
                 usage::adjust(&txn, &dst_bucket.id, Some(&record), previous.as_ref())?;
 
@@ -380,16 +386,21 @@ impl MetaStore {
                 }
                 Outcome::Object(previous)
             }
-            Command::DeleteObject { bucket, key, gc_due_at } => {
+            Command::DeleteObject { bucket, key, condition, gc_due_at } => {
                 let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                Outcome::Object(delete_object(&txn, &bucket, &key, gc_due_at)?)
+                Outcome::Object(delete_object(&txn, &bucket, &key, &condition, gc_due_at)?)
             }
-            Command::DeleteObjects { bucket, keys, gc_due_at } => {
+            Command::DeleteObjects { bucket, objects, gc_due_at } => {
                 let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                for key in keys {
-                    delete_object(&txn, &bucket, &key, gc_due_at)?;
+                let mut failed = Vec::new();
+                for (i, (key, condition)) in objects.iter().enumerate() {
+                    match delete_object(&txn, &bucket, key, condition, gc_due_at) {
+                        Ok(_) => {}
+                        Err(Error::PreconditionFailed) => failed.push(i),
+                        Err(e) => return Err(e),
+                    }
                 }
-                Outcome::Done
+                Outcome::Failed(failed)
             }
             Command::CreateKey { key } => {
                 let mut keys = txn.open_table(ACCESS_KEYS)?;
@@ -806,16 +817,6 @@ fn load_upload(
     }
 }
 
-fn check_condition(condition: &WriteCondition, existing: Option<&ObjectRecord>) -> Result<()> {
-    match (condition, existing) {
-        (WriteCondition::None, _) | (WriteCondition::IfNoneMatchAny, None) => Ok(()),
-        (WriteCondition::IfNoneMatchAny, Some(_)) => Err(Error::PreconditionFailed),
-        (WriteCondition::IfMatch(_), None) => Err(Error::NoSuchKey),
-        (WriteCondition::IfMatch(etag), Some(prev)) if *etag == prev.etag => Ok(()),
-        (WriteCondition::IfMatch(_), Some(_)) => Err(Error::PreconditionFailed),
-    }
-}
-
 /// Deletes an upload and its parts. Parts listed in `kept` (sorted) hand their
 /// block references to a completed object; all others release them.
 fn remove_upload(
@@ -858,12 +859,16 @@ fn delete_object(
     txn: &redb::WriteTransaction,
     bucket: &BucketRecord,
     key: &str,
+    condition: &DeleteCondition,
     gc_due_at: Millis,
 ) -> Result<Option<ObjectRecord>> {
     let mut objects = txn.open_table(OBJECTS)?;
     let okey = object_key(&bucket.id, key.as_bytes());
-    let previous: Option<ObjectRecord> =
-        objects.remove(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+    let previous: Option<ObjectRecord> = objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+    if let Some(prev) = &previous {
+        condition.check(prev)?;
+        objects.remove(okey.as_slice())?;
+    }
     if let Some(prev) = &previous {
         usage::adjust(txn, &bucket.id, None, Some(prev))?;
         let mut blocks = txn.open_table(BLOCKS)?;

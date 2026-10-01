@@ -42,7 +42,13 @@ impl AetherS3 {
     }
 
     async fn list(&self, bucket: &str, query: ListQuery) -> S3Result<ListPage> {
-        self.engine.list_objects(bucket, query).await.map_err(s3_error)
+        let max_keys = query.max_keys;
+        let mut page = self.engine.list_objects(bucket, query).await.map_err(s3_error)?;
+        // Asking for nothing gets a complete (empty) answer, as in S3.
+        if max_keys == 0 {
+            page.next_start = None;
+        }
+        Ok(page)
     }
 
     /// Streams an upload body to disk and verifies every integrity check the
@@ -125,7 +131,10 @@ impl ObjectHeaders {
             None => attrs.expires.clone(),
         };
         Self {
-            content_type: response_content_type.or_else(|| attrs.content_type.clone()),
+            // S3's type for objects uploaded without one.
+            content_type: response_content_type
+                .or_else(|| attrs.content_type.clone())
+                .or_else(|| Some("binary/octet-stream".into())),
             content_encoding: response_content_encoding.or_else(|| attrs.content_encoding.clone()),
             content_disposition: response_content_disposition.or_else(|| attrs.content_disposition.clone()),
             content_language: response_content_language.or_else(|| attrs.content_language.clone()),
@@ -145,12 +154,33 @@ impl S3 for AetherS3 {
 
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         let identity = self.auth.caller(&req)?;
-        let prefix = req.input.prefix.unwrap_or_default();
+        let input = req.input;
+        let limit = match input.max_buckets {
+            None => usize::MAX,
+            Some(n @ 1..=10_000) => n as usize,
+            Some(_) => return Err(s3_error!(InvalidArgument, "max-buckets must be between 1 and 10000")),
+        };
+        let after = match &input.continuation_token {
+            Some(token) => Some(String::from_utf8(decode_token(token)?).map_err(|_| s3_error!(InvalidToken))?),
+            None => None,
+        };
+        let prefix = input.prefix.clone().unwrap_or_default();
+        let other_region = input.bucket_region.as_ref().is_some_and(|r| *r != self.region);
         let buckets = self.engine.list_buckets().await.map_err(s3_error)?;
-        // Keys only see the buckets they have some permission on.
-        let buckets = buckets
+        // Keys only see the buckets they have some permission on. Names are sorted.
+        let mut visible = buckets.into_iter().filter(|b| {
+            !other_region
+                && b.name.starts_with(&prefix)
+                && after.as_ref().is_none_or(|after| b.name > *after)
+                && !identity.grant(&b.name).is_empty()
+        });
+        let page: Vec<_> = visible.by_ref().take(limit).collect();
+        let continuation_token = match (visible.next(), page.last()) {
+            (Some(_), Some(last)) => Some(encode_token(last.name.as_bytes())),
+            _ => None,
+        };
+        let buckets = page
             .into_iter()
-            .filter(|b| b.name.starts_with(&prefix) && !identity.grant(&b.name).is_empty())
             .map(|b| Bucket {
                 name: Some(b.name),
                 creation_date: Some(timestamp(b.created_at)),
@@ -158,7 +188,12 @@ impl S3 for AetherS3 {
                 ..Default::default()
             })
             .collect();
-        let output = ListBucketsOutput { buckets: Some(buckets), owner: Some(Self::owner()), ..Default::default() };
+        let output = ListBucketsOutput {
+            buckets: Some(buckets),
+            owner: Some(Self::owner()),
+            continuation_token,
+            prefix: input.prefix,
+        };
         Ok(S3Response::new(output))
     }
 
@@ -358,10 +393,9 @@ impl S3 for AetherS3 {
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
         check_version_id(input.version_id.as_deref())?;
-        if input.if_match.is_some() || input.if_match_last_modified_time.is_some() || input.if_match_size.is_some() {
-            return Err(s3_error!(NotImplemented, "conditional deletes are not supported yet"));
-        }
-        self.engine.delete_object(&input.bucket, &input.key).await.map_err(s3_error)?;
+        let condition =
+            delete_condition(input.if_match.as_ref(), input.if_match_last_modified_time.as_ref(), input.if_match_size)?;
+        self.engine.delete_object_if(&input.bucket, &input.key, condition).await.map_err(s3_error)?;
         Ok(S3Response::new(DeleteObjectOutput::default()))
     }
 
@@ -372,25 +406,43 @@ impl S3 for AetherS3 {
             return Err(s3_error!(MalformedXML, "a request can delete at most {MAX_DELETE_KEYS} keys"));
         }
 
-        let mut keys = Vec::with_capacity(objects.len());
+        let mut targets = Vec::with_capacity(objects.len());
         let mut errors = Vec::new();
         for object in objects {
-            match check_version_id(object.version_id.as_deref()) {
-                Ok(()) => keys.push(object.key),
-                Err(_) => errors.push(Error {
-                    key: Some(object.key),
-                    version_id: object.version_id,
-                    code: Some("NoSuchVersion".into()),
-                    message: Some("versioning is not enabled".into()),
-                }),
+            let error = |code: &str, message: &str| Error {
+                key: Some(object.key.clone()),
+                version_id: object.version_id.clone(),
+                code: Some(code.into()),
+                message: Some(message.into()),
+            };
+            if check_version_id(object.version_id.as_deref()).is_err() {
+                errors.push(error("NoSuchVersion", "versioning is not enabled"));
+                continue;
+            }
+            let if_match = object.e_tag.clone().map(ETagCondition::ETag);
+            match delete_condition(if_match.as_ref(), object.last_modified_time.as_ref(), object.size) {
+                Ok(condition) => targets.push((object.key, condition)),
+                Err(e) => errors.push(error("InvalidArgument", e.message().unwrap_or("invalid condition"))),
             }
         }
-        self.engine.delete_objects(&input.bucket, keys.clone()).await.map_err(s3_error)?;
+        let failed = self.engine.delete_objects_if(&input.bucket, targets.clone()).await.map_err(s3_error)?;
 
+        let mut deleted = Vec::with_capacity(targets.len());
+        for (i, (key, _)) in targets.into_iter().enumerate() {
+            if failed.binary_search(&i).is_ok() {
+                errors.push(Error {
+                    key: Some(key),
+                    code: Some("PreconditionFailed".into()),
+                    message: Some("At least one of the pre-conditions you specified did not hold".into()),
+                    ..Default::default()
+                });
+            } else {
+                deleted.push(DeletedObject { key: Some(key), ..Default::default() });
+            }
+        }
         let quiet = input.delete.quiet == Some(true);
-        let deleted = (!quiet)
-            .then(|| keys.into_iter().map(|key| DeletedObject { key: Some(key), ..Default::default() }).collect());
-        let output = DeleteObjectsOutput { deleted, errors: Some(errors), ..Default::default() };
+        let output =
+            DeleteObjectsOutput { deleted: (!quiet).then_some(deleted), errors: Some(errors), ..Default::default() };
         Ok(S3Response::new(output))
     }
 
@@ -455,7 +507,8 @@ impl S3 for AetherS3 {
             _ => None,
         };
         let max_keys = max_keys(input.max_keys)?;
-        let query = ListQuery { prefix: prefix.clone(), delimiter: input.delimiter.clone(), start, max_keys };
+        let delimiter = input.delimiter.filter(|d| !d.is_empty());
+        let query = ListQuery { prefix: prefix.clone(), delimiter: delimiter.clone(), start, max_keys };
         let page = self.list(&input.bucket, query).await?;
 
         let encode = |s: String| if url { url_encode(&s) } else { s };
@@ -464,7 +517,7 @@ impl S3 for AetherS3 {
         let output = ListObjectsV2Output {
             name: Some(input.bucket),
             prefix: Some(encode(prefix)),
-            delimiter: input.delimiter.map(encode),
+            delimiter: delimiter.map(encode),
             start_after: input.start_after.map(encode),
             max_keys: Some(max_keys as i32),
             key_count: Some(key_count as i32),
@@ -494,22 +547,97 @@ impl S3 for AetherS3 {
         Ok(S3Response::new(output))
     }
 
+    /// Without versioning (v2), every object has exactly one version, `null`,
+    /// and there are no delete markers. Cleanup tools rely on this call.
+    async fn list_object_versions(
+        &self,
+        req: S3Request<ListObjectVersionsInput>,
+    ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        let input = req.input;
+        let url = wants_url_encoding(input.encoding_type.as_ref())?;
+        if input.version_id_marker.as_deref().is_some_and(|m| !m.is_empty() && m != "null") {
+            return Err(s3_error!(InvalidArgument, "invalid version-id-marker"));
+        }
+        let prefix = input.prefix.unwrap_or_default();
+        let delimiter = input.delimiter.filter(|d| !d.is_empty());
+        let start = input
+            .key_marker
+            .as_deref()
+            .filter(|m| !m.is_empty())
+            .map(|m| marker_start(m, &prefix, delimiter.as_deref()));
+        let max_keys = max_keys(input.max_keys)?;
+        let query = ListQuery { prefix: prefix.clone(), delimiter: delimiter.clone(), start, max_keys };
+        let page = self.list(&input.bucket, query).await?;
+
+        let truncated = page.next_start.is_some();
+        let last_key = page.objects.last().map(|o| o.key.clone());
+        let last_prefix = page.common_prefixes.last().cloned();
+        let (next_key_marker, next_version_id_marker) = match (truncated, last_key, last_prefix) {
+            (false, _, _) => (None, None),
+            (true, Some(key), Some(prefix)) if prefix > key => (Some(prefix), None),
+            (true, Some(key), _) => (Some(key), Some("null".to_owned())),
+            (true, None, prefix) => (prefix, None),
+        };
+
+        let encode = |s: String| if url { url_encode(&s) } else { s };
+        let versions = page
+            .objects
+            .into_iter()
+            .map(|o| ObjectVersion {
+                key: Some(encode(o.key)),
+                version_id: Some("null".into()),
+                is_latest: Some(true),
+                size: Some(o.size as i64),
+                e_tag: Some(ETag::Strong(o.etag)),
+                last_modified: Some(timestamp(o.last_modified)),
+                storage_class: Some(ObjectVersionStorageClass::from_static(ObjectVersionStorageClass::STANDARD)),
+                owner: Some(Self::owner()),
+                ..Default::default()
+            })
+            .collect();
+        let output = ListObjectVersionsOutput {
+            name: Some(input.bucket),
+            prefix: Some(encode(prefix)),
+            delimiter: delimiter.map(encode),
+            key_marker: input.key_marker.map(encode),
+            version_id_marker: input.version_id_marker,
+            next_key_marker: next_key_marker.map(encode),
+            next_version_id_marker,
+            max_keys: Some(max_keys as i32),
+            is_truncated: Some(truncated),
+            versions: Some(versions),
+            common_prefixes: Some(
+                page.common_prefixes.into_iter().map(|p| CommonPrefix { prefix: Some(encode(p)) }).collect(),
+            ),
+            encoding_type: input.encoding_type,
+            ..Default::default()
+        };
+        Ok(S3Response::new(output))
+    }
+
+    /// Versioning has never been enabled on any bucket (it arrives in v2).
+    async fn get_bucket_versioning(
+        &self,
+        req: S3Request<GetBucketVersioningInput>,
+    ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
+        self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        Ok(S3Response::new(GetBucketVersioningOutput::default()))
+    }
+
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let url = wants_url_encoding(input.encoding_type.as_ref())?;
         let prefix = input.prefix.unwrap_or_default();
-        let start = input
-            .marker
-            .as_deref()
-            .filter(|m| !m.is_empty())
-            .map(|m| marker_start(m, &prefix, input.delimiter.as_deref()));
+        let delimiter = input.delimiter.filter(|d| !d.is_empty());
+        let start =
+            input.marker.as_deref().filter(|m| !m.is_empty()).map(|m| marker_start(m, &prefix, delimiter.as_deref()));
         let max_keys = max_keys(input.max_keys)?;
-        let query = ListQuery { prefix: prefix.clone(), delimiter: input.delimiter.clone(), start, max_keys };
+        let query = ListQuery { prefix: prefix.clone(), delimiter: delimiter.clone(), start, max_keys };
         let page = self.list(&input.bucket, query).await?;
 
         let truncated = page.next_start.is_some();
         // S3 returns NextMarker only with a delimiter; clients otherwise use the last key.
-        let next_marker = if truncated && input.delimiter.is_some() {
+        let next_marker = if truncated && delimiter.is_some() {
             let last_key = page.objects.last().map(|o| o.key.clone());
             let last_prefix = page.common_prefixes.last().cloned();
             last_key.max(last_prefix)
@@ -518,11 +646,12 @@ impl S3 for AetherS3 {
         };
 
         let encode = |s: String| if url { url_encode(&s) } else { s };
+        // Clients decode Marker but not Prefix in v1 responses (unlike v2).
         let output = ListObjectsOutput {
             name: Some(input.bucket),
-            prefix: Some(encode(prefix)),
-            delimiter: input.delimiter.map(encode),
-            marker: input.marker.map(encode),
+            prefix: Some(prefix),
+            delimiter: delimiter.map(encode),
+            marker: Some(encode(input.marker.unwrap_or_default())),
             next_marker: next_marker.map(encode),
             max_keys: Some(max_keys as i32),
             is_truncated: Some(truncated),

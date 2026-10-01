@@ -11,7 +11,7 @@ use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::dto::{CopyObjectInput, CopySource, UploadPartCopyInput};
 use s3s::path::S3Path;
-use s3s::{S3Request, S3Result, s3_error};
+use s3s::{S3Error, S3Request, S3Result, s3_error};
 use subtle::ConstantTimeEq;
 
 use crate::engine::Engine;
@@ -120,8 +120,8 @@ enum Required {
 fn required(operation: &str) -> Required {
     match operation {
         "ListBuckets" | "CreateBucket" => Required::Handler,
-        "HeadBucket" | "GetBucketLocation" => Required::Any,
-        "ListObjects" | "ListObjectsV2" | "GetObject" | "HeadObject" => Required::Read,
+        "HeadBucket" | "GetBucketLocation" | "GetBucketVersioning" => Required::Any,
+        "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "GetObject" | "HeadObject" => Required::Read,
         "ListMultipartUploads" | "ListParts" => Required::ReadOrWrite,
         "PutObject"
         | "DeleteObject"
@@ -165,12 +165,23 @@ impl S3Auth for S3Credentials {
 pub struct S3Permissions(pub Arc<Authorizer>);
 
 impl S3Permissions {
-    fn check_source(&self, identity: &Identity, source: &CopySource) -> S3Result<()> {
+    async fn check_source(&self, identity: &Identity, source: &CopySource) -> S3Result<()> {
         match source {
             CopySource::Bucket { bucket, .. } if identity.grant(bucket).read => Ok(()),
-            CopySource::Bucket { .. } => Err(s3_error!(AccessDenied, "no read access to the copy source")),
+            CopySource::Bucket { bucket, .. } => {
+                Err(self.denied(bucket, s3_error!(AccessDenied, "no read access to the copy source")).await)
+            }
             // Rejected later as not implemented.
             _ => Ok(()),
+        }
+    }
+
+    /// As in S3, a caller with a valid key learns that a bucket does not
+    /// exist (404) rather than that it may not access it (403).
+    async fn denied(&self, bucket: &str, error: S3Error) -> S3Error {
+        match self.0.engine.get_bucket(bucket).await {
+            Err(crate::error::Error::NoSuchBucket) => s3_error!(NoSuchBucket),
+            _ => error,
         }
     }
 }
@@ -186,21 +197,27 @@ impl S3Access for S3Permissions {
         let access_key = access_key.ok_or_else(|| s3_error!(AccessDenied, "Signature is required"))?;
         let identity = self.0.identify(&access_key).ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let required = required(cx.s3_op().name());
-        let permitted = match cx.s3_path() {
-            S3Path::Bucket { bucket } | S3Path::Object { bucket, .. } => allowed(identity.grant(bucket), required),
-            S3Path::Root => required == Required::Handler || identity.is_admin(),
-        };
-        if permitted { Ok(()) } else { Err(s3_error!(AccessDenied)) }
+        match cx.s3_path() {
+            S3Path::Bucket { bucket } | S3Path::Object { bucket, .. } => {
+                if allowed(identity.grant(bucket), required) {
+                    Ok(())
+                } else {
+                    Err(self.denied(bucket, s3_error!(AccessDenied)).await)
+                }
+            }
+            S3Path::Root if required == Required::Handler || identity.is_admin() => Ok(()),
+            S3Path::Root => Err(s3_error!(AccessDenied)),
+        }
     }
 
     async fn copy_object(&self, req: &mut S3Request<CopyObjectInput>) -> S3Result<()> {
         let identity = self.0.caller(req)?;
-        self.check_source(&identity, &req.input.copy_source)
+        self.check_source(&identity, &req.input.copy_source).await
     }
 
     async fn upload_part_copy(&self, req: &mut S3Request<UploadPartCopyInput>) -> S3Result<()> {
         let identity = self.0.caller(req)?;
-        self.check_source(&identity, &req.input.copy_source)
+        self.check_source(&identity, &req.input.copy_source).await
     }
 }
 

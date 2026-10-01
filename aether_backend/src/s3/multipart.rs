@@ -17,7 +17,8 @@ use s3s::{S3Request, S3Response, S3Result, s3_error};
 use super::convert::*;
 use super::{AetherS3, BodyChecks};
 use crate::engine::Completion;
-use crate::meta::{PartsPage, UploadListQuery, UploadRecord};
+use crate::error::Error as EngineError;
+use crate::meta::{ObjectRecord, PartsPage, UploadListQuery, UploadRecord};
 
 /// Algorithms S3 accepts for multipart uploads.
 const MULTIPART_ALGORITHMS: &[&str] = &["crc32", "crc32c", "crc64nvme", "sha1", "sha256"];
@@ -106,8 +107,11 @@ impl AetherS3 {
             requested.push((part_number(number)?, etag.value().to_owned()));
         }
 
-        let completion =
-            self.engine.prepare_completion(&bucket, &key, upload_id, &requested).await.map_err(s3_error)?;
+        let completion = match self.engine.prepare_completion(&bucket, &key, upload_id, &requested).await {
+            Ok(completion) => completion,
+            Err(EngineError::NoSuchUpload) => return self.already_completed(bucket, key, upload_id).await,
+            Err(e) => return Err(s3_error(e)),
+        };
         if let Some(expected) = expected_size
             && u64::try_from(expected).ok() != Some(completion.size())
         {
@@ -115,22 +119,27 @@ impl AetherS3 {
         }
         let whole_object = sent_checksum!(input);
         let (checksums, checksum_type) = multipart_checksum(&completion, parts, &whole_object)?;
-        let record = self
-            .engine
-            .complete_upload(&bucket, &key, completion, checksums, checksum_type, condition)
-            .await
-            .map_err(s3_error)?;
+        let record =
+            match self.engine.complete_upload(&bucket, &key, completion, checksums, checksum_type, condition).await {
+                Ok(record) => record,
+                Err(EngineError::NoSuchUpload) => return self.already_completed(bucket, key, upload_id).await,
+                Err(e) => return Err(s3_error(e)),
+            };
+        Ok(S3Response::new(completed_output(bucket, key, &record)))
+    }
 
-        let mut output = CompleteMultipartUploadOutput {
-            location: Some(format!("/{bucket}/{key}")),
-            bucket: Some(bucket),
-            key: Some(key),
-            e_tag: Some(etag(&record)),
-            checksum_type: stored_checksum_type(&record.attrs),
-            ..Default::default()
-        };
-        set_checksums!(output, checksum_from_map(&record.attrs.checksums));
-        Ok(S3Response::new(output))
+    /// Clients retry CompleteMultipartUpload when a response is lost, by which
+    /// time the upload is gone; S3 answers success if it made the object.
+    async fn already_completed(
+        &self,
+        bucket: String,
+        key: String,
+        upload_id: uuid::Uuid,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        match self.engine.completed_upload(&bucket, &key, upload_id).await.map_err(s3_error)? {
+            Some(record) => Ok(S3Response::new(completed_output(bucket, key, &record))),
+            None => Err(s3_error!(NoSuchUpload)),
+        }
     }
 
     pub(super) async fn abort_multipart_upload_op(
@@ -355,6 +364,19 @@ fn combine_crcs(alg: &str, parts: &[(Vec<u8>, u64)]) -> S3Result<String> {
     }
     let bytes = combined.unwrap_or(0).to_be_bytes();
     Ok(STANDARD.encode(&bytes[8 - width..]))
+}
+
+fn completed_output(bucket: String, key: String, record: &ObjectRecord) -> CompleteMultipartUploadOutput {
+    let mut output = CompleteMultipartUploadOutput {
+        location: Some(format!("/{bucket}/{key}")),
+        bucket: Some(bucket),
+        key: Some(key),
+        e_tag: Some(etag(record)),
+        checksum_type: stored_checksum_type(&record.attrs),
+        ..Default::default()
+    };
+    set_checksums!(output, checksum_from_map(&record.attrs.checksums));
+    output
 }
 
 #[cfg(test)]

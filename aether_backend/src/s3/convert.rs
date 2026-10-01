@@ -4,15 +4,16 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::ops::Range;
 
+use axum::http::{HeaderMap, HeaderValue, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use s3s::checksum::ChecksumHasher;
-use s3s::dto::{self, Checksum, ChecksumAlgorithm, ETag, ETagCondition, Timestamp};
+use s3s::dto::{self, Checksum, ChecksumAlgorithm, ETag, ETagCondition, Timestamp, TimestampFormat};
 use s3s::{BodySizeLimitExceeded, S3Error, S3ErrorCode, S3Result, s3_error};
 use tracing::error;
 
 use crate::error::Error;
-use crate::meta::{Millis, ObjectAttrs, ObjectRecord, WriteCondition, prefix_successor};
+use crate::meta::{DeleteCondition, Millis, ObjectAttrs, ObjectRecord, WriteCondition, prefix_successor};
 
 pub fn s3_error(e: Error) -> S3Error {
     match e {
@@ -56,6 +57,10 @@ pub fn timestamp(millis: Millis) -> Timestamp {
     time::OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap_or(time::OffsetDateTime::UNIX_EPOCH).into()
 }
 
+pub fn millis(ts: &Timestamp) -> Millis {
+    (time::OffsetDateTime::from(ts.clone()).unix_timestamp_nanos() / 1_000_000) as Millis
+}
+
 pub fn etag(record: &ObjectRecord) -> ETag {
     ETag::Strong(record.etag.clone())
 }
@@ -68,17 +73,34 @@ pub fn check_version_id(version_id: Option<&str>) -> S3Result<()> {
     }
 }
 
-/// S3 supports `If-None-Match: *` and `If-Match: <etag>` on writes.
+/// `If-Match` or `If-None-Match` on a write (one of them, not both).
 pub fn write_condition(
     if_match: Option<&ETagCondition>,
     if_none_match: Option<&ETagCondition>,
 ) -> S3Result<WriteCondition> {
     match (if_match, if_none_match) {
         (None, None) => Ok(WriteCondition::None),
-        (None, Some(cond)) if cond.is_any() => Ok(WriteCondition::IfNoneMatchAny),
+        (Some(ETagCondition::Any), None) => Ok(WriteCondition::IfMatchAny),
         (Some(ETagCondition::ETag(etag)), None) => Ok(WriteCondition::IfMatch(etag.value().to_owned())),
-        _ => Err(s3_error!(NotImplemented, "only If-None-Match: * or If-Match: <etag> are supported on writes")),
+        (None, Some(ETagCondition::Any)) => Ok(WriteCondition::IfNoneMatchAny),
+        (None, Some(ETagCondition::ETag(etag))) => Ok(WriteCondition::IfNoneMatch(etag.value().to_owned())),
+        (Some(_), Some(_)) => Err(s3_error!(InvalidArgument, "If-Match and If-None-Match cannot be combined")),
     }
+}
+
+/// `If-Match`, `x-amz-if-match-last-modified-time` and `x-amz-if-match-size`
+/// on a delete. `If-Match: *` adds nothing: deleting a missing key succeeds anyway.
+pub fn delete_condition(
+    if_match: Option<&ETagCondition>,
+    last_modified: Option<&Timestamp>,
+    size: Option<i64>,
+) -> S3Result<DeleteCondition> {
+    let size = size.map(u64::try_from).transpose().map_err(|_| s3_error!(InvalidArgument, "negative size"))?;
+    Ok(DeleteCondition {
+        etag: if_match.and_then(ETagCondition::as_etag).map(|etag| etag.value().to_owned()),
+        last_modified: last_modified.map(millis),
+        size,
+    })
 }
 
 /// HTTP conditional-read rules (RFC 9110 §13.2.2), as S3 applies them to GET and HEAD.
@@ -108,14 +130,31 @@ pub fn check_read_conditions(
     }
     if let Some(cond) = if_none_match {
         if matches(cond) {
-            return Err(s3_error!(NotModified));
+            return Err(not_modified(record));
         }
     } else if let Some(ts) = if_modified_since
         && modified <= seconds(ts)
     {
-        return Err(s3_error!(NotModified));
+        return Err(not_modified(record));
     }
     Ok(())
+}
+
+/// A 304 carries the validators the client compares against (RFC 9110 §15.4.5).
+fn not_modified(record: &ObjectRecord) -> S3Error {
+    let mut error = s3_error!(NotModified);
+    let mut headers = HeaderMap::new();
+    if let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", record.etag)) {
+        headers.insert(header::ETAG, value);
+    }
+    let mut date = Vec::new();
+    if timestamp(record.last_modified).format(TimestampFormat::HttpDate, &mut date).is_ok()
+        && let Ok(value) = HeaderValue::from_bytes(&date)
+    {
+        headers.insert(header::LAST_MODIFIED, value);
+    }
+    error.set_headers(headers);
+    error
 }
 
 /// What a GET or HEAD returns: a byte range, or one part of a multipart object.
@@ -179,7 +218,10 @@ pub fn copy_source_range(range: Option<&str>, size: u64) -> S3Result<Range<u64>>
         .and_then(|(first, last)| Some((first.trim().parse::<u64>().ok()?, last.trim().parse::<u64>().ok()?)));
     match parsed {
         Some((first, last)) if first <= last && last < size => Ok(first..last + 1),
-        _ => Err(s3_error!(InvalidArgument, "the copy source range is not valid for an object of size {size}")),
+        Some((first, last)) if first <= last => {
+            Err(s3_error!(InvalidRange, "the copy source range is outside the source object ({size} bytes)"))
+        }
+        _ => Err(s3_error!(InvalidArgument, "invalid copy source range {range:?}")),
     }
 }
 
@@ -194,12 +236,24 @@ pub fn part_number(n: i32) -> S3Result<u32> {
         .ok_or_else(|| s3_error!(InvalidArgument, "part numbers must be between 1 and {}", crate::engine::MAX_PARTS))
 }
 
+/// `aws-chunked` describes how the request body was framed, not the object,
+/// so it is not stored (S3 drops it too).
+pub fn stored_content_encoding(encoding: Option<String>) -> Option<String> {
+    let encoding = encoding?;
+    let kept: Vec<&str> = encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("aws-chunked"))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(", "))
+}
+
 /// Attributes for a new object from request headers.
 macro_rules! object_attrs {
     ($input:ident) => {
         $crate::meta::ObjectAttrs {
             content_type: $input.content_type,
-            content_encoding: $input.content_encoding,
+            content_encoding: $crate::s3::convert::stored_content_encoding($input.content_encoding),
             content_disposition: $input.content_disposition,
             content_language: $input.content_language,
             cache_control: $input.cache_control,
@@ -458,6 +512,18 @@ pub fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aws_chunked_is_not_stored_as_content_encoding() {
+        let stored = |e: &str| stored_content_encoding(Some(e.to_owned()));
+        assert_eq!(stored("gzip").as_deref(), Some("gzip"));
+        assert_eq!(stored("deflate, gzip").as_deref(), Some("deflate, gzip"));
+        assert_eq!(stored("gzip, aws-chunked").as_deref(), Some("gzip"));
+        assert_eq!(stored("aws-chunked,gzip").as_deref(), Some("gzip"));
+        assert_eq!(stored("aws-chunked"), None);
+        assert_eq!(stored("aws-chunked, aws-chunked"), None);
+        assert_eq!(stored_content_encoding(None), None);
+    }
 
     #[test]
     fn marker_skips_common_prefix_only_when_it_is_one() {

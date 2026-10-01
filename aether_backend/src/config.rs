@@ -245,8 +245,11 @@ impl Config {
         if let Some(file) = file {
             figment = figment.merge(Toml::file_exact(file));
         }
-        // AETHER_CONFIG names the file itself and is read by the CLI parser.
-        figment = figment.merge(Env::prefixed("AETHER_").split("__").ignore(&["config"]));
+        // These AETHER_* variables belong to the CLI, not the server config:
+        // the config file path and the admin client's connection settings.
+        let cli_variables =
+            ["config", "admin_url", "admin_access_key", "admin_secret_key", "admin_ca_cert", "admin_insecure"];
+        figment = figment.merge(Env::prefixed("AETHER_").split("__").ignore(&cli_variables));
         let config: Config = figment.extract().map_err(Box::new)?;
         config.validate()?;
         Ok(config)
@@ -331,6 +334,23 @@ mod tests {
             assert_eq!(config.storage.data_dir, PathBuf::from("/srv/aether"));
             assert_eq!(config.s3.region, "us-east-1");
             assert!(!format!("{config:?}").contains("env-secret"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cli_variables_do_not_break_the_server_config() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("AETHER_S3__ACCESS_KEY", "admin");
+            jail.set_env("AETHER_S3__SECRET_KEY", "change-me-please");
+            jail.set_env("AETHER_ADMIN_URL", "http://127.0.0.1:9001");
+            jail.set_env("AETHER_ADMIN_ACCESS_KEY", "admin");
+            jail.set_env("AETHER_ADMIN_SECRET_KEY", "change-me-please");
+            jail.set_env("AETHER_ADMIN_CA_CERT", "/etc/ca.pem");
+            jail.set_env("AETHER_ADMIN_INSECURE", "true");
+            jail.set_env("AETHER_ADMIN__LISTEN", "0.0.0.0:9001");
+            let config = Config::load(None).unwrap();
+            assert_eq!(config.admin.listen, "0.0.0.0:9001".parse().unwrap());
             Ok(())
         });
     }

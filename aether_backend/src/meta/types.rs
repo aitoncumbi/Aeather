@@ -4,6 +4,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::error::{Error, Result};
+
 /// Unix time in milliseconds.
 pub type Millis = i64;
 
@@ -29,6 +31,10 @@ pub struct ObjectRecord {
     /// Empty for single-part objects.
     #[serde(default)]
     pub part_sizes: Vec<u64>,
+    /// The multipart upload that created the object, so that a retried
+    /// CompleteMultipartUpload can be answered after the upload is gone.
+    #[serde(default)]
+    pub upload_id: Option<Uuid>,
 }
 
 /// Attributes supplied by the client when the object was written.
@@ -202,8 +208,45 @@ pub enum WriteCondition {
     None,
     /// `If-None-Match: *` — only create, never overwrite.
     IfNoneMatchAny,
+    /// `If-None-Match: <etag>` — write unless the key holds this exact object.
+    IfNoneMatch(String),
+    /// `If-Match: *` — only overwrite an existing object.
+    IfMatchAny,
     /// `If-Match: <etag>` — only overwrite this exact object.
     IfMatch(String),
+}
+
+impl WriteCondition {
+    /// `existing` is the object the write would replace.
+    pub fn check(&self, existing: Option<&ObjectRecord>) -> Result<()> {
+        match (self, existing) {
+            (Self::IfMatchAny | Self::IfMatch(_), None) => Err(Error::NoSuchKey),
+            (Self::IfNoneMatchAny, Some(_)) => Err(Error::PreconditionFailed),
+            (Self::IfNoneMatch(etag), Some(prev)) if *etag == prev.etag => Err(Error::PreconditionFailed),
+            (Self::IfMatch(etag), Some(prev)) if *etag != prev.etag => Err(Error::PreconditionFailed),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Precondition on a delete. Deleting a key that does not exist succeeds
+/// whatever the condition, as in S3.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteCondition {
+    pub etag: Option<String>,
+    /// Compared at the one-second resolution of HTTP dates.
+    pub last_modified: Option<Millis>,
+    pub size: Option<u64>,
+}
+
+impl DeleteCondition {
+    pub fn check(&self, existing: &ObjectRecord) -> Result<()> {
+        let etag = self.etag.as_ref().is_none_or(|etag| *etag == existing.etag);
+        let modified =
+            self.last_modified.is_none_or(|ms| ms.div_euclid(1000) == existing.last_modified.div_euclid(1000));
+        let size = self.size.is_none_or(|size| size == existing.size);
+        if etag && modified && size { Ok(()) } else { Err(Error::PreconditionFailed) }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

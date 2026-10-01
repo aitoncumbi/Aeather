@@ -33,8 +33,9 @@ pub use self::keys::NewKey;
 use crate::blocks::{BlockStore, BlockWriter};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
-    BlockRef, BucketRecord, BucketUsage, Command, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs, ObjectData,
-    ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord, WriteCondition,
+    BlockRef, BucketRecord, BucketUsage, Command, DeleteCondition, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs,
+    ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord,
+    WriteCondition,
 };
 
 /// S3's limit for one ListObjects page.
@@ -212,12 +213,7 @@ impl Engine {
                 Err(Error::NoSuchKey) => None,
                 Err(e) => return Err(e),
             };
-            match (&condition, existing) {
-                (WriteCondition::IfNoneMatchAny, Some(_)) => Err(Error::PreconditionFailed),
-                (WriteCondition::IfMatch(_), None) => Err(Error::NoSuchKey),
-                (WriteCondition::IfMatch(etag), Some(record)) if *etag != record.etag => Err(Error::PreconditionFailed),
-                _ => Ok(()),
-            }
+            condition.check(existing.as_ref())
         })
         .await
     }
@@ -305,6 +301,7 @@ impl Engine {
             attrs,
             data: staged.data.clone(),
             part_sizes: Vec::new(),
+            upload_id: None,
         };
         let command = Command::PutObject {
             bucket: bucket.to_owned(),
@@ -337,9 +334,21 @@ impl Engine {
 
     /// Deleting a key that does not exist succeeds, as in S3.
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectRecord>> {
+        self.delete_object_if(bucket, key, DeleteCondition::default()).await
+    }
+
+    /// Deletes the key if it holds an object meeting `condition`; fails with
+    /// `PreconditionFailed` if it holds another one.
+    pub async fn delete_object_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        condition: DeleteCondition,
+    ) -> Result<Option<ObjectRecord>> {
         let command = Command::DeleteObject {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            condition,
             gc_due_at: now_millis() + self.gc_grace_millis(),
         };
         match self.apply(command).await? {
@@ -350,13 +359,22 @@ impl Engine {
 
     /// Deletes up to 1000 keys in one commit. Missing keys are not an error.
     pub async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<()> {
+        let objects = keys.into_iter().map(|key| (key, DeleteCondition::default())).collect();
+        self.delete_objects_if(bucket, objects).await.map(drop)
+    }
+
+    /// Like `delete_objects`, with a condition per key. Returns the indexes of
+    /// the keys left in place because their condition failed.
+    pub async fn delete_objects_if(&self, bucket: &str, objects: Vec<(String, DeleteCondition)>) -> Result<Vec<usize>> {
         let command = Command::DeleteObjects {
             bucket: bucket.to_owned(),
-            keys,
+            objects,
             gc_due_at: now_millis() + self.gc_grace_millis(),
         };
-        self.apply(command).await?;
-        Ok(())
+        match self.apply(command).await? {
+            Outcome::Failed(failed) => Ok(failed),
+            other => unreachable!("DeleteObjects returned {other:?}"),
+        }
     }
 
     /// Makes `dst_bucket/dst_key` a copy of `source`, which the caller read from
@@ -383,6 +401,7 @@ impl Engine {
             attrs,
             data: source.data.clone(),
             part_sizes: source.part_sizes.clone(),
+            upload_id: None,
         };
         let command = Command::CopyObject {
             src_bucket: src_bucket.to_owned(),
@@ -535,6 +554,7 @@ impl Engine {
             attrs,
             data: ObjectData::Blocks(completion.parts.iter().flat_map(|(_, p)| p.blocks.iter().copied()).collect()),
             part_sizes: completion.parts.iter().map(|(_, p)| p.size).collect(),
+            upload_id: Some(completion.upload.upload_id),
         };
         let command = Command::CompleteUpload {
             bucket: bucket.to_owned(),
@@ -547,6 +567,16 @@ impl Engine {
         };
         self.apply(command).await?;
         Ok(record)
+    }
+
+    /// The object at `key` if `upload_id` created it: lets a retried
+    /// CompleteMultipartUpload succeed after the first attempt did.
+    pub async fn completed_upload(&self, bucket: &str, key: &str, upload_id: Uuid) -> Result<Option<ObjectRecord>> {
+        match self.get_object(bucket, key).await {
+            Ok(record) => Ok((record.upload_id == Some(upload_id)).then_some(record)),
+            Err(Error::NoSuchKey) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn abort_upload(&self, bucket: &str, key: &str, upload_id: Uuid) -> Result<()> {
@@ -956,14 +986,17 @@ pub fn now_millis() -> Millis {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as Millis)
 }
 
-/// S3 bucket naming rules for new buckets.
+/// S3 bucket naming rules for new buckets: DNS-compatible, so that
+/// virtual-hosted-style addressing works. Every dot-separated label starts
+/// and ends with a letter or digit.
 pub fn validate_bucket_name(name: &str) -> Result<()> {
-    let bytes = name.as_bytes();
-    let valid = (3..=63).contains(&bytes.len())
-        && bytes.iter().all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        && !name.contains("..")
+    let label = |l: &str| {
+        let b = l.as_bytes();
+        !b.is_empty() && b[0].is_ascii_alphanumeric() && b[b.len() - 1].is_ascii_alphanumeric()
+    };
+    let valid = (3..=63).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && name.split('.').all(label)
         && name.parse::<Ipv4Addr>().is_err();
     if valid { Ok(()) } else { Err(Error::InvalidBucketName(name.to_owned())) }
 }

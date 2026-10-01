@@ -45,6 +45,7 @@ mod tests {
             },
             data: ObjectData::Blocks(vec![BlockRef { id: Uuid::new_v4(), len: 3, crc32c: 7 }]),
             part_sizes: vec![3],
+            upload_id: Some(Uuid::now_v7()),
         };
         let back: ObjectRecord = decode(&encode(&record)).unwrap();
         assert_eq!(back, record);
