@@ -4,12 +4,13 @@
 #   docker compose up -d
 #   docker compose exec aether aether key create my-app --grant my-bucket=rw
 #
-# The S3 API is published on port 9000. The admin API and /metrics (9001)
-# are published on the host's loopback interface only.
+# The S3 API is published on port 9000. The admin API, the web console
+# (http://127.0.0.1:9001/) and /metrics are published on the host's loopback
+# interface only.
 
 services:
   aether:
-    build: ./aether_backend
+    build: .
     image: aether:latest
     restart: unless-stopped
     environment:

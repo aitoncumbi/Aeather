@@ -38,7 +38,7 @@ These are out of scope unless the roadmap says otherwise:
 ## Architecture
 
 ```
-  S3 clients (SDKs, aws cli, rclone)           Web console (v1.1)
+  S3 clients (SDKs, aws cli, rclone)          Web console, aether CLI
                  │                                     │
         ┌────────▼────────┐                   ┌────────▼────────┐
         │   S3 gateway    │  s3s on axum      │    Admin API    │  JSON, axum
@@ -86,21 +86,58 @@ not valid in a bucket name, so they cannot collide with path-style requests.
 ### Admin API
 
 A JSON API on its own port (`127.0.0.1:9001` by default): access keys, bucket
-permissions, buckets with usage, and node status. Requests use HTTP Basic auth with
-the access key id and secret of the root key or an admin key. The web console and
-the `aether` CLI (`aether key …`, `aether bucket …`, `aether status`) are clients of
-this API; neither has a private backdoor.
+permissions, buckets with usage, objects, node status and activity. Requests use
+HTTP Basic auth with the access key id and secret of the root key or an admin
+key, or a console session (below). The web console and the `aether` CLI
+(`aether key …`, `aether bucket …`, `aether status`) are clients of this API;
+neither has a private backdoor.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /api/v1/status` | Version, uptime, bucket/object/byte/block/key counts |
+| `GET /api/v1/status` | Version, uptime, counts, disk, storage settings, GC queue, scrub report, the S3 endpoint |
+| `GET /api/v1/stats?range=1h\|24h\|7d` | Request rates by kind, latency percentiles, bandwidth, errors and object counts over time |
+| `POST /api/v1/scrub` | Start a scrub now (`409` while one runs) |
 | `GET, POST /api/v1/keys` | List keys; create one (the response is the only time its secret is shown) |
 | `GET, PATCH, DELETE /api/v1/keys/{id}` | Show, update (name, admin, can_create_buckets, disabled), delete |
 | `PUT, DELETE /api/v1/keys/{id}/buckets/{bucket}` | Set or remove a key's permissions on a bucket |
 | `GET, POST /api/v1/buckets` | List buckets with usage; create one |
 | `GET, DELETE /api/v1/buckets/{name}` | Usage and the keys with access; delete an empty bucket |
+| `GET /api/v1/buckets/{name}/objects` | List objects: `prefix`, `delimiter`, `continuation`, `max_keys` |
+| `GET, PUT, DELETE /api/v1/buckets/{name}/object?key=` | Object details (storage, parts, checksums, metadata); upload; delete |
+| `GET /api/v1/buckets/{name}/object/download?key=` | The object's data, as an attachment |
+| `POST /api/v1/buckets/{name}/object/share` | A presigned S3 GET URL, signed with the caller's key |
+| `POST /api/v1/buckets/{name}/uploads`, `PUT …/uploads/{id}/parts/{n}`, `POST …/uploads/{id}/complete`, `DELETE …/uploads/{id}` | Multipart uploads |
+| `GET /api/v1/session`, `POST /api/v1/login`, `POST /api/v1/logout` | Console sessions |
+| `GET /api/v1/health` | Whether the node is ready, without credentials (for the sign-in page) |
 
 Errors are `{"error": {"code": "...", "message": "..."}}` with a matching HTTP status.
+
+### Web console
+
+A Next.js app in `console/`, built as a static export and embedded in the
+binary at compile time (`build.rs` includes `console/out`, or
+`$AETHER_CONSOLE_DIR`). The admin listener serves it next to the API, so there
+is one process to deploy and one origin: no CORS, and nothing to configure for
+the console to find the API. A binary built without the console serves a page
+explaining how to build it; `admin.console = false` turns it off.
+
+- **Sign-in.** Any admin key signs in. `POST /api/v1/login` checks the secret
+  and sets a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` with admin
+  TLS). Sessions live in memory: they end on sign-out, after 12 hours idle,
+  after 7 days, on restart, or as soon as the key is disabled, deleted or loses
+  admin. Browsers keep no secret.
+- **Objects go through the admin API**, not the S3 port: the console works
+  wherever the admin port is reachable (including an SSH tunnel), needs no CORS
+  rules on buckets, and signs nothing in the browser. Files up to 32 MiB are
+  one `PUT`; larger ones are multipart uploads, three parts at a time, aborted
+  if they fail or are cancelled.
+- **Share links** are ordinary presigned S3 GET URLs (SigV4, up to 7 days),
+  signed with the caller's key. They point at `s3.public_url` when set, or else
+  at the host the console was opened on, with the S3 port.
+- **Activity history** is sampled every 10 seconds into in-memory rings
+  (10-second, 1-minute and 10-minute resolution, covering 1 hour, 1 day and 7
+  days), so it starts empty after a restart. Prometheus remains the long-term
+  record.
 
 ### Engine
 
@@ -357,7 +394,18 @@ replication (v3) the same pass will repair from a healthy copy.
   In v1 they are protected by file permissions on the data directory. With
   encryption at rest (v2), they are encrypted under the master key.
 - TLS is supported natively (rustls) or can be terminated by a reverse proxy. The
-  admin API listens on loopback by default; exposing it without TLS logs a warning.
+  admin API listens on loopback by default; exposing it without TLS logs a warning,
+  and the console's sign-in page warns when it is opened over plain HTTP from
+  another host.
+- **Console sessions.** Writes authenticated by the session cookie must carry the
+  `x-aether-console` header, which a cross-site form cannot send (CSRF).
+  Requests from the console never get a Basic `WWW-Authenticate` challenge, so
+  browsers do not show their own sign-in dialog. Failed sign-ins wait 250 ms.
+- **Console pages** are served with a strict Content Security Policy
+  (`default-src 'self'`, `frame-ancestors 'none'`), `X-Frame-Options: DENY` and
+  `nosniff`. Downloads are always `application/octet-stream` attachments with
+  `Content-Security-Policy: sandbox`, so a stored HTML object cannot run script
+  in the console's origin.
 - `s3s` is not a full security boundary: we set body and object size limits,
   timeouts and listing limits ourselves.
 

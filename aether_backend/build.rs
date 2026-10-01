@@ -1,6 +1,8 @@
 //! Embeds the web console (the static export in `../console/out`, or
 //! `$AETHER_CONSOLE_DIR`) into the binary. Without a console build the server
 //! serves a page explaining how to make one, so Rust work never needs Node.
+//! Release builds set `AETHER_CONSOLE_DIR`, which must hold a build, so a
+//! missing one fails the build instead of shipping that page.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -10,13 +12,19 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=AETHER_CONSOLE_DIR");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("set by cargo"));
-    let dir = env::var_os("AETHER_CONSOLE_DIR").map(PathBuf::from).unwrap_or_else(|| manifest.join("../console/out"));
+    let required = env::var_os("AETHER_CONSOLE_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
+    let dir = required.clone().unwrap_or_else(|| manifest.join("../console/out"));
 
     let mut files = Vec::new();
     if dir.join("index.html").is_file() {
         println!("cargo::rerun-if-changed={}", dir.display());
         collect(&dir, &dir, &mut files);
         files.sort();
+    } else if required.is_some() {
+        panic!(
+            "AETHER_CONSOLE_DIR={} holds no console build (index.html); run `npm run build` in console/",
+            dir.display()
+        );
     } else if let Some(parent) = dir.parent().filter(|p| p.is_dir()) {
         // A missing path would rerun this script on every build; watching the
         // console's directory instead picks up its first build.

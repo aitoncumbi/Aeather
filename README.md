@@ -5,9 +5,10 @@ servers or containers and need object storage for internal applications.
 
 > **Status: v1 milestones complete, not yet proven in production.** A single
 > node works with the AWS SDKs, the AWS CLI, boto3 and rclone: multipart uploads,
-> server-side copies, per-application access keys, HTTPS, Prometheus metrics and
-> a Docker image. CI drives those clients against a live server and runs 239 of
-> Ceph's s3-tests. Next: the web console. See the [roadmap](docs/ROADMAP.md).
+> server-side copies, per-application access keys, HTTPS, Prometheus metrics, a
+> Docker image and a web console. CI drives those clients against a live server
+> and runs 239 of Ceph's s3-tests. See the [roadmap](docs/ROADMAP.md) for what
+> comes next.
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
 "AWS" below only refers to standard S3 client tools.
@@ -26,18 +27,19 @@ docker compose up -d
 ```
 
 [`compose.yaml`](compose.yaml) builds the image, keeps data in a named volume,
-publishes the S3 API on port 9000 and the admin API and metrics on the host's
-loopback interface only (127.0.0.1:9001). The image runs as a non-root user,
+publishes the S3 API on port 9000 and the admin API, web console and metrics on
+the host's loopback interface only (127.0.0.1:9001). The image runs as a non-root user,
 has a health check, and shuts down cleanly on `docker stop`. Run the CLI inside
 the container: `docker compose exec aether aether status`.
 
 ### From source
 
-Requires Rust 1.96 or newer.
+Requires Rust 1.96 or newer, and Node.js 20.9 or newer for the web console.
 
 ```sh
+(cd console && npm ci && npm run build)   # optional: the web console
 cd aether_backend
-cargo build --release
+cargo build --release                      # embeds console/out when it exists
 
 AETHER_S3__ACCESS_KEY=admin \
 AETHER_S3__SECRET_KEY=change-me-please \
@@ -66,6 +68,27 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 ```
 
 Clients then need to trust it: `aws --ca-bundle tls.crt`, `aether --ca-cert tls.crt`.
+
+## Web console
+
+Open the admin port in a browser, `http://127.0.0.1:9001/`, and sign in with the
+root key or another admin key. The console shows usage and request activity,
+creates and deletes buckets, browses, uploads, downloads and deletes objects,
+makes presigned share links, and manages keys and their bucket permissions.
+
+The admin port listens on loopback by default. From another machine, use an SSH
+tunnel (`ssh -L 9001:127.0.0.1:9001 server`, then open `http://127.0.0.1:9001/`)
+or serve the admin API over HTTPS (`tls.admin = true`) on a reachable address.
+
+- Sign-in sessions end on sign-out, after 12 hours idle or 7 days, when the
+  server restarts, and immediately when the key is disabled or deleted.
+- Share links are presigned S3 URLs: whoever has one can download the object
+  until it expires, from the S3 port. They use the host name the console was
+  opened with; when clients reach the S3 API at another address (a load
+  balancer, a reverse proxy), set `s3.public_url = "https://s3.example.com"`.
+- Request charts cover what the server has seen since it started; use the
+  Prometheus metrics for long-term history.
+- `admin.console = false` turns the console off; the admin API is unchanged.
 
 ## Give each application its own key
 
@@ -162,6 +185,20 @@ cd aether_backend
 cargo test      # unit tests and end-to-end tests with the AWS Rust SDK
 cargo clippy --all-targets
 cargo build --release
+```
+
+The console is a Next.js app in [`console/`](console). With a server running,
+`npm run dev` serves it with hot reloading at http://localhost:3000 and forwards
+`/api` to the admin API (`AETHER_ADMIN_URL`, default `http://127.0.0.1:9001`).
+Its end-to-end tests start a release build with its own data and drive the
+embedded console in Chromium:
+
+```sh
+cd console
+npm ci && npx playwright install chromium
+npm run typecheck
+npm run build && (cd ../aether_backend && cargo build --release)
+npm run e2e
 ```
 
 Compatibility checks run a release build against real clients (as CI does):

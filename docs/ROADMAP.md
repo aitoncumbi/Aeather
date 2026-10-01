@@ -65,7 +65,9 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Benchmarks (small-object ops/s, large-object throughput): [BENCHMARKS.md](BENCHMARKS.md)
 
 ## v1.1: console
-- [ ] Web console on the admin API: buckets, object browser, keys, permissions, usage
+- [x] Web console on the admin API, embedded in the binary: overview with usage and
+  activity charts, buckets, object browser (upload, download, presigned share links),
+  keys and permissions; sign-in sessions; end-to-end tests in CI
 - [ ] Group commit for metadata writes (small PUTs are capped by one fsync'd transaction
   at a time; see [BENCHMARKS.md](BENCHMARKS.md))
 - [ ] Per-bucket CORS (needed for browser uploads with presigned URLs)
