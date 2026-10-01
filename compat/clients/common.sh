@@ -1,7 +1,8 @@
+# shellcheck shell=bash
 # Helpers for the shell-based client checks. Source this file.
 
 mkdir -p "$WORKDIR"
-cd "$WORKDIR"
+cd "$WORKDIR" || exit 1
 
 # check DESCRIPTION EXPECTED ACTUAL
 check() {

@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared helpers for the compatibility scripts: start a throwaway Aether
 # server and stop it on exit. Source this file; do not run it.
 
