@@ -6,7 +6,12 @@ source "$(dirname "$0")/common.sh"
 
 export AWS_ACCESS_KEY_ID=$COMPAT_ACCESS_KEY AWS_SECRET_ACCESS_KEY=$COMPAT_SECRET_KEY
 export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FILE=/dev/null
-aws() { "${AWS_CLI:-aws}" --endpoint-url "$COMPAT_ENDPOINT" "$@"; }
+# No pager, and a stalled request fails within seconds instead of being
+# retried for minutes.
+export AWS_PAGER="" AWS_MAX_ATTEMPTS=1
+aws() {
+    "${AWS_CLI:-aws}" --endpoint-url "$COMPAT_ENDPOINT" --cli-connect-timeout 10 --cli-read-timeout 30 "$@"
+}
 B=compat-aws
 
 make_tree

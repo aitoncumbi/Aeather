@@ -19,8 +19,8 @@ start_server() {
     AETHER_STORAGE__DATA_DIR="$WORK/data" \
     AETHER_S3__ACCESS_KEY=$ROOT_KEY \
     AETHER_S3__SECRET_KEY=$ROOT_SECRET \
-    AETHER_LOG__LEVEL=${AETHER_LOG_LEVEL:-warn} \
-    AETHER_LOG__ACCESS_LOG=false \
+    AETHER_LOG__LEVEL=${COMPAT_LOG_LEVEL:-warn} \
+    AETHER_LOG__ACCESS_LOG=${COMPAT_ACCESS_LOG:-false} \
         "$AETHER" serve > "$WORK/server.log" 2>&1 &
     SERVER_PID=$!
     trap stop_server EXIT

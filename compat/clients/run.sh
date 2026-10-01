@@ -6,7 +6,9 @@
 #
 # Each client signs with an ordinary access key (not root) that may create
 # buckets, and works in its own bucket. Environment: AETHER (the binary),
-# AWS_CLI, PYTHON (with boto3), RCLONE, PORT, KEEP_LOG (keep the server log).
+# AWS_CLI, PYTHON (with boto3), RCLONE, PORT, KEEP_LOG (keep the server log),
+# CLIENT_TIMEOUT (seconds each client may take; default 600),
+# COMPAT_LOG_LEVEL and COMPAT_ACCESS_LOG=true (more detail in that log).
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 source compat/lib.sh
@@ -30,7 +32,8 @@ for client in "${clients[@]}"; do
         rclone) script=(bash compat/clients/rclone.sh) ;;
         *) echo "unknown client: $client" >&2; exit 2 ;;
     esac
-    if WORKDIR="$WORK/$client" "${script[@]}"; then
+    # A hung client fails here, with the server log, rather than stalling CI.
+    if WORKDIR="$WORK/$client" timeout "${CLIENT_TIMEOUT:-600}" "${script[@]}"; then
         echo "=== $client: ok"
     else
         echo "=== $client: FAILED"

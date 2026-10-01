@@ -17,7 +17,8 @@ env:
   CARGO_TERM_COLOR: always
   # ceph/s3-tests revision the pass list was recorded against.
   S3_TESTS_REF: 5522d1c351f75bc00ae0f64f742f3f095f5939d9
-  RCLONE_VERSION: v1.71.1
+  # Not RCLONE_*: rclone reads every RCLONE_<FLAG> variable as a flag.
+  CI_RCLONE_VERSION: v1.71.1
 
 defaults:
   run:
@@ -70,6 +71,7 @@ jobs:
     name: AWS CLI, boto3, rclone
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: .
@@ -88,9 +90,10 @@ jobs:
       - run: pip install boto3
       - name: Install rclone
         run: |
-          curl -fsSL -o rclone.zip "https://downloads.rclone.org/$RCLONE_VERSION/rclone-$RCLONE_VERSION-linux-amd64.zip"
+          curl -fsSL -o rclone.zip \
+            "https://downloads.rclone.org/$CI_RCLONE_VERSION/rclone-$CI_RCLONE_VERSION-linux-amd64.zip"
           unzip -q rclone.zip
-          sudo install "rclone-$RCLONE_VERSION-linux-amd64/rclone" /usr/local/bin/rclone
+          sudo install "rclone-$CI_RCLONE_VERSION-linux-amd64/rclone" /usr/local/bin/rclone
       - name: Client versions
         run: |
           aws --version
@@ -99,6 +102,9 @@ jobs:
       - run: compat/clients/run.sh
         env:
           KEEP_LOG: ${{ runner.temp }}/clients-server.log
+          # Record every request, so a failure's server log shows what arrived.
+          COMPAT_LOG_LEVEL: info
+          COMPAT_ACCESS_LOG: "true"
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
