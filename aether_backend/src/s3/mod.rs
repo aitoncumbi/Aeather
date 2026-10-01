@@ -18,7 +18,9 @@ use s3s::{S3, S3Request, S3Response, S3Result, TrailingHeaders, s3_error};
 use sync_wrapper::SyncStream;
 
 use self::convert::*;
+use crate::auth::Authorizer;
 use crate::engine::{Engine, StagedObject};
+use crate::error::Error as EngineError;
 use crate::meta::{ListPage, ListQuery, ObjectRecord};
 
 /// S3 limit on keys per DeleteObjects request.
@@ -26,12 +28,13 @@ const MAX_DELETE_KEYS: usize = 1000;
 
 pub struct AetherS3 {
     engine: Arc<Engine>,
+    auth: Arc<Authorizer>,
     region: String,
 }
 
 impl AetherS3 {
-    pub fn new(engine: Arc<Engine>, region: String) -> Self {
-        Self { engine, region }
+    pub fn new(engine: Arc<Engine>, auth: Arc<Authorizer>, region: String) -> Self {
+        Self { engine, auth, region }
     }
 
     fn owner() -> Owner {
@@ -141,11 +144,13 @@ impl S3 for AetherS3 {
     // ---- buckets ----
 
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
+        let identity = self.auth.caller(&req)?;
         let prefix = req.input.prefix.unwrap_or_default();
         let buckets = self.engine.list_buckets().await.map_err(s3_error)?;
+        // Keys only see the buckets they have some permission on.
         let buckets = buckets
             .into_iter()
-            .filter(|b| b.name.starts_with(&prefix))
+            .filter(|b| b.name.starts_with(&prefix) && !identity.grant(&b.name).is_empty())
             .map(|b| Bucket {
                 name: Some(b.name),
                 creation_date: Some(timestamp(b.created_at)),
@@ -158,11 +163,29 @@ impl S3 for AetherS3 {
     }
 
     async fn create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
+        let identity = self.auth.caller(&req)?;
         let input = req.input;
         if input.object_lock_enabled_for_bucket == Some(true) {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
-        self.engine.create_bucket(&input.bucket).await.map_err(s3_error)?;
+        let has_access = !identity.grant(&input.bucket).is_empty();
+        if !identity.can_create_buckets() {
+            // Applications often "create" their bucket at startup and ignore
+            // BucketAlreadyOwnedByYou, so answer that when the key can use it.
+            if has_access && self.engine.get_bucket(&input.bucket).await.is_ok() {
+                return Err(s3_error!(BucketAlreadyOwnedByYou));
+            }
+            return Err(s3_error!(AccessDenied, "this access key may not create buckets"));
+        }
+        let created = match identity.owner_key() {
+            Some(owner) => self.engine.create_bucket_for(&input.bucket, owner).await,
+            None => self.engine.create_bucket(&input.bucket).await,
+        };
+        match created {
+            Ok(_) => {}
+            Err(EngineError::BucketAlreadyExists) if !has_access => return Err(s3_error!(BucketAlreadyExists)),
+            Err(e) => return Err(s3_error(e)),
+        }
         let output = CreateBucketOutput { location: Some(format!("/{}", input.bucket)), ..Default::default() };
         Ok(S3Response::new(output))
     }

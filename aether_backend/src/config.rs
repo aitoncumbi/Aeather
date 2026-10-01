@@ -19,6 +19,7 @@ const DEFAULT_CONFIG_FILE: &str = "aether.toml";
 pub struct Config {
     pub storage: StorageConfig,
     pub s3: S3Config,
+    pub admin: AdminConfig,
     pub gc: GcConfig,
     pub log: LogConfig,
 }
@@ -45,6 +46,15 @@ pub struct S3Config {
     pub secret_key: Secret,
     /// Largest single PUT, in bytes. S3's own limit is 5 GiB.
     pub max_object_size: u64,
+}
+
+/// The JSON admin API (keys, permissions, buckets, usage).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminConfig {
+    pub enabled: bool,
+    /// Loopback by default; expose it deliberately (e.g. `0.0.0.0:9001` in a container).
+    pub listen: SocketAddr,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +125,12 @@ impl Default for S3Config {
             secret_key: Secret::default(),
             max_object_size: 5 * 1024 * 1024 * 1024,
         }
+    }
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self { enabled: true, listen: SocketAddr::from(([127, 0, 0, 1], 9001)) }
     }
 }
 

@@ -36,10 +36,11 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Multipart checksums: `COMPOSITE` and `FULL_OBJECT` (CRCs combined across parts)
 
 ### M4. Access control and admin API
-- [ ] Access keys stored in metadata, per-bucket permissions (read, write, admin)
+- [x] Access keys stored in metadata, per-bucket permissions (read, write, owner)
 - [x] Presigned URLs (verified by `s3s`; covered by tests)
-- [ ] Admin API: keys, buckets, permissions, usage stats
-- [ ] `aether` CLI subcommands for bootstrapping (create the first key)
+- [x] Admin API: keys, buckets, permissions, usage stats
+- [x] `aether key`, `aether bucket` and `aether status` CLI commands (admin API clients)
+- [x] Import existing access keys (migrating from another S3 store)
 
 ### M5. Operations
 - [x] TOML config with environment overrides

@@ -3,6 +3,7 @@ use std::time::Duration;
 use futures::TryStreamExt;
 
 use super::*;
+use crate::meta::{BucketGrant, KeyUpdate};
 
 /// Tiny blocks and inline threshold so multi-block paths run on small inputs.
 async fn test_engine() -> (Engine, tempfile::TempDir) {
@@ -769,4 +770,134 @@ async fn copy_checks_source_and_destination() {
         .await
         .unwrap();
     assert_eq!(read_all(&engine, &copied, 0..6).await, b"inline");
+}
+
+// ---- access keys and usage ----
+
+fn grant(read: bool, write: bool, owner: bool) -> BucketGrant {
+    BucketGrant { read, write, owner }
+}
+
+#[tokio::test]
+async fn keys_and_grants() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("alpha").await.unwrap();
+    engine.create_bucket("beta").await.unwrap();
+
+    let new = NewKey {
+        name: "billing".into(),
+        buckets: [("alpha".to_string(), grant(true, false, false))].into(),
+        ..Default::default()
+    };
+    let key = engine.create_key(new).await.unwrap();
+    assert!(key.access_key_id.starts_with("AK"));
+    assert_eq!(key.secret_key.len(), 40);
+    assert_eq!(engine.access_key(&key.access_key_id), Some(key.clone()));
+    let id = key.access_key_id.as_str();
+
+    let updated = engine.set_grant(id, "beta", grant(false, true, false)).await.unwrap();
+    assert_eq!(updated.buckets["beta"], grant(false, true, false));
+    let updated = engine.set_grant(id, "beta", BucketGrant::default()).await.unwrap();
+    assert!(!updated.buckets.contains_key("beta"));
+    assert!(matches!(engine.set_grant(id, "missing", BucketGrant::FULL).await, Err(Error::NoSuchBucket)));
+
+    let update = KeyUpdate { name: Some("billing-v2".into()), disabled: Some(true), ..Default::default() };
+    engine.update_key(id, update).await.unwrap();
+    let cached = engine.access_key(id).unwrap();
+    assert_eq!((cached.name.as_str(), cached.disabled, cached.buckets.len()), ("billing-v2", true, 1));
+
+    // A key granted on a missing bucket is not created at all.
+    let bad =
+        NewKey { name: "x".into(), buckets: [("nope".to_string(), BucketGrant::FULL)].into(), ..Default::default() };
+    assert!(matches!(engine.create_key(bad).await, Err(Error::NoSuchBucket)));
+    assert_eq!(engine.access_keys().len(), 1);
+
+    let imported = NewKey {
+        name: "legacy".into(),
+        access_key_id: Some("legacy-app".into()),
+        secret_key: Some("legacy-secret".into()),
+        ..Default::default()
+    };
+    engine.create_key(imported.clone()).await.unwrap();
+    assert!(matches!(engine.create_key(imported).await, Err(Error::AccessKeyExists)));
+    assert_eq!(engine.access_key("legacy-app").unwrap().secret_key, "legacy-secret");
+
+    engine.delete_key(id).await.unwrap();
+    assert_eq!(engine.access_key(id), None);
+    assert!(matches!(engine.delete_key(id).await, Err(Error::NoSuchAccessKey)));
+    assert!(matches!(engine.update_key(id, KeyUpdate::default()).await, Err(Error::NoSuchAccessKey)));
+}
+
+#[tokio::test]
+async fn buckets_carry_their_grants() {
+    let (engine, _dir) = test_engine().await;
+    let new = NewKey { name: "app".into(), can_create_buckets: true, ..Default::default() };
+    let id = engine.create_key(new).await.unwrap().access_key_id;
+
+    engine.create_bucket_for("mine", &id).await.unwrap();
+    assert_eq!(engine.access_key(&id).unwrap().buckets["mine"], BucketGrant::FULL);
+
+    // Deleting the bucket revokes the grant, so a new bucket with the same name starts clean.
+    engine.delete_bucket("mine").await.unwrap();
+    assert!(engine.access_key(&id).unwrap().buckets.is_empty());
+    engine.create_bucket("mine").await.unwrap();
+    assert!(engine.access_key(&id).unwrap().buckets.is_empty());
+
+    assert!(matches!(engine.create_bucket_for("orphan", "no-such-key").await, Err(Error::NoSuchAccessKey)));
+    assert!(matches!(engine.get_bucket("orphan").await, Err(Error::NoSuchBucket)));
+}
+
+async fn bkt_usage(engine: &Engine) -> BucketUsage {
+    engine.bucket_usage("bkt").await.unwrap().1
+}
+
+#[tokio::test]
+async fn usage_tracks_every_write() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    assert_eq!(bkt_usage(&engine).await, BucketUsage::default());
+
+    put(&engine, "bkt", "a", &pattern(100)).await;
+    put(&engine, "bkt", "b", &pattern(2500)).await;
+    put(&engine, "bkt", "a", &pattern(50)).await;
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 2550 });
+
+    engine.delete_object("bkt", "b").await.unwrap();
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 50 });
+
+    let a = engine.get_object("bkt", "a").await.unwrap();
+    engine.copy_object("bkt", "a", &a, "bkt", "c", ObjectAttrs::default(), WriteCondition::None).await.unwrap();
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 100 });
+
+    let id = engine.create_upload("bkt", "d", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "d", id, 1, &pattern(1500)).await;
+    let p2 = upload_part(&engine, "d", id, 2, &pattern(700)).await;
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 100 }, "parts do not count until completed");
+    complete(&engine, "d", id, &[(1, &p1), (2, &p2)]).await.unwrap();
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 3, bytes: 2300 });
+
+    engine.delete_objects("bkt", vec!["a".into(), "c".into(), "missing".into()]).await.unwrap();
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 2200 });
+
+    let all = engine.list_bucket_usage().await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!((all[0].0.name.as_str(), all[0].1), ("bkt", BucketUsage { objects: 1, bytes: 2200 }));
+}
+
+#[tokio::test]
+async fn schema_migration_rebuilds_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
+    {
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.create_bucket("bkt").await.unwrap();
+        engine.create_bucket("empty").await.unwrap();
+        put(&engine, "bkt", "a", &pattern(10)).await;
+        put(&engine, "bkt", "b", &pattern(20)).await;
+        engine.meta.downgrade_to_v1().unwrap();
+        assert_eq!(engine.bucket_usage("bkt").await.unwrap().1, BucketUsage::default());
+    }
+    let engine = Engine::open(config).await.unwrap();
+    assert_eq!(engine.bucket_usage("bkt").await.unwrap().1, BucketUsage { objects: 2, bytes: 30 });
+    assert_eq!(engine.bucket_usage("empty").await.unwrap().1, BucketUsage::default());
 }

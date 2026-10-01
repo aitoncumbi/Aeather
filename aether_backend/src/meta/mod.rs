@@ -8,6 +8,7 @@
 mod codec;
 mod keys;
 mod types;
+mod usage;
 
 use std::ops::Bound;
 use std::path::Path;
@@ -33,21 +34,30 @@ const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
 const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
 /// due time ‖ block id → ()
 const GC_QUEUE: TableDefinition<&[u8], ()> = TableDefinition::new("gc_queue");
+/// access key id → `AccessKeyRecord`
+const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
+/// bucket id → `BucketUsage`
+const BUCKET_USAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bucket_usage");
 /// name → value
 const SYSTEM: TableDefinition<&str, &[u8]> = TableDefinition::new("system");
 
-const SCHEMA_VERSION: u32 = 1;
+/// 1: initial layout. 2: adds `access_keys` and `bucket_usage`.
+const SCHEMA_VERSION: u32 = 2;
 
 // Commands and outcomes are short-lived; boxing the large variants buys nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
+    /// `owner`, if set, is the access key that created the bucket and gets full
+    /// permissions on it.
     CreateBucket {
         name: String,
         id: Uuid,
         created_at: Millis,
+        owner: Option<String>,
     },
-    /// Fails if the bucket has objects; aborts its in-progress uploads.
+    /// Fails if the bucket has objects. Aborts its in-progress uploads and
+    /// removes every key's permissions on it.
     DeleteBucket {
         name: String,
         gc_due_at: Millis,
@@ -118,6 +128,24 @@ pub enum Command {
     ForgetBlocks {
         entries: Vec<(Millis, Uuid)>,
     },
+    /// Fails with `AccessKeyExists` if the id is taken, or `NoSuchBucket` if
+    /// a granted bucket does not exist.
+    CreateKey {
+        key: AccessKeyRecord,
+    },
+    UpdateKey {
+        access_key_id: String,
+        update: KeyUpdate,
+    },
+    DeleteKey {
+        access_key_id: String,
+    },
+    /// Sets a key's permissions on a bucket; an empty grant removes them.
+    SetGrant {
+        access_key_id: String,
+        bucket: String,
+        grant: BucketGrant,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -127,6 +155,7 @@ pub enum Outcome {
     Bucket(BucketRecord),
     /// The object record that was replaced or deleted, if any.
     Object(Option<ObjectRecord>),
+    Key(AccessKeyRecord),
 }
 
 pub struct MetaStore {
@@ -144,19 +173,23 @@ impl MetaStore {
             txn.open_table(GC_QUEUE)?;
             txn.open_table(UPLOADS)?;
             txn.open_table(PARTS)?;
+            txn.open_table(ACCESS_KEYS)?;
+            txn.open_table(BUCKET_USAGE)?;
             let mut system = txn.open_table(SYSTEM)?;
             let stored = system.get("schema_version")?.map(|v| codec::decode::<u32>(v.value())).transpose()?;
             match stored {
-                None => {
-                    system.insert("schema_version", codec::encode(&SCHEMA_VERSION).as_slice())?;
+                None | Some(SCHEMA_VERSION) => {}
+                Some(1) => {
+                    tracing::info!("migrating metadata schema 1 -> 2: computing bucket usage");
+                    usage::rebuild(&txn)?;
                 }
-                Some(SCHEMA_VERSION) => {}
                 Some(other) => {
                     return Err(Error::Corrupt(format!(
                         "metadata schema version {other} is not supported (expected {SCHEMA_VERSION})"
                     )));
                 }
             }
+            system.insert("schema_version", codec::encode(&SCHEMA_VERSION).as_slice())?;
         }
         txn.commit()?;
         Ok(Self { db })
@@ -165,13 +198,20 @@ impl MetaStore {
     pub fn apply(&self, command: Command) -> Result<Outcome> {
         let txn = self.db.begin_write()?;
         let outcome = match command {
-            Command::CreateBucket { name, id, created_at } => {
+            Command::CreateBucket { name, id, created_at, owner } => {
                 let mut buckets = txn.open_table(BUCKETS)?;
                 if buckets.get(name.as_str())?.is_some() {
                     return Err(Error::BucketAlreadyExists);
                 }
                 let record = BucketRecord { id, name, created_at };
                 buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
+                usage::adjust(&txn, &record.id, None, None)?;
+                if let Some(owner) = owner {
+                    let mut keys = txn.open_table(ACCESS_KEYS)?;
+                    let mut key = load_key(&keys, &owner)?;
+                    key.buckets.insert(record.name.clone(), BucketGrant::FULL);
+                    keys.insert(owner.as_str(), codec::encode(&key).as_slice())?;
+                }
                 Outcome::Bucket(record)
             }
             Command::DeleteBucket { name, gc_due_at } => {
@@ -194,6 +234,20 @@ impl MetaStore {
                     remove_upload(&txn, &ukey, &upload_id, &[], gc_due_at)?;
                 }
                 buckets.remove(name.as_str())?;
+                usage::remove(&txn, &bucket.id)?;
+                // Grants are by name: drop them so a future bucket with the same
+                // name does not inherit them.
+                let mut keys = txn.open_table(ACCESS_KEYS)?;
+                let mut changed = Vec::new();
+                for entry in keys.iter()? {
+                    let mut key: AccessKeyRecord = codec::decode(entry?.1.value())?;
+                    if key.buckets.remove(&name).is_some() {
+                        changed.push(key);
+                    }
+                }
+                for key in changed {
+                    keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
+                }
                 Outcome::Done
             }
             Command::PutObject { bucket, key, record, condition, gc_due_at } => {
@@ -204,6 +258,7 @@ impl MetaStore {
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
                 check_condition(&condition, previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+                usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
 
                 let mut blocks = txn.open_table(BLOCKS)?;
                 let mut gc = txn.open_table(GC_QUEUE)?;
@@ -265,6 +320,7 @@ impl MetaStore {
                 check_condition(&condition, previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
                 drop(objects);
+                usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
 
                 // The object takes over the references held by the parts it uses.
                 let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
@@ -310,6 +366,7 @@ impl MetaStore {
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
                 check_condition(&condition, previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+                usage::adjust(&txn, &dst_bucket.id, Some(&record), previous.as_ref())?;
 
                 // Add references before releasing the previous object: when copying
                 // an object onto itself they are the same blocks.
@@ -333,6 +390,47 @@ impl MetaStore {
                     delete_object(&txn, &bucket, &key, gc_due_at)?;
                 }
                 Outcome::Done
+            }
+            Command::CreateKey { key } => {
+                let mut keys = txn.open_table(ACCESS_KEYS)?;
+                if keys.get(key.access_key_id.as_str())?.is_some() {
+                    return Err(Error::AccessKeyExists);
+                }
+                let buckets = txn.open_table(BUCKETS)?;
+                for bucket in key.buckets.keys() {
+                    load_bucket(&buckets, bucket)?;
+                }
+                keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
+                Outcome::Key(key)
+            }
+            Command::UpdateKey { access_key_id, update } => {
+                let mut keys = txn.open_table(ACCESS_KEYS)?;
+                let mut key = load_key(&keys, &access_key_id)?;
+                let KeyUpdate { name, admin, can_create_buckets, disabled } = update;
+                key.name = name.unwrap_or(key.name);
+                key.admin = admin.unwrap_or(key.admin);
+                key.can_create_buckets = can_create_buckets.unwrap_or(key.can_create_buckets);
+                key.disabled = disabled.unwrap_or(key.disabled);
+                keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
+                Outcome::Key(key)
+            }
+            Command::DeleteKey { access_key_id } => {
+                if txn.open_table(ACCESS_KEYS)?.remove(access_key_id.as_str())?.is_none() {
+                    return Err(Error::NoSuchAccessKey);
+                }
+                Outcome::Done
+            }
+            Command::SetGrant { access_key_id, bucket, grant } => {
+                let mut keys = txn.open_table(ACCESS_KEYS)?;
+                let mut key = load_key(&keys, &access_key_id)?;
+                load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                if grant.is_empty() {
+                    key.buckets.remove(&bucket);
+                } else {
+                    key.buckets.insert(bucket, grant);
+                }
+                keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
+                Outcome::Key(key)
             }
             Command::ForgetBlocks { entries } => {
                 let mut blocks = txn.open_table(BLOCKS)?;
@@ -437,6 +535,38 @@ impl MetaStore {
             }
         }
         Ok(page)
+    }
+
+    pub fn get_key(&self, access_key_id: &str) -> Result<Option<AccessKeyRecord>> {
+        let txn = self.db.begin_read()?;
+        let keys = txn.open_table(ACCESS_KEYS)?;
+        keys.get(access_key_id)?.map(|v| codec::decode(v.value())).transpose()
+    }
+
+    pub fn list_keys(&self) -> Result<Vec<AccessKeyRecord>> {
+        let txn = self.db.begin_read()?;
+        let keys = txn.open_table(ACCESS_KEYS)?;
+        keys.iter()?.map(|entry| codec::decode(entry?.1.value())).collect()
+    }
+
+    /// Every bucket with its usage, in name order.
+    pub fn list_bucket_usage(&self) -> Result<Vec<(BucketRecord, BucketUsage)>> {
+        let txn = self.db.begin_read()?;
+        let usage = txn.open_table(BUCKET_USAGE)?;
+        let mut out = Vec::new();
+        for entry in txn.open_table(BUCKETS)?.iter()? {
+            let bucket: BucketRecord = codec::decode(entry?.1.value())?;
+            let used = usage::get(&usage, &bucket.id)?;
+            out.push((bucket, used));
+        }
+        Ok(out)
+    }
+
+    pub fn bucket_usage(&self, bucket: &str) -> Result<(BucketRecord, BucketUsage)> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        let used = usage::get(&txn.open_table(BUCKET_USAGE)?, &bucket.id)?;
+        Ok((bucket, used))
     }
 
     /// Fails with `NoSuchBucket` or `NoSuchUpload`.
@@ -589,6 +719,16 @@ impl MetaStore {
         Ok(blocks.get(id.as_bytes().as_slice())?.is_some())
     }
 
+    /// Puts the database back into its schema-1 state, to test the migration.
+    #[cfg(test)]
+    pub fn downgrade_to_v1(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.open_table(BUCKET_USAGE)?.retain(|_, _| false)?;
+        txn.open_table(SYSTEM)?.insert("schema_version", codec::encode(&1u32).as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
     pub fn block_count(&self) -> Result<u64> {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(BLOCKS)?.len()?)
@@ -599,6 +739,13 @@ fn load_bucket(buckets: &impl ReadableTable<&'static str, &'static [u8]>, name: 
     match buckets.get(name)? {
         Some(v) => codec::decode(v.value()),
         None => Err(Error::NoSuchBucket),
+    }
+}
+
+fn load_key(keys: &impl ReadableTable<&'static str, &'static [u8]>, access_key_id: &str) -> Result<AccessKeyRecord> {
+    match keys.get(access_key_id)? {
+        Some(v) => codec::decode(v.value()),
+        None => Err(Error::NoSuchAccessKey),
     }
 }
 
@@ -673,6 +820,7 @@ fn delete_object(
     let previous: Option<ObjectRecord> =
         objects.remove(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
     if let Some(prev) = &previous {
+        usage::adjust(txn, &bucket.id, None, Some(prev))?;
         let mut blocks = txn.open_table(BLOCKS)?;
         let mut gc = txn.open_table(GC_QUEUE)?;
         release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;

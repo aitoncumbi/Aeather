@@ -75,8 +75,22 @@ not valid in a bucket name, so they cannot collide with path-style requests.
 
 ### Admin API
 
-A JSON API on its own port: access keys, bucket permissions, usage stats, node
-status. The web console is a client of this API and has no private backdoor.
+A JSON API on its own port (`127.0.0.1:9001` by default): access keys, bucket
+permissions, buckets with usage, and node status. Requests use HTTP Basic auth with
+the access key id and secret of the root key or an admin key. The web console and
+the `aether` CLI (`aether key …`, `aether bucket …`, `aether status`) are clients of
+this API; neither has a private backdoor.
+
+| Method and path | Purpose |
+|---|---|
+| `GET /api/v1/status` | Version, uptime, bucket/object/byte/block/key counts |
+| `GET, POST /api/v1/keys` | List keys; create one (the response is the only time its secret is shown) |
+| `GET, PATCH, DELETE /api/v1/keys/{id}` | Show, update (name, admin, can_create_buckets, disabled), delete |
+| `PUT, DELETE /api/v1/keys/{id}/buckets/{bucket}` | Set or remove a key's permissions on a bucket |
+| `GET, POST /api/v1/buckets` | List buckets with usage; create one |
+| `GET, DELETE /api/v1/buckets/{name}` | Usage and the keys with access; delete an empty bucket |
+
+Errors are `{"error": {"code": "...", "message": "..."}}` with a matching HTTP status.
 
 ### Engine
 
@@ -97,9 +111,14 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 | `gc_queue` | due_at (u64 BE) ‖ block_id | – |
 | `uploads` | bucket_id ‖ object key ‖ 0x00 ‖ upload_id | `UploadRecord` |
 | `parts` | upload_id ‖ part number (u32 BE) | `PartRecord` |
+| `access_keys` | access key id | `AccessKeyRecord` (secret, roles, per-bucket permissions) |
+| `bucket_usage` | bucket_id | object count and bytes, updated by every write |
 | `system` | name | schema version and other node-level values |
 
-Added in later milestones: `access_keys`, `versions` (v2).
+Added in later milestones: `versions` (v2).
+
+The schema version is checked at startup and older databases are migrated in place
+(version 1 → 2 computed `bucket_usage` from existing objects).
 
 Object keys may not contain NUL: S3's XML responses cannot carry it, and the
 `uploads` key uses it as a separator so uploads sort by key, then by start time
@@ -237,8 +256,27 @@ into compare-and-swap.
 - Every S3 request must be signed with SigV4 (anonymous access arrives with
   public-read buckets, later). Signature Version 2 is rejected: AWS deprecated it
   and it relies on HMAC-SHA1.
-- Each application gets its own access key, limited to specific buckets
-  (read, write or admin).
+- **Identities.** The root key comes from the config file and can do everything.
+  Every other identity is an access key stored in metadata, created through the
+  admin API. A key is either `admin` (everything, including the admin API) or has
+  per-bucket permissions:
+  - `read`: get and list objects
+  - `write`: put, copy and delete objects; multipart uploads
+  - `owner`: delete the bucket and, later, change its settings
+
+  `HeadBucket` needs any permission; `ListParts` and `ListMultipartUploads` need
+  read or write, so upload-only keys can resume uploads. `CopyObject` and
+  `UploadPartCopy` also need read on the source bucket. `ListBuckets` shows only the
+  buckets a key has some permission on.
+- **Bucket creation.** Keys with `can_create_buckets` become owners of the buckets
+  they create. A key without it that "creates" a bucket it can already use gets
+  `BucketAlreadyOwnedByYou`, which applications that create their bucket at startup
+  already handle.
+- **Revocation is immediate.** Keys are cached in memory and the cache is reloaded
+  before an admin change returns. Disabled and deleted keys fail with
+  `InvalidAccessKeyId`. Permissions are by bucket name and are removed when the
+  bucket is deleted, so a new bucket with the same name starts with no grants.
+- Admin API secrets are compared in constant time.
 - SigV4 needs the plaintext secret to verify signatures, so secrets cannot be hashed.
   In v1 they are protected by file permissions on the data directory. With
   encryption at rest (v2), they are encrypted under the master key.

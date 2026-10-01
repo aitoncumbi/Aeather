@@ -27,11 +27,13 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use self::keys::KeyCache;
+pub use self::keys::NewKey;
 use crate::blocks::{BlockStore, BlockWriter};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
-    BlockRef, BucketRecord, Command, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs, ObjectData, ObjectRecord,
-    Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord, WriteCondition,
+    BlockRef, BucketRecord, BucketUsage, Command, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs, ObjectData,
+    ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord, WriteCondition,
 };
 
 /// S3's limit for one ListObjects page.
@@ -85,6 +87,7 @@ impl Default for EngineConfig {
 pub struct Engine {
     meta: Arc<MetaStore>,
     blocks: Arc<BlockStore>,
+    keys: Arc<KeyCache>,
     config: EngineConfig,
 }
 
@@ -97,7 +100,9 @@ impl Engine {
         let meta_path = config.data_dir.join("meta.redb");
         let meta = tokio::task::spawn_blocking(move || MetaStore::open(&meta_path)).await??;
         let blocks = BlockStore::open(&config.data_dir).await?;
-        Ok(Self { meta: Arc::new(meta), blocks: Arc::new(blocks), config })
+        let keys = KeyCache::default();
+        KeyCache::load(&meta, &keys)?;
+        Ok(Self { meta: Arc::new(meta), blocks: Arc::new(blocks), keys: Arc::new(keys), config })
     }
 
     pub fn config(&self) -> &EngineConfig {
@@ -108,7 +113,8 @@ impl Engine {
 
     pub async fn create_bucket(&self, name: &str) -> Result<BucketRecord> {
         validate_bucket_name(name)?;
-        let command = Command::CreateBucket { name: name.to_owned(), id: Uuid::new_v4(), created_at: now_millis() };
+        let command =
+            Command::CreateBucket { name: name.to_owned(), id: Uuid::new_v4(), created_at: now_millis(), owner: None };
         match self.apply(command).await? {
             Outcome::Bucket(bucket) => Ok(bucket),
             other => unreachable!("CreateBucket returned {other:?}"),
@@ -116,11 +122,27 @@ impl Engine {
     }
 
     /// Fails with `BucketNotEmpty` unless the bucket has no objects.
-    /// Multipart uploads still in progress are aborted.
+    /// Multipart uploads still in progress are aborted, and every key loses
+    /// its permissions on the bucket.
     pub async fn delete_bucket(&self, name: &str) -> Result<()> {
         let command = Command::DeleteBucket { name: name.to_owned(), gc_due_at: self.gc_due_at() };
-        self.apply(command).await?;
+        self.apply_to_keys(command).await?;
         Ok(())
+    }
+
+    pub async fn bucket_usage(&self, name: &str) -> Result<(BucketRecord, BucketUsage)> {
+        let name = name.to_owned();
+        self.read(move |meta| meta.bucket_usage(&name)).await
+    }
+
+    /// Every bucket with its usage, in name order.
+    pub async fn list_bucket_usage(&self) -> Result<Vec<(BucketRecord, BucketUsage)>> {
+        self.read(|meta| meta.list_bucket_usage()).await
+    }
+
+    /// Number of block files referenced or awaiting deletion.
+    pub async fn block_count(&self) -> Result<u64> {
+        self.read(|meta| meta.block_count()).await
     }
 
     pub async fn get_bucket(&self, name: &str) -> Result<BucketRecord> {
@@ -896,6 +918,8 @@ pub fn validate_part_number(part_number: u32) -> Result<()> {
     }
     Ok(())
 }
+
+mod keys;
 
 #[cfg(test)]
 mod tests;

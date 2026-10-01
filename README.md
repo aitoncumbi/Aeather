@@ -4,9 +4,9 @@ S3-compatible object storage written in Rust, for teams that run their own
 servers or containers and need object storage for internal applications.
 
 > **Status: early development.** Single-node object storage, including multipart
-> uploads and server-side copies, works with the AWS SDKs, the AWS CLI and boto3
-> using their default settings. Per-application access keys and the admin API are
-> next. See the [roadmap](docs/ROADMAP.md).
+> uploads, server-side copies and per-application access keys, works with the AWS
+> SDKs, the AWS CLI and boto3 using their default settings. Operations work (TLS,
+> metrics, Docker image) is next. See the [roadmap](docs/ROADMAP.md).
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
 "AWS" below only refers to standard S3 client tools.
@@ -28,7 +28,9 @@ AETHER_STORAGE__DATA_DIR=/var/lib/aether \
 ./target/release/aether
 ```
 
-The S3 API listens on port 9000. All settings are listed in
+The S3 API listens on port 9000 and the admin API on `127.0.0.1:9001`. The root
+key set here can do everything; give each application its own key (below). All
+settings are listed in
 [`aether.example.toml`](aether_backend/aether.example.toml); copy it to
 `aether.toml` or pass `--config <file>`.
 
@@ -37,9 +39,37 @@ Health checks for load balancers and orchestrators:
 - `GET /_aether/health/live`: the process is up
 - `GET /_aether/health/ready`: the metadata store is answering
 
+## Give each application its own key
+
+Run these on the server host: the `aether` commands read the same config file
+and talk to the admin API with the root key. Elsewhere, pass `--url`,
+`--access-key` and `--secret-key` (or `AETHER_ADMIN_URL`,
+`AETHER_ADMIN_ACCESS_KEY`, `AETHER_ADMIN_SECRET_KEY`).
+
+```sh
+aether bucket create invoices
+aether key create "billing service" --grant invoices=rw
+# Access key id: AK64OA2XIS00HEL7LJ95
+# Secret key:    kC0ZGtTTxQeHxEThsiwFD/rHagA4UrpgDhkLVZrR
+# Save the secret key now: it cannot be shown again.
+
+aether key list
+aether key grant AK64OA2XIS00HEL7LJ95 reports r   # r: read, w: write, o: owner
+aether key disable AK64OA2XIS00HEL7LJ95           # takes effect immediately
+aether bucket show invoices                       # usage and which keys have access
+aether status
+```
+
+Other options: `--admin` for full access, `--create-buckets` for keys that create
+(and own) their buckets, and `--import-id`/`--import-secret` to keep an
+application's existing credentials when migrating from another S3 store. Every
+command takes `--json`. The underlying JSON API is described in
+[DESIGN.md](docs/DESIGN.md#admin-api).
+
 ## Use it
 
-Point any S3 client at the endpoint with path-style addressing.
+Point any S3 client at the endpoint with path-style addressing. The examples use
+the root key; applications use their own.
 
 ```sh
 export AWS_ACCESS_KEY_ID=admin AWS_SECRET_ACCESS_KEY=change-me-please AWS_DEFAULT_REGION=us-east-1
@@ -67,7 +97,8 @@ Current limitations:
 
 - **Only Signature Version 4 is accepted.** AWS CLI v1 creates SigV2 presigned
   URLs by default; set `s3.signature_version = s3v4` in its config.
-- One root key for now; per-application keys come with the admin API.
+- No TLS yet: put a TLS-terminating proxy in front for anything beyond a trusted
+  network (native TLS is planned, see the roadmap).
 
 ## Develop
 

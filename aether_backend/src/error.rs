@@ -36,6 +36,12 @@ pub enum Error {
     #[error("part {0} is smaller than the minimum part size")]
     EntityTooSmall(u32),
 
+    #[error("the access key does not exist")]
+    NoSuchAccessKey,
+
+    #[error("an access key with this id already exists")]
+    AccessKeyExists,
+
     /// A concurrent change invalidated the request; retrying may succeed.
     #[error("conflicting concurrent operation: {0}")]
     Conflict(String),

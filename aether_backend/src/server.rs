@@ -1,45 +1,72 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use futures::FutureExt;
+
 use axum::Router;
 use axum::body::Body;
 use axum::error_handling::HandleError;
 use axum::extract::State;
 use axum::http::{Response, StatusCode};
 use axum::routing::get;
-use s3s::auth::SimpleAuth;
 use s3s::config::StaticConfigProvider;
 use s3s::service::S3ServiceBuilder;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+use crate::auth::{Authorizer, S3Credentials, S3Permissions};
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::s3::AetherS3;
 
-/// Opens the engine and serves the S3 API until `shutdown` resolves.
+/// Opens the engine and serves the S3 and admin APIs until `shutdown` resolves.
 pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
     let engine = Arc::new(Engine::open(config.engine_config()).await?);
     let _background = engine.start_background_tasks();
+    let routers = routers(engine, &config);
+    let shutdown = shutdown.shared();
 
-    let listener = TcpListener::bind(config.s3.listen).await?;
+    let s3_listener = TcpListener::bind(config.s3.listen).await?;
     info!(
-        addr = %listener.local_addr()?,
+        addr = %s3_listener.local_addr()?,
         data_dir = %config.storage.data_dir.display(),
         region = %config.s3.region,
         "S3 API listening"
     );
-    axum::serve(listener, router(engine, &config)).with_graceful_shutdown(shutdown).await?;
+    let s3 = axum::serve(s3_listener, routers.s3).with_graceful_shutdown(shutdown.clone());
+
+    if config.admin.enabled {
+        let admin_listener = TcpListener::bind(config.admin.listen).await?;
+        info!(addr = %admin_listener.local_addr()?, "admin API listening");
+        let admin = axum::serve(admin_listener, routers.admin).with_graceful_shutdown(shutdown);
+        tokio::try_join!(s3.into_future(), admin.into_future())?;
+    } else {
+        s3.await?;
+    }
     info!("shut down");
     Ok(())
 }
 
-pub fn router(engine: Arc<Engine>, config: &Config) -> Router {
+/// The two HTTP applications, sharing one engine and one set of identities.
+pub struct Routers {
+    pub s3: Router,
+    pub admin: Router,
+}
+
+pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
+    let auth =
+        Authorizer::new(Arc::clone(&engine), config.s3.access_key.clone(), config.s3.secret_key.expose().to_owned());
+    Routers { s3: s3_router(Arc::clone(&engine), Arc::clone(&auth), config), admin: crate::admin::router(engine, auth) }
+}
+
+fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Router {
     let mut s3_config = s3s::config::S3Config::default();
     s3_config.put_object_max_size = Some(config.s3.max_object_size);
 
-    let mut builder = S3ServiceBuilder::new(AetherS3::new(Arc::clone(&engine), config.s3.region.clone()));
-    builder.set_auth(SimpleAuth::from_single(config.s3.access_key.clone(), config.s3.secret_key.expose()));
+    let s3 = AetherS3::new(Arc::clone(&engine), Arc::clone(&auth), config.s3.region.clone());
+    let mut builder = S3ServiceBuilder::new(s3);
+    builder.set_auth(S3Credentials(Arc::clone(&auth)));
+    builder.set_access(S3Permissions(auth));
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
     let s3 = HandleError::new(builder.build(), |err: s3s::HttpError| async move {
         error!(error = ?err, "S3 request failed");

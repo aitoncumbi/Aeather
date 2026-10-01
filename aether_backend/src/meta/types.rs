@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -80,6 +81,81 @@ pub struct BlockRef {
     pub id: Uuid,
     pub len: u64,
     pub crc32c: u32,
+}
+
+/// Credentials for one application, and what they may access.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessKeyRecord {
+    pub access_key_id: String,
+    /// Stored in plaintext: SigV4 verification needs it. Encrypted under the
+    /// master key once encryption at rest exists (v2).
+    pub secret_key: String,
+    /// What the key is for, e.g. the application's name.
+    pub name: String,
+    pub created_at: Millis,
+    /// Full access to every bucket and to the admin API.
+    #[serde(default)]
+    pub admin: bool,
+    /// May create buckets; it becomes their owner.
+    #[serde(default)]
+    pub can_create_buckets: bool,
+    /// Disabled keys are rejected but kept, so they can be re-enabled.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Bucket name → permissions. Removed when the bucket is deleted.
+    #[serde(default)]
+    pub buckets: BTreeMap<String, BucketGrant>,
+}
+
+impl fmt::Debug for AccessKeyRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AccessKeyRecord")
+            .field("access_key_id", &self.access_key_id)
+            .field("name", &self.name)
+            .field("admin", &self.admin)
+            .field("can_create_buckets", &self.can_create_buckets)
+            .field("disabled", &self.disabled)
+            .field("buckets", &self.buckets)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Permissions of one key on one bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketGrant {
+    /// Get and list objects.
+    #[serde(default)]
+    pub read: bool,
+    /// Put, copy and delete objects; multipart uploads.
+    #[serde(default)]
+    pub write: bool,
+    /// Delete the bucket and change its settings.
+    #[serde(default)]
+    pub owner: bool,
+}
+
+impl BucketGrant {
+    pub const FULL: Self = Self { read: true, write: true, owner: true };
+
+    pub fn is_empty(&self) -> bool {
+        !(self.read || self.write || self.owner)
+    }
+}
+
+/// Changes to a key's settings; `None` leaves a field unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyUpdate {
+    pub name: Option<String>,
+    pub admin: Option<bool>,
+    pub can_create_buckets: Option<bool>,
+    pub disabled: Option<bool>,
+}
+
+/// Object count and total size of a bucket, kept up to date by every write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketUsage {
+    pub objects: u64,
+    pub bytes: u64,
 }
 
 /// A multipart upload in progress.

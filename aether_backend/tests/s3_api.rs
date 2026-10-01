@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aether_backend::config::{Config, Secret};
-use aether_backend::engine::Engine;
+use aether_backend::engine::{Engine, NewKey};
+use aether_backend::meta::{BucketGrant, KeyUpdate};
 use aether_backend::server;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
@@ -28,6 +29,7 @@ const SECRET_KEY: &str = "test-secret-key";
 struct TestServer {
     client: Client,
     addr: SocketAddr,
+    engine: Arc<Engine>,
     _dir: tempfile::TempDir,
 }
 
@@ -42,18 +44,22 @@ async fn start() -> TestServer {
     let engine = Arc::new(Engine::open(config.engine_config()).await.unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = server::router(engine, &config);
+    let app = server::routers(Arc::clone(&engine), &config).s3;
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    TestServer { client: client(addr, SECRET_KEY), addr, _dir: dir }
+    TestServer { client: client(addr, SECRET_KEY), addr, engine, _dir: dir }
 }
 
 fn client(addr: SocketAddr, secret: &str) -> Client {
+    client_for(addr, ACCESS_KEY, secret)
+}
+
+fn client_for(addr: SocketAddr, access_key: &str, secret: &str) -> Client {
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://{addr}"))
-        .credentials_provider(Credentials::new(ACCESS_KEY, secret, None, None, "test"))
+        .credentials_provider(Credentials::new(access_key, secret, None, None, "test"))
         .force_path_style(true)
         .build();
     Client::from_conf(config)
@@ -765,4 +771,170 @@ async fn upload_part_copy_assembles_ranges() {
         .await
         .unwrap();
     assert_eq!(get_bytes(c, "bkt", "joined").await, [&source[MIB..], b"tail"].concat());
+}
+
+// ---- access keys ----
+
+const READ: BucketGrant = BucketGrant { read: true, write: false, owner: false };
+const WRITE: BucketGrant = BucketGrant { read: false, write: true, owner: false };
+const READ_WRITE: BucketGrant = BucketGrant { read: true, write: true, owner: false };
+
+/// Creates an access key and a client that signs with it.
+async fn key_client(
+    s: &TestServer,
+    grants: &[(&str, BucketGrant)],
+    configure: impl FnOnce(&mut NewKey),
+) -> (Client, String) {
+    let mut new = NewKey {
+        name: "test app".into(),
+        buckets: grants.iter().map(|(b, g)| (b.to_string(), *g)).collect(),
+        ..Default::default()
+    };
+    configure(&mut new);
+    let key = s.engine.create_key(new).await.unwrap();
+    (client_for(s.addr, &key.access_key_id, &key.secret_key), key.access_key_id)
+}
+
+async fn put(c: &Client, bucket: &str, key: &str) -> Result<(), String> {
+    c.put_object().bucket(bucket).key(key).body(ByteStream::from_static(b"data")).send().await.map(|_| ()).map_err(code)
+}
+
+async fn get(c: &Client, bucket: &str, key: &str) -> Result<(), String> {
+    c.get_object().bucket(bucket).key(key).send().await.map(|_| ()).map_err(code)
+}
+
+fn code<E: ProvideErrorMetadata>(e: E) -> String {
+    e.code().unwrap_or("<none>").to_owned()
+}
+
+fn denied() -> Result<(), String> {
+    Err("AccessDenied".into())
+}
+
+#[tokio::test]
+async fn keys_only_reach_their_buckets() {
+    let s = start().await;
+    for bucket in ["app", "other"] {
+        s.client.create_bucket().bucket(bucket).send().await.unwrap();
+        put(&s.client, bucket, "x").await.unwrap();
+    }
+    let (app, _) = key_client(&s, &[("app", READ_WRITE)], |_| {}).await;
+
+    assert_eq!(put(&app, "app", "k").await, Ok(()));
+    assert_eq!(get(&app, "app", "k").await, Ok(()));
+    app.list_objects_v2().bucket("app").send().await.unwrap();
+    app.copy_object().bucket("app").key("copy").copy_source("app/k").send().await.unwrap();
+
+    assert_eq!(get(&app, "other", "x").await, denied());
+    assert_eq!(put(&app, "other", "k").await, denied());
+    assert_eq!(code(app.list_objects_v2().bucket("other").send().await.unwrap_err()), "AccessDenied");
+    assert!(app.head_bucket().bucket("other").send().await.is_err());
+    let err = app.copy_object().bucket("app").key("stolen").copy_source("other/x").send().await.unwrap_err();
+    assert_eq!(code(err), "AccessDenied");
+
+    let names: Vec<_> =
+        app.list_buckets().send().await.unwrap().buckets().iter().filter_map(|b| b.name()).map(str::to_owned).collect();
+    assert_eq!(names, ["app"]);
+    assert_eq!(code(app.delete_bucket().bucket("app").send().await.unwrap_err()), "AccessDenied");
+    assert_eq!(code(app.create_bucket().bucket("new").send().await.unwrap_err()), "AccessDenied");
+    // "Create if missing" at startup gets the answer apps already handle.
+    assert_eq!(code(app.create_bucket().bucket("app").send().await.unwrap_err()), "BucketAlreadyOwnedByYou");
+}
+
+#[tokio::test]
+async fn read_only_and_write_only_keys() {
+    let s = start().await;
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+    put(&s.client, "bkt", "existing").await.unwrap();
+    let (reader, _) = key_client(&s, &[("bkt", READ)], |_| {}).await;
+    let (writer, _) = key_client(&s, &[("bkt", WRITE)], |_| {}).await;
+
+    assert_eq!(get(&reader, "bkt", "existing").await, Ok(()));
+    reader.list_objects_v2().bucket("bkt").send().await.unwrap();
+    assert_eq!(put(&reader, "bkt", "k").await, denied());
+    assert_eq!(code(reader.delete_object().bucket("bkt").key("existing").send().await.unwrap_err()), "AccessDenied");
+    let err = reader.create_multipart_upload().bucket("bkt").key("k").send().await.unwrap_err();
+    assert_eq!(code(err), "AccessDenied");
+
+    assert_eq!(put(&writer, "bkt", "upload").await, Ok(()));
+    assert_eq!(get(&writer, "bkt", "existing").await, denied());
+    assert_eq!(code(writer.list_objects_v2().bucket("bkt").send().await.unwrap_err()), "AccessDenied");
+    // Uploaders can run multipart uploads end to end, including ListParts.
+    let upload_id =
+        writer.create_multipart_upload().bucket("bkt").key("mp").send().await.unwrap().upload_id().unwrap().to_owned();
+    let part = writer
+        .upload_part()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"part"))
+        .send()
+        .await
+        .unwrap();
+    writer.list_parts().bucket("bkt").key("mp").upload_id(&upload_id).send().await.unwrap();
+    writer
+        .complete_multipart_upload()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(&upload_id)
+        .multipart_upload(completed(&[(1, part.e_tag().unwrap().to_owned())]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_bytes(&s.client, "bkt", "mp").await, b"part");
+}
+
+#[tokio::test]
+async fn keys_that_create_buckets_own_them() {
+    let s = start().await;
+    s.client.create_bucket().bucket("taken").send().await.unwrap();
+    let (creator, _) = key_client(&s, &[], |k| k.can_create_buckets = true).await;
+
+    creator.create_bucket().bucket("mine").send().await.unwrap();
+    assert_eq!(put(&creator, "mine", "k").await, Ok(()));
+    assert_eq!(get(&creator, "mine", "k").await, Ok(()));
+    let err = creator.create_bucket().bucket("taken").send().await.unwrap_err();
+    assert_eq!(code(err), "BucketAlreadyExists", "someone else's bucket");
+    assert_eq!(get(&creator, "taken", "k").await, denied());
+
+    creator.delete_object().bucket("mine").key("k").send().await.unwrap();
+    creator.delete_bucket().bucket("mine").send().await.unwrap();
+}
+
+#[tokio::test]
+async fn disabled_and_deleted_keys_are_rejected() {
+    let s = start().await;
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+    let (app, id) = key_client(&s, &[("bkt", READ_WRITE)], |_| {}).await;
+    app.list_buckets().send().await.unwrap();
+
+    s.engine.update_key(&id, KeyUpdate { disabled: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(code(app.list_buckets().send().await.unwrap_err()), "InvalidAccessKeyId");
+    s.engine.update_key(&id, KeyUpdate { disabled: Some(false), ..Default::default() }).await.unwrap();
+    app.list_buckets().send().await.unwrap();
+
+    s.engine.delete_key(&id).await.unwrap();
+    assert_eq!(code(app.list_buckets().send().await.unwrap_err()), "InvalidAccessKeyId");
+}
+
+#[tokio::test]
+async fn admin_keys_have_full_access() {
+    let s = start().await;
+    s.client.create_bucket().bucket("root-made").send().await.unwrap();
+    let (admin, _) = key_client(&s, &[], |k| k.admin = true).await;
+    admin.create_bucket().bucket("admin-made").send().await.unwrap();
+    assert_eq!(put(&admin, "root-made", "k").await, Ok(()));
+    let names: Vec<_> = admin
+        .list_buckets()
+        .send()
+        .await
+        .unwrap()
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(names, ["admin-made", "root-made"]);
+    admin.delete_bucket().bucket("admin-made").send().await.unwrap();
 }

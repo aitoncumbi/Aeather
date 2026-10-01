@@ -1,6 +1,9 @@
 //! Aether: S3-compatible object storage. See `docs/DESIGN.md`.
 
+pub mod admin;
+pub mod auth;
 pub mod blocks;
+pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod error;
