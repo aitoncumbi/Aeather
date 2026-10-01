@@ -86,7 +86,8 @@ async fn small_objects_are_inline() {
         user_metadata: [("owner".to_string(), "ops".to_string())].into(),
         ..Default::default()
     };
-    let written = engine.put_object("bkt", "hello.txt", body(b"hello", 2), attrs.clone(), WriteCondition::None).await.unwrap();
+    let written =
+        engine.put_object("bkt", "hello.txt", body(b"hello", 2), attrs.clone(), WriteCondition::None).await.unwrap();
 
     assert!(matches!(written.data, ObjectData::Inline(_)));
     assert_eq!(written.etag, "5d41402abc4b2a76b9719d911017c592");
@@ -150,6 +151,22 @@ async fn overwrite_and_delete_release_blocks() {
 }
 
 #[tokio::test]
+async fn batch_delete() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    put(&engine, "bkt", "a", &pattern(1500)).await;
+    put(&engine, "bkt", "b", b"small").await;
+    put(&engine, "bkt", "c", b"keep").await;
+
+    let keys = vec!["a".to_string(), "b".to_string(), "missing".to_string()];
+    engine.delete_objects("bkt", keys).await.unwrap();
+    let page = engine.list_objects("bkt", ListQuery { max_keys: 10, ..Default::default() }).await.unwrap();
+    assert_eq!(page.objects.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["c"]);
+    assert_eq!(engine.collect_garbage().await.unwrap(), 2);
+    assert!(matches!(engine.delete_objects("nope", vec![]).await, Err(Error::NoSuchBucket)));
+}
+
+#[tokio::test]
 async fn gc_waits_for_grace_period() {
     let dir = tempfile::tempdir().unwrap();
     let config = EngineConfig {
@@ -194,7 +211,13 @@ async fn conditional_writes() {
     wait_for_block_files(&engine, before).await;
 
     let err = engine
-        .put_object("bkt", "missing", body(b"x", 1), ObjectAttrs::default(), WriteCondition::IfMatch(first.etag.clone()))
+        .put_object(
+            "bkt",
+            "missing",
+            body(b"x", 1),
+            ObjectAttrs::default(),
+            WriteCondition::IfMatch(first.etag.clone()),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoSuchKey));
@@ -217,7 +240,8 @@ async fn failed_uploads_leave_no_blocks() {
     engine.create_bucket("bkt").await.unwrap();
 
     // The client disconnects after 2500 bytes.
-    let mut chunks: Vec<Result<Bytes, io::Error>> = pattern(2500).chunks(500).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
+    let mut chunks: Vec<Result<Bytes, io::Error>> =
+        pattern(2500).chunks(500).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
     chunks.push(Err(io::Error::new(io::ErrorKind::ConnectionReset, "client went away")));
     let err = engine.stage(stream::iter(chunks)).await.unwrap_err();
     assert!(matches!(err, Error::Body(_)));
@@ -265,7 +289,12 @@ async fn sweeper_removes_only_orphans() {
 #[tokio::test]
 async fn reopen_keeps_data() {
     let dir = tempfile::tempdir().unwrap();
-    let config = EngineConfig { data_dir: dir.path().to_path_buf(), block_size: 1000, inline_threshold: 100, ..Default::default() };
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        block_size: 1000,
+        inline_threshold: 100,
+        ..Default::default()
+    };
     {
         let engine = Engine::open(config.clone()).await.unwrap();
         engine.create_bucket("bkt").await.unwrap();
@@ -388,8 +417,5 @@ async fn listing_details() {
     let query = ListQuery { max_keys: 5000, ..Default::default() };
     assert_eq!(engine.list_objects("bkt", query).await.unwrap().objects.len(), 2);
 
-    assert!(matches!(
-        engine.list_objects("nope", ListQuery::default()).await,
-        Err(Error::NoSuchBucket)
-    ));
+    assert!(matches!(engine.list_objects("nope", ListQuery::default()).await, Err(Error::NoSuchBucket)));
 }

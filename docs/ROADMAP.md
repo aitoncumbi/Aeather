@@ -17,15 +17,15 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Background GC with a grace period, orphan sweeper
 
 ### M2. S3 gateway
-- [ ] `s3s` on axum, replacing the actix-web prototype
-- [ ] Buckets: CreateBucket, DeleteBucket (empty only), HeadBucket, ListBuckets, GetBucketLocation
-- [ ] Objects: PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects
-- [ ] ListObjects and ListObjectsV2
-- [ ] Range GET, conditional GET (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`)
-- [ ] Content-MD5 and `x-amz-checksum-*` verification, including aws-chunked trailers
-- [ ] SigV4 auth with a root key from config
-- [ ] Liveness and readiness endpoints
-- [ ] End-to-end tests with the Rust AWS SDK
+- [x] `s3s` on axum, replacing the actix-web prototype
+- [x] Buckets: CreateBucket, DeleteBucket (empty only), HeadBucket, ListBuckets, GetBucketLocation
+- [x] Objects: PutObject, GetObject, HeadObject, DeleteObject, DeleteObjects
+- [x] ListObjects and ListObjectsV2
+- [x] Range GET, conditional GET (`If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`)
+- [x] Content-MD5 and `x-amz-checksum-*` verification, including aws-chunked trailers
+- [x] SigV4 auth with a root key from config
+- [x] Liveness and readiness endpoints
+- [x] End-to-end tests with the Rust AWS SDK
 
 ### M3. Large objects and copies
 - [ ] Multipart upload: Create, UploadPart, Complete, Abort, ListParts, ListMultipartUploads
@@ -36,16 +36,17 @@ anything from a 1 KB document to a 100 GB file.
 
 ### M4. Access control and admin API
 - [ ] Access keys stored in metadata, per-bucket permissions (read, write, admin)
-- [ ] Presigned URLs (verified by `s3s`; covered by tests)
+- [x] Presigned URLs (verified by `s3s`; covered by tests)
 - [ ] Admin API: keys, buckets, permissions, usage stats
 - [ ] `aether` CLI subcommands for bootstrapping (create the first key)
 
 ### M5. Operations
-- [ ] TOML config with environment overrides
+- [x] TOML config with environment overrides
 - [ ] Native TLS (rustls)
 - [ ] Prometheus metrics: requests, latency, bytes, errors, GC, disk usage
-- [ ] JSON logs option, request ids
-- [ ] Graceful shutdown (finish in-flight requests)
+- [x] JSON logs option
+- [ ] Request ids in logs and responses
+- [x] Graceful shutdown (finish in-flight requests)
 - [ ] Request timeouts and body limits
 - [ ] Docker image and example compose file
 - [ ] Background scrubber that verifies block CRC32Cs

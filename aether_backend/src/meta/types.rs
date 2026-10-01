@@ -39,8 +39,9 @@ pub struct ObjectAttrs {
     pub content_language: Option<String>,
     #[serde(default)]
     pub cache_control: Option<String>,
+    /// Raw `Expires` header value; S3 stores it verbatim.
     #[serde(default)]
-    pub expires: Option<Millis>,
+    pub expires: Option<String>,
     /// `x-amz-meta-*` headers, without the prefix.
     #[serde(default)]
     pub user_metadata: BTreeMap<String, String>,

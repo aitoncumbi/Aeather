@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use self::keys::prefix_successor;
-pub use self::types::*;
 use self::keys::{gc_key, object_key, parse_gc_key};
+pub use self::types::*;
 use crate::error::{Error, Result};
 
 /// bucket name → `BucketRecord`
@@ -57,6 +57,12 @@ pub enum Command {
     DeleteObject {
         bucket: String,
         key: String,
+        gc_due_at: Millis,
+    },
+    /// Deletes many keys in one transaction (S3 DeleteObjects).
+    DeleteObjects {
+        bucket: String,
+        keys: Vec<String>,
         gc_due_at: Millis,
     },
     /// Drop GC queue entries whose block files have been deleted.
@@ -158,16 +164,14 @@ impl MetaStore {
             }
             Command::DeleteObject { bucket, key, gc_due_at } => {
                 let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                let mut objects = txn.open_table(OBJECTS)?;
-                let okey = object_key(&bucket.id, key.as_bytes());
-                let previous: Option<ObjectRecord> =
-                    objects.remove(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                if let Some(prev) = &previous {
-                    let mut blocks = txn.open_table(BLOCKS)?;
-                    let mut gc = txn.open_table(GC_QUEUE)?;
-                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+                Outcome::Object(delete_object(&txn, &bucket, &key, gc_due_at)?)
+            }
+            Command::DeleteObjects { bucket, keys, gc_due_at } => {
+                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                for key in keys {
+                    delete_object(&txn, &bucket, &key, gc_due_at)?;
                 }
-                Outcome::Object(previous)
+                Outcome::Done
             }
             Command::ForgetBlocks { entries } => {
                 let mut blocks = txn.open_table(BLOCKS)?;
@@ -305,6 +309,24 @@ fn load_bucket(buckets: &impl ReadableTable<&'static str, &'static [u8]>, name: 
         Some(v) => codec::decode(v.value()),
         None => Err(Error::NoSuchBucket),
     }
+}
+
+fn delete_object(
+    txn: &redb::WriteTransaction,
+    bucket: &BucketRecord,
+    key: &str,
+    gc_due_at: Millis,
+) -> Result<Option<ObjectRecord>> {
+    let mut objects = txn.open_table(OBJECTS)?;
+    let okey = object_key(&bucket.id, key.as_bytes());
+    let previous: Option<ObjectRecord> =
+        objects.remove(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+    if let Some(prev) = &previous {
+        let mut blocks = txn.open_table(BLOCKS)?;
+        let mut gc = txn.open_table(GC_QUEUE)?;
+        release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+    }
+    Ok(previous)
 }
 
 fn add_block_ref(blocks: &mut redb::Table<&[u8], u64>, id: &Uuid) -> Result<()> {

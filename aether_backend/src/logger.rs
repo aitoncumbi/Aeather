@@ -1,26 +1,16 @@
-use tracing_subscriber::{EnvFilter};
-use tracing_appender::rolling::daily;
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::EnvFilter;
 
-pub fn init_logger() {
-     let file_appender = daily("logs", "app.log").with_max_level(tracing::Level::DEBUG);
+use crate::config::{LogConfig, LogFormat};
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-
-    let result = tracing_subscriber::fmt()
-        .with_writer(std::io::stdout.and(file_appender))
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_level(true)
-        .with_file(true)
-        .with_line_number(true)
-        // .json()
-        .compact()
-        .try_init();
-
+/// Logs to stdout. `RUST_LOG`, when set, overrides the configured level.
+pub fn init(config: &LogConfig) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter).with_target(true);
+    let result = match config.format {
+        LogFormat::Json => builder.json().try_init(),
+        LogFormat::Text => builder.compact().try_init(),
+    };
     if let Err(e) = result {
-        // Use println! here since tracing might not be set up yet
-        println!("Warning: Logger already initialized: {}", e);
+        eprintln!("logger already initialized: {e}");
     }
 }

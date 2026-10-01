@@ -57,10 +57,4 @@ macro_rules! from_redb {
     )*};
 }
 
-from_redb!(
-    redb::DatabaseError,
-    redb::TransactionError,
-    redb::TableError,
-    redb::StorageError,
-    redb::CommitError
-);
+from_redb!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);

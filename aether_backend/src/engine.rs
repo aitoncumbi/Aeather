@@ -259,6 +259,17 @@ impl Engine {
         }
     }
 
+    /// Deletes up to 1000 keys in one commit. Missing keys are not an error.
+    pub async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<()> {
+        let command = Command::DeleteObjects {
+            bucket: bucket.to_owned(),
+            keys,
+            gc_due_at: now_millis() + self.gc_grace_millis(),
+        };
+        self.apply(command).await?;
+        Ok(())
+    }
+
     // ---- reads ----
 
     pub async fn get_object(&self, bucket: &str, key: &str) -> Result<ObjectRecord> {

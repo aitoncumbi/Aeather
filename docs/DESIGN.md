@@ -187,7 +187,8 @@ into compare-and-swap.
 ## Security
 
 - Every S3 request must be signed with SigV4 (anonymous access arrives with
-  public-read buckets, later).
+  public-read buckets, later). Signature Version 2 is rejected: AWS deprecated it
+  and it relies on HMAC-SHA1.
 - Each application gets its own access key, limited to specific buckets
   (read, write or admin).
 - SigV4 needs the plaintext secret to verify signatures, so secrets cannot be hashed.

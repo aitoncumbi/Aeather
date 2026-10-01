@@ -1,0 +1,37 @@
+# Aether configuration. Copy to aether.toml, or pass --config <file>.
+# Every setting can also come from the environment: AETHER_<SECTION>__<KEY>,
+# e.g. AETHER_S3__SECRET_KEY. Environment variables win over this file.
+
+[storage]
+# Metadata database (meta.redb) and block files live here.
+data_dir = "data"
+# Uploads are split into blocks of at most this many bytes (min 1 MiB).
+block_size = 67108864        # 64 MiB
+# Objects up to this size are stored inside the metadata database.
+inline_threshold = 4096
+
+[s3]
+listen = "0.0.0.0:9000"
+# Region clients sign requests for. Use the same value in your SDK config.
+region = "us-east-1"
+# Root credentials (required). Prefer AETHER_S3__ACCESS_KEY / AETHER_S3__SECRET_KEY
+# over writing the secret here.
+access_key = ""
+secret_key = ""
+# Largest single PUT in bytes (S3's limit is 5 GiB).
+max_object_size = 5368709120
+
+[gc]
+# Blocks of deleted or overwritten objects are kept this long so downloads
+# already in progress can finish.
+grace_secs = 900
+interval_secs = 30
+# Leftovers from interrupted uploads are removed after this long.
+orphan_grace_secs = 3600
+sweep_interval_secs = 3600
+
+[log]
+# Filter directive; RUST_LOG overrides it.
+level = "info"
+# "text" or "json"
+format = "text"
