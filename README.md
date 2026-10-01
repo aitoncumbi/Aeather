@@ -3,17 +3,18 @@
 S3-compatible object storage written in Rust, for teams that run their own
 servers or containers and need object storage for internal applications.
 
-> **Status: early development.** Single-node object storage works with the AWS
-> SDKs, the AWS CLI and boto3 using their default settings: multipart uploads,
+> **Status: v1 milestones complete, not yet proven in production.** A single
+> node works with the AWS SDKs, the AWS CLI, boto3 and rclone: multipart uploads,
 > server-side copies, per-application access keys, HTTPS, Prometheus metrics and
-> a Docker image. Compatibility testing in CI is next. See the
-> [roadmap](docs/ROADMAP.md).
+> a Docker image. CI drives those clients against a live server and runs 239 of
+> Ceph's s3-tests. Next: the web console. See the [roadmap](docs/ROADMAP.md).
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
 "AWS" below only refers to standard S3 client tools.
 
 - [Design](docs/DESIGN.md): architecture and the decisions behind it
 - [Roadmap](docs/ROADMAP.md): what is done and what comes next
+- [Benchmarks](docs/BENCHMARKS.md): baseline numbers and how to reproduce them
 
 ## Run it
 
@@ -115,15 +116,24 @@ s3 = boto3.client(
     aws_access_key_id="admin",
     aws_secret_access_key="change-me-please",
     region_name="us-east-1",
-    config=Config(s3={"addressing_style": "path"}),
+    # s3v4: otherwise boto3 presigns URLs with the legacy SigV2.
+    config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
 )
 s3.put_object(Bucket="reports", Key="hello.txt", Body=b"hello")
 ```
 
 Current limitations:
 
-- **Only Signature Version 4 is accepted.** AWS CLI v1 creates SigV2 presigned
-  URLs by default; set `s3.signature_version = s3v4` in its config.
+- **Signature Version 4 only, by default.** boto3 and AWS CLI v1 presign URLs
+  with the deprecated SigV2 unless told otherwise: use
+  `signature_version="s3v4"` as above (AWS CLI v1: `s3.signature_version = s3v4`
+  in its config). `s3.allow_sig_v2 = true` accepts SigV2 for clients that cannot
+  be changed.
+- **Path-style addressing only** (`http://host:9000/bucket/key`).
+- **Not supported yet:** versioning, server-side encryption, object tagging,
+  lifecycle rules (v2 on the roadmap); CORS (v1.1); ACLs and bucket policies
+  (per-key bucket permissions replace them); object lock; browser POST uploads.
+  Requests that need these fail with `NotImplemented` rather than being ignored.
 - One node only: no replication yet, so back up the data directory (see the
   roadmap for clustering).
 
@@ -151,4 +161,18 @@ Current limitations:
 cd aether_backend
 cargo test      # unit tests and end-to-end tests with the AWS Rust SDK
 cargo clippy --all-targets
+cargo build --release
 ```
+
+Compatibility checks run a release build against real clients (as CI does):
+
+```sh
+compat/clients/run.sh                          # AWS CLI v2, boto3 and rclone
+S3TESTS_DIR=~/src/s3-tests compat/s3-tests/run.sh   # Ceph s3-tests in the pass list
+S3TESTS_DIR=~/src/s3-tests compat/s3-tests/run.sh --update   # after fixing more of them
+```
+
+The s3-tests runner needs a [ceph/s3-tests](https://github.com/ceph/s3-tests)
+checkout with its requirements and `pytest-timeout` installed; the revision CI
+uses is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Benchmarks:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).

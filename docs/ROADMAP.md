@@ -13,7 +13,7 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Inline storage for small objects
 - [x] Engine: create/delete/list buckets; put/get/head/delete objects; byte ranges
 - [x] Listing with prefix, delimiter and pagination
-- [x] Conditional writes (`If-None-Match: *`, `If-Match`) checked inside the commit
+- [x] Conditional writes and deletes (`If-Match`, `If-None-Match`) checked inside the commit
 - [x] Background GC with a grace period, orphan sweeper
 
 ### M2. S3 gateway
@@ -54,12 +54,20 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Background scrubber that verifies block CRC32Cs
 
 ### M6. Compatibility
-- [ ] CI runs the AWS CLI, boto3 and rclone against a live server
-- [ ] A subset of Ceph's [s3-tests](https://github.com/ceph/s3-tests) in CI, tracked as a pass list
-- [ ] Benchmarks (small-object ops/s, large-object throughput)
+- [x] CI runs the AWS CLI, boto3 and rclone against a live server (`compat/clients`)
+- [x] A subset of Ceph's [s3-tests](https://github.com/ceph/s3-tests) in CI, tracked as a pass list
+  (`compat/s3-tests`, 239 tests)
+- [x] Fixes from both: ListObjectVersions and GetBucketVersioning for unversioned buckets,
+  conditional deletes, `If-Match: *` and `If-None-Match: <etag>` on writes, retried
+  CompleteMultipartUpload, ListBuckets paging, NoSuchBucket for missing buckets, empty
+  object tag sets for copy tools, and more
+- [x] Optional SigV2 (`s3.allow_sig_v2`) for legacy clients
+- [x] Benchmarks (small-object ops/s, large-object throughput): [BENCHMARKS.md](BENCHMARKS.md)
 
 ## v1.1: console
 - [ ] Web console on the admin API: buckets, object browser, keys, permissions, usage
+- [ ] Group commit for metadata writes (small PUTs are capped by one fsync'd transaction
+  at a time; see [BENCHMARKS.md](BENCHMARKS.md))
 - [ ] Per-bucket CORS (needed for browser uploads with presigned URLs)
 - [ ] Bucket quotas
 - [ ] Virtual-hosted-style addressing

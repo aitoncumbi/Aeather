@@ -62,13 +62,23 @@ storage-specific:
 
 - Verifying `Content-MD5`, `x-amz-checksum-*` headers and trailing checksums
   (current AWS SDKs send CRC32 checksums in aws-chunked trailers by default).
-- Mapping engine errors to S3 error codes.
-- Path-style addressing (`/bucket/key`) by default. Virtual-hosted style
-  (`bucket.s3.example.com`) when a base domain is configured.
+- Mapping engine errors to S3 error codes. Error bodies carry the request id
+  (`<RequestId>`), as SDKs expect.
+- Path-style addressing (`/bucket/key`). Virtual-hosted style
+  (`bucket.s3.example.com`, with a configured base domain) is planned for v1.1.
+- Answering the calls that clients and tools make on every bucket, for features
+  that do not exist yet, the way S3 answers for a bucket that does not use
+  them: `ListObjectVersions` lists every object as version `null`,
+  `GetBucketVersioning` reports versioning never enabled, `GetObjectTagging`
+  returns an empty tag set (the AWS CLI reads it when copying) and
+  `GetBucketTagging` returns `NoSuchTagSet`. Requests that would *set* such
+  features fail with `NotImplemented`.
 
 Authentication uses `s3s`'s SigV4 verification, backed by access keys stored in
 the metadata store. Authorization (which key can do what on which bucket) is an
-`s3s::access::S3Access` implementation. Anonymous requests are rejected.
+`s3s::access::S3Access` implementation. Anonymous requests are rejected. A
+caller with a valid key that addresses a bucket that does not exist gets
+`NoSuchBucket` rather than `AccessDenied`, as in S3.
 
 Health endpoints live under `/_aether/` on the S3 port. A leading underscore is
 not valid in a bucket name, so they cannot collide with path-style requests.
@@ -137,11 +147,17 @@ Notes:
   one write transaction. Commands carry everything non-deterministic (timestamps,
   generated ids), so applying the same command twice on two machines gives the same
   result. This is the seam where Raft plugs in for clustering.
-- **Conditional writes are evaluated inside the transaction.** `If-None-Match: *`
-  and `If-Match` are part of the `PutObject` command, so two racing writers cannot
-  both succeed.
+- **Conditional writes are evaluated inside the transaction.** `If-Match` and
+  `If-None-Match` (`*` or an ETag) are part of the `PutObject`, `CompleteUpload`
+  and `CopyObject` commands, so two racing writers cannot both succeed. Deletes
+  take an ETag, last-modified time and size to match (`DeleteObject`, and per key
+  in `DeleteObjects`); deleting a key that does not exist succeeds whatever the
+  condition, as in S3.
 - redb allows one writer at a time with concurrent MVCC readers. Each commit is one
-  fsync. redb is synchronous, so the engine calls it from `spawn_blocking`.
+  fsync. redb is synchronous, so the engine calls it from `spawn_blocking`. One
+  fsync'd commit per write caps small PUTs at roughly 1,500 per second on the
+  benchmark machine ([BENCHMARKS.md](BENCHMARKS.md)); group commit, several
+  waiting commands in one transaction, is the planned remedy.
 
 `ObjectRecord` holds: version id, size, ETag, last-modified, content headers
 (type, encoding, disposition, language, cache-control, expires), user metadata,
@@ -210,7 +226,9 @@ completed object can never point at released blocks.
 
 The object's ETag is the MD5 of the parts' MD5s followed by `-<part count>`, as in
 S3, and the object keeps each part's size so `GetObject?partNumber=N` can serve a
-single part.
+single part. It also keeps the id of the upload that created it: a client whose
+`CompleteMultipartUpload` response was lost retries after the upload is gone,
+and gets the same success response as long as the key still holds that object.
 
 **Checksums.** When an upload is created with a checksum algorithm, every part is
 hashed with it, whether or not the client sends a value. On completion the
@@ -273,6 +291,12 @@ framework server, to control connection behaviour:
 
 ### Observability
 
+The `s3s` library logs every failed request at ERROR, including the body of
+malformed XML. Client mistakes are not server errors and request bodies do not
+belong in logs, so its logs are off unless `log.level` names it (e.g.
+`info,s3s=debug`); the access log records every failure's status, and Aether
+logs its own internal errors.
+
 Prometheus metrics are served at `/metrics` on the admin listener (loopback by
 default), without credentials. Request counters and latency histograms are
 recorded as responses are sent; usage, disk space and background-work counters
@@ -304,8 +328,10 @@ replication (v3) the same pass will repair from a healthy copy.
 ## Security
 
 - Every S3 request must be signed with SigV4 (anonymous access arrives with
-  public-read buckets, later). Signature Version 2 is rejected: AWS deprecated it
-  and it relies on HMAC-SHA1.
+  public-read buckets, later). Signature Version 2 is rejected by default: AWS
+  deprecated it and it relies on HMAC-SHA1. `s3.allow_sig_v2` accepts it for
+  clients that cannot be changed (boto3 presigns with SigV2 unless configured
+  for `s3v4`).
 - **Identities.** The root key comes from the config file and can do everything.
   Every other identity is an access key stored in metadata, created through the
   admin API. A key is either `admin` (everything, including the admin API) or has
