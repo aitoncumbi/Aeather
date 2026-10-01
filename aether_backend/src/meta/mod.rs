@@ -789,6 +789,12 @@ impl MetaStore {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(BLOCKS)?.len()?)
     }
+
+    /// Unreferenced blocks waiting for their grace period to pass.
+    pub fn gc_queue_len(&self) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(GC_QUEUE)?.len()?)
+    }
 }
 
 fn load_bucket(buckets: &impl ReadableTable<&'static str, &'static [u8]>, name: &str) -> Result<BucketRecord> {

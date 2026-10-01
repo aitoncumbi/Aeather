@@ -24,12 +24,19 @@ max_object_size = 5368709120
 # configuring clients for SigV4; boto3, for example, presigns URLs with SigV2
 # unless given Config(signature_version="s3v4").
 allow_sig_v2 = false
+# The URL clients use to reach this API (scheme, host and port), shown in the
+# web console and used in its share links. Unset: the host the console was
+# opened on, with the port of `listen`.
+# public_url = "https://s3.internal:9000"
 
 [admin]
-# JSON API for access keys, permissions, buckets and usage. Requests use HTTP
-# Basic auth with the root key or an admin access key. Loopback only by default.
+# JSON API for access keys, permissions, buckets, objects and usage, and the
+# web console. Requests use HTTP Basic auth with the root key or an admin
+# access key, or a console session. Loopback only by default.
 enabled = true
 listen = "127.0.0.1:9001"
+# Serve the web console at http://<listen>/.
+console = true
 
 [tls]
 # HTTPS: set both files (PEM) to serve the S3 API over TLS. Renewed files are

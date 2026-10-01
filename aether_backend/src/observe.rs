@@ -122,14 +122,17 @@ async fn add_request_id_to_error(response: Response, id: &str) -> Response {
 }
 
 /// Label for requests that never reached an S3 operation (health checks,
-/// signature failures) and for admin API requests.
+/// signature failures) and for admin API requests. Labels must come from a
+/// small set: arbitrary paths would grow the metrics without bound.
 fn default_operation(api: &str, path: &str, method: &str) -> String {
     if path.starts_with("/_aether/") || path == "/metrics" {
         "internal".into()
     } else if api == "s3" {
         "unauthenticated".into()
-    } else {
+    } else if path.starts_with("/api/") {
         format!("{method} {}", path.split('/').take(4).collect::<Vec<_>>().join("/"))
+    } else {
+        "console".into()
     }
 }
 
@@ -156,5 +159,6 @@ mod tests {
         assert_eq!(default_operation("admin", "/api/v1/keys/AKX/buckets/b", "PUT"), "PUT /api/v1/keys");
         assert_eq!(default_operation("s3", "/_aether/health/ready", "GET"), "internal");
         assert_eq!(default_operation("s3", "/bucket/key", "GET"), "unauthenticated");
+        assert_eq!(default_operation("admin", "/_next/static/chunks/x.js", "GET"), "console");
     }
 }

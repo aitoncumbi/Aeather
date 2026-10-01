@@ -188,6 +188,11 @@ impl Engine {
         self.read(|meta| meta.block_count()).await
     }
 
+    /// Blocks no object uses any more, waiting for garbage collection.
+    pub async fn gc_pending(&self) -> Result<u64> {
+        self.read(|meta| meta.gc_queue_len()).await
+    }
+
     pub async fn get_bucket(&self, name: &str) -> Result<BucketRecord> {
         let name = name.to_owned();
         self.read(move |meta| meta.get_bucket(&name)?.ok_or(Error::NoSuchBucket)).await
