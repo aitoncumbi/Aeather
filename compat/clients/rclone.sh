@@ -10,8 +10,9 @@ export RCLONE_CONFIG_AETHER_ENDPOINT=$COMPAT_ENDPOINT RCLONE_CONFIG_AETHER_REGIO
 export RCLONE_CONFIG_AETHER_ACCESS_KEY_ID=$COMPAT_ACCESS_KEY
 export RCLONE_CONFIG_AETHER_SECRET_ACCESS_KEY=$COMPAT_SECRET_KEY
 export RCLONE_CONFIG_AETHER_FORCE_PATH_STYLE=true
+# `command`: without RCLONE, a bare `rclone` here would call this function again.
 rclone() {
-    "${RCLONE:-rclone}" --s3-upload-cutoff 5M --s3-chunk-size 5M --s3-copy-cutoff 5M \
+    command "${RCLONE:-rclone}" --s3-upload-cutoff 5M --s3-chunk-size 5M --s3-copy-cutoff 5M \
         --retries 1 --low-level-retries 1 "$@"
 }
 R=aether:compat-rclone

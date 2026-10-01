@@ -9,8 +9,9 @@ export AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FI
 # No pager, and a stalled request fails within seconds instead of being
 # retried for minutes.
 export AWS_PAGER="" AWS_MAX_ATTEMPTS=1
+# `command`: without AWS_CLI, a bare `aws` here would call this function again.
 aws() {
-    "${AWS_CLI:-aws}" --endpoint-url "$COMPAT_ENDPOINT" --cli-connect-timeout 10 --cli-read-timeout 30 "$@"
+    command "${AWS_CLI:-aws}" --endpoint-url "$COMPAT_ENDPOINT" --cli-connect-timeout 10 --cli-read-timeout 30 "$@"
 }
 B=compat-aws
 
