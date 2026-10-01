@@ -120,8 +120,10 @@ enum Required {
 fn required(operation: &str) -> Required {
     match operation {
         "ListBuckets" | "CreateBucket" => Required::Handler,
-        "HeadBucket" | "GetBucketLocation" | "GetBucketVersioning" => Required::Any,
-        "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "GetObject" | "HeadObject" => Required::Read,
+        "HeadBucket" | "GetBucketLocation" | "GetBucketVersioning" | "GetBucketTagging" => Required::Any,
+        "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "GetObject" | "HeadObject" | "GetObjectTagging" => {
+            Required::Read
+        }
         "ListMultipartUploads" | "ListParts" => Required::ReadOrWrite,
         "PutObject"
         | "DeleteObject"

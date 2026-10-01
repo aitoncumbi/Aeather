@@ -34,12 +34,17 @@ struct TestServer {
 }
 
 async fn start() -> TestServer {
+    start_with(|_| {}).await
+}
+
+async fn start_with(configure: impl FnOnce(&mut Config)) -> TestServer {
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.storage.data_dir = dir.path().to_path_buf();
     config.storage.block_size = 1024 * 1024;
     config.s3.access_key = ACCESS_KEY.into();
     config.s3.secret_key = Secret::from(SECRET_KEY);
+    configure(&mut config);
 
     let engine = Arc::new(Engine::open(config.engine_config()).await.unwrap());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -470,6 +475,32 @@ async fn authentication() {
     let (status, body) = raw_get(s.addr, uri.path_and_query().unwrap().as_str()).await;
     assert_eq!(status, 200);
     assert_eq!(body, b"secret");
+}
+
+/// A legacy SigV2 presigned GET URL (what boto3 makes by default).
+fn sig_v2_presigned_path(bucket_and_key: &str) -> String {
+    use hmac::{KeyInit, Mac};
+    let expires = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 300;
+    let mut mac = hmac::Hmac::<sha1::Sha1>::new_from_slice(SECRET_KEY.as_bytes()).unwrap();
+    mac.update(format!("GET\n\n\n{expires}\n/{bucket_and_key}").as_bytes());
+    let signature = STANDARD.encode(mac.finalize().into_bytes());
+    let signature = signature.replace('+', "%2B").replace('/', "%2F").replace('=', "%3D");
+    format!("/{bucket_and_key}?AWSAccessKeyId={ACCESS_KEY}&Expires={expires}&Signature={signature}")
+}
+
+#[tokio::test]
+async fn sig_v2_is_accepted_only_when_enabled() {
+    for allow in [false, true] {
+        let s = start_with(|config| config.s3.allow_sig_v2 = allow).await;
+        s.client.create_bucket().bucket("bkt").send().await.unwrap();
+        s.client.put_object().bucket("bkt").key("k").body(ByteStream::from_static(b"v2")).send().await.unwrap();
+        let (status, body) = raw_get(s.addr, &sig_v2_presigned_path("bkt/k")).await;
+        if allow {
+            assert_eq!((status, body.as_slice()), (200, b"v2".as_slice()));
+        } else {
+            assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+        }
+    }
 }
 
 #[tokio::test]

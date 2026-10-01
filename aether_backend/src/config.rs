@@ -49,6 +49,9 @@ pub struct S3Config {
     pub secret_key: Secret,
     /// Largest single PUT, in bytes. S3's own limit is 5 GiB.
     pub max_object_size: u64,
+    /// Also accept the legacy Signature Version 2 (HMAC-SHA1, deprecated by
+    /// AWS). Off by default; some old clients still sign with it.
+    pub allow_sig_v2: bool,
 }
 
 /// The JSON admin API (keys, permissions, buckets, usage).
@@ -180,6 +183,7 @@ impl Default for S3Config {
             access_key: String::new(),
             secret_key: Secret::default(),
             max_object_size: 5 * 1024 * 1024 * 1024,
+            allow_sig_v2: false,
         }
     }
 }

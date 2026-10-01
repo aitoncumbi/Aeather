@@ -20,6 +20,10 @@ access_key = ""
 secret_key = ""
 # Largest single PUT in bytes (S3's limit is 5 GiB).
 max_object_size = 5368709120
+# Accept legacy Signature Version 2 requests and presigned URLs. Prefer
+# configuring clients for SigV4; boto3, for example, presigns URLs with SigV2
+# unless given Config(signature_version="s3v4").
+allow_sig_v2 = false
 
 [admin]
 # JSON API for access keys, permissions, buckets and usage. Requests use HTTP

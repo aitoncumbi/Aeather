@@ -624,6 +624,27 @@ impl S3 for AetherS3 {
         Ok(S3Response::new(GetBucketVersioningOutput::default()))
     }
 
+    /// Tags cannot be set yet (such requests are refused), so every object's
+    /// tag set is empty. Copy tools read it to carry tags over to the copy.
+    async fn get_object_tagging(
+        &self,
+        req: S3Request<GetObjectTaggingInput>,
+    ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        let input = req.input;
+        check_version_id(input.version_id.as_deref())?;
+        self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
+        Ok(S3Response::new(GetObjectTaggingOutput { tag_set: Vec::new(), version_id: None }))
+    }
+
+    /// No bucket has tags; S3 answers NoSuchTagSet for an untagged bucket.
+    async fn get_bucket_tagging(
+        &self,
+        req: S3Request<GetBucketTaggingInput>,
+    ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
+        self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        Err(s3_error!(NoSuchTagSet))
+    }
+
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
         let input = req.input;
         let url = wants_url_encoding(input.encoding_type.as_ref())?;

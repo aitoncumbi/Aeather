@@ -90,6 +90,7 @@ pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
 fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Router {
     let mut s3_config = s3s::config::S3Config::default();
     s3_config.put_object_max_size = Some(config.s3.max_object_size);
+    s3_config.enable_sig_v2 = config.s3.allow_sig_v2;
 
     let s3 = AetherS3::new(Arc::clone(&engine), Arc::clone(&auth), config.s3.region.clone());
     let mut builder = S3ServiceBuilder::new(s3);
