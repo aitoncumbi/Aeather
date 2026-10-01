@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # ceph/s3-tests revision the pass list was recorded against.
+  S3_TESTS_REF: 5522d1c351f75bc00ae0f64f742f3f095f5939d9
+  # Not RCLONE_*: rclone reads every RCLONE_<FLAG> variable as a flag.
+  CI_RCLONE_VERSION: v1.71.1
+
+defaults:
+  run:
+    working-directory: aether_backend
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aether_backend
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aether_backend
+      - run: cargo check --locked --all-targets
+
+  release:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aether_backend
+      - run: cargo build --release --locked --bin aether
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aether
+          path: aether_backend/target/release/aether
+          retention-days: 7
+
+  clients:
+    name: AWS CLI, boto3, rclone
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: aether
+          path: aether_backend/target/release
+      - run: chmod +x aether_backend/target/release/aether
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      # The latest boto3 on purpose: new client defaults (like 2025's
+      # checksums) are what this job exists to catch.
+      - run: pip install boto3
+      - name: Install rclone
+        run: |
+          curl -fsSL -o rclone.zip \
+            "https://downloads.rclone.org/$CI_RCLONE_VERSION/rclone-$CI_RCLONE_VERSION-linux-amd64.zip"
+          unzip -q rclone.zip
+          sudo install "rclone-$CI_RCLONE_VERSION-linux-amd64/rclone" /usr/local/bin/rclone
+      - name: Client versions
+        run: |
+          aws --version
+          python -c "import boto3; print('boto3', boto3.__version__)"
+          rclone version | head -n 1
+      - run: compat/clients/run.sh
+        env:
+          KEEP_LOG: ${{ runner.temp }}/clients-server.log
+          # Record every request, so a failure's server log shows what arrived.
+          COMPAT_LOG_LEVEL: info
+          COMPAT_ACCESS_LOG: "true"
+          # Each client takes well under a minute; three limits fit in the job's.
+          CLIENT_TIMEOUT: "300"
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clients-server-log
+          path: ${{ runner.temp }}/clients-server.log
+
+  s3-tests:
+    name: Ceph s3-tests (pass list)
+    needs: release
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: ceph/s3-tests
+          ref: ${{ env.S3_TESTS_REF }}
+          path: s3-tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: aether
+          path: aether_backend/target/release
+      - run: chmod +x aether_backend/target/release/aether
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install -r s3-tests/requirements.txt pytest-timeout
+      - run: compat/s3-tests/run.sh
+        env:
+          S3TESTS_DIR: ${{ github.workspace }}/s3-tests
+          JUNIT_OUT: ${{ runner.temp }}/s3-tests.xml
+          KEEP_LOG: ${{ runner.temp }}/s3-tests-server.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-tests-results
+          path: |
+            ${{ runner.temp }}/s3-tests.xml
+            ${{ runner.temp }}/s3-tests-server.log
+          if-no-files-found: ignore
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build -t aether:ci .
+      - name: Smoke test
+        env:
+          AWS_ACCESS_KEY_ID: ci-root
+          AWS_SECRET_ACCESS_KEY: ci-root-secret-key
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          docker run -d --name aether -p 9000:9000 \
+            -e AETHER_S3__ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e AETHER_S3__SECRET_KEY="$AWS_SECRET_ACCESS_KEY" aether:ci
+          for _ in $(seq 1 30); do
+            if docker exec aether /usr/local/bin/aether health; then break; fi
+            sleep 1
+          done
+          docker exec aether /usr/local/bin/aether health
+          echo "hello from the image" > hello.txt
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://smoke
+          aws --endpoint-url http://127.0.0.1:9000 s3 cp hello.txt s3://smoke/hello.txt
+          test "$(aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://smoke/hello.txt -)" = "hello from the image"
+          docker image ls aether:ci
+      - if: always()
+        run: docker logs aether || true

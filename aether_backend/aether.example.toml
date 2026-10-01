@@ -1,0 +1,83 @@
+# Aether configuration. Copy to aether.toml, or pass --config <file>.
+# Every setting can also come from the environment: AETHER_<SECTION>__<KEY>,
+# e.g. AETHER_S3__SECRET_KEY. Environment variables win over this file.
+
+[storage]
+# Metadata database (meta.redb) and block files live here.
+data_dir = "data"
+# Uploads are split into blocks of at most this many bytes (min 1 MiB).
+block_size = 67108864        # 64 MiB
+# Objects up to this size are stored inside the metadata database.
+inline_threshold = 4096
+
+[s3]
+listen = "0.0.0.0:9000"
+# Region clients sign requests for. Use the same value in your SDK config.
+region = "us-east-1"
+# Root credentials (required). Prefer AETHER_S3__ACCESS_KEY / AETHER_S3__SECRET_KEY
+# over writing the secret here.
+access_key = ""
+secret_key = ""
+# Largest single PUT in bytes (S3's limit is 5 GiB).
+max_object_size = 5368709120
+# Accept legacy Signature Version 2 requests and presigned URLs. Prefer
+# configuring clients for SigV4; boto3, for example, presigns URLs with SigV2
+# unless given Config(signature_version="s3v4").
+allow_sig_v2 = false
+
+[admin]
+# JSON API for access keys, permissions, buckets and usage. Requests use HTTP
+# Basic auth with the root key or an admin access key. Loopback only by default.
+enabled = true
+listen = "127.0.0.1:9001"
+
+[tls]
+# HTTPS: set both files (PEM) to serve the S3 API over TLS. Renewed files are
+# picked up without a restart. The certificate must be a server (end-entity)
+# certificate, not a CA: for a self-signed one, add
+#   -addext "basicConstraints=critical,CA:FALSE"
+# to `openssl req -x509`.
+# cert_file = "/etc/aether/tls.crt"
+# key_file = "/etc/aether/tls.key"
+# Also serve the admin API over TLS with the same certificate.
+admin = false
+# How often to check the files for changes, in seconds. 0 disables reloading.
+reload_secs = 60
+
+[http]
+# Time allowed to send request headers (protects against slow clients).
+header_timeout_secs = 30
+handshake_timeout_secs = 10
+# An upload that sends no data for this long is aborted with RequestTimeout.
+body_timeout_secs = 60
+# On shutdown (SIGTERM), how long in-flight requests may take to finish.
+shutdown_timeout_secs = 30
+
+[gc]
+# Blocks of deleted or overwritten objects are kept this long so downloads
+# already in progress can finish.
+grace_secs = 900
+interval_secs = 30
+# Leftovers from interrupted uploads are removed after this long.
+orphan_grace_secs = 3600
+sweep_interval_secs = 3600
+# Multipart uploads not completed within this time are aborted and their parts
+# deleted. 0 keeps them forever.
+abandoned_upload_secs = 604800   # 7 days
+
+[scrub]
+# Re-read every block and verify its checksum this often. 0 disables.
+interval_secs = 604800   # 7 days
+# Read rate limit while scrubbing, in bytes per second. 0: unlimited.
+bytes_per_sec = 67108864 # 64 MiB/s
+
+[log]
+# Filter directive; RUST_LOG overrides it. The S3 protocol library's own
+# per-request error logs stay off unless named, e.g. "info,s3s=debug".
+level = "info"
+# "text" or "json"
+format = "text"
+# One line per request (target "aether::access"): method, path, status,
+# operation, access key, peer, duration and request id. Query strings are
+# never logged.
+access_log = true

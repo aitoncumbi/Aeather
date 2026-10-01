@@ -1,0 +1,6 @@
+target/
+data/
+logs/
+*.redb
+aether.toml
+.vscode/

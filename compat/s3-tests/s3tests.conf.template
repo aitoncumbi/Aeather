@@ -1,0 +1,57 @@
+# s3-tests configuration for Aether; run.sh fills in @PORT@.
+# The main and alt users are ordinary access keys allowed to create buckets
+# (and so owning the buckets they create), like two separate S3 accounts.
+
+[DEFAULT]
+host = 127.0.0.1
+port = @PORT@
+is_secure = False
+ssl_verify = False
+
+[fixtures]
+bucket prefix = s3test-{random}-
+iam name prefix = s3-tests-
+iam path prefix = /s3-tests/
+
+[s3 main]
+display_name = aether
+user_id = aether
+email = main@example.com
+access_key = 0555b35654ad1656d804
+secret_key = h7GhxuBLTrlhVUyxSPUKUV8r/2EI4ngqJxD7iBdBYLhwluN30JaT3Q==
+
+[s3 alt]
+display_name = alt
+user_id = alt
+email = alt@example.com
+access_key = NOPQRSTUVWXYZABCDEFG
+secret_key = nopqrstuvwxyzabcdefghijklmnabcdefghijklm
+
+[s3 tenant]
+display_name = tenant
+user_id = tenant
+email = tenant@example.com
+access_key = HIJKLMNOPQRSTUVWXYZA
+secret_key = opqrstuvwxyzabcdefghijklmnopqrstuvwxyzab
+tenant = testx
+
+[iam]
+email = s3@example.com
+user_id = iam
+access_key = ABCDEFGHIJKLMNOPQRST
+secret_key = abcdefghijklmnopqrstuvwxyzabcdefghijklmn
+display_name = iam
+
+[iam root]
+access_key = AAAAAAAAAAAAAAAAAAaa
+secret_key = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+account_id = RGW11111111111111111
+user_id = RGW11111111111111111
+email = account1@example.com
+
+[iam alt root]
+access_key = BBBBBBBBBBBBBBBBBBbb
+secret_key = bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+account_id = RGW22222222222222222
+user_id = RGW22222222222222222
+email = account2@example.com
