@@ -24,6 +24,10 @@ pub struct ObjectRecord {
     pub last_modified: Millis,
     pub attrs: ObjectAttrs,
     pub data: ObjectData,
+    /// Size of each part, for objects created by a multipart upload.
+    /// Empty for single-part objects.
+    #[serde(default)]
+    pub part_sizes: Vec<u64>,
 }
 
 /// Attributes supplied by the client when the object was written.
@@ -49,6 +53,9 @@ pub struct ObjectAttrs {
     /// name (`crc32c`, `sha256`, ...), base64-encoded as in S3 headers.
     #[serde(default)]
     pub checksums: BTreeMap<String, String>,
+    /// `COMPOSITE` or `FULL_OBJECT` for multipart checksums; `None` otherwise.
+    #[serde(default)]
+    pub checksum_type: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +80,34 @@ pub struct BlockRef {
     pub id: Uuid,
     pub len: u64,
     pub crc32c: u32,
+}
+
+/// A multipart upload in progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadRecord {
+    /// Time-ordered (UUIDv7), so uploads of one key list oldest first.
+    pub upload_id: Uuid,
+    pub key: String,
+    pub initiated: Millis,
+    /// Attributes the completed object will have.
+    pub attrs: ObjectAttrs,
+    /// Checksum algorithm chosen at creation (lowercase), computed for every part.
+    #[serde(default)]
+    pub checksum_algorithm: Option<String>,
+    #[serde(default)]
+    pub checksum_type: Option<String>,
+}
+
+/// One uploaded part. Parts are never stored inline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartRecord {
+    pub size: u64,
+    /// Hex MD5 of the part, without quotes.
+    pub etag: String,
+    pub last_modified: Millis,
+    pub blocks: Vec<BlockRef>,
+    #[serde(default)]
+    pub checksums: BTreeMap<String, String>,
 }
 
 /// The fields a listing needs, without the data location or attributes.
@@ -104,6 +139,35 @@ pub struct ListQuery {
     /// a v1 marker or a continuation token.
     pub start: Option<Vec<u8>>,
     pub max_keys: usize,
+}
+
+/// One page of an upload's parts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartsPage {
+    pub upload: UploadRecord,
+    /// (part number, part), in ascending order.
+    pub parts: Vec<(u32, PartRecord)>,
+    /// More parts follow.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UploadListQuery {
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    /// List uploads after this key (or, with `upload_id_marker`, after that upload of this key).
+    pub key_marker: Option<String>,
+    pub upload_id_marker: Option<Uuid>,
+    pub max_uploads: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UploadPage {
+    pub uploads: Vec<UploadRecord>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+    pub next_key_marker: Option<String>,
+    pub next_upload_id_marker: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -12,7 +12,7 @@ use s3s::{BodySizeLimitExceeded, S3Error, S3ErrorCode, S3Result, s3_error};
 use tracing::error;
 
 use crate::error::Error;
-use crate::meta::{Millis, ObjectRecord, WriteCondition, prefix_successor};
+use crate::meta::{Millis, ObjectAttrs, ObjectRecord, WriteCondition, prefix_successor};
 
 pub fn s3_error(e: Error) -> S3Error {
     match e {
@@ -25,6 +25,14 @@ pub fn s3_error(e: Error) -> S3Error {
             S3Error::with_message(S3ErrorCode::InvalidBucketName, format!("invalid bucket name: {name}"))
         }
         Error::InvalidArgument(msg) => S3Error::with_message(S3ErrorCode::InvalidArgument, msg),
+        Error::NoSuchUpload => S3Error::new(S3ErrorCode::NoSuchUpload),
+        Error::InvalidPart(msg) => S3Error::with_message(S3ErrorCode::InvalidPart, msg),
+        Error::InvalidPartOrder => S3Error::new(S3ErrorCode::InvalidPartOrder),
+        Error::EntityTooSmall(part) => S3Error::with_message(
+            S3ErrorCode::EntityTooSmall,
+            format!("part {part} is smaller than the minimum allowed size; only the last part may be smaller"),
+        ),
+        Error::Conflict(msg) => S3Error::with_message(S3ErrorCode::OperationAborted, msg),
         // The body stream fails with s3s errors (bad chunk signature, size limit)
         // or I/O errors when the client goes away.
         Error::Body(source) => match source.downcast::<S3Error>() {
@@ -106,31 +114,128 @@ pub fn check_read_conditions(
     Ok(())
 }
 
-/// Objects are single-part until multipart upload exists, so only part 1 is valid.
-pub fn check_part_number(part_number: Option<i32>) -> S3Result<()> {
-    match part_number {
-        None | Some(1) => Ok(()),
-        Some(_) => {
-            let mut e = S3Error::with_message(
-                S3ErrorCode::Custom("InvalidPartNumber".into()),
-                "the requested part number is not satisfiable",
-            );
-            e.set_status_code(axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
-            Err(e)
+/// What a GET or HEAD returns: a byte range, or one part of a multipart object.
+pub struct Selection {
+    pub range: Range<u64>,
+    /// Set for partial responses (206).
+    pub content_range: Option<String>,
+    /// Set when a part was requested from a multipart object.
+    pub parts_count: Option<i32>,
+}
+
+pub fn select(record: &ObjectRecord, part_number: Option<i32>, range: Option<&dto::Range>) -> S3Result<Selection> {
+    let size = record.size;
+    let content_range = |r: &Range<u64>| (r.start < r.end).then(|| format!("bytes {}-{}/{}", r.start, r.end - 1, size));
+    match (part_number, range) {
+        (None, None) => Ok(Selection { range: 0..size, content_range: None, parts_count: None }),
+        (None, Some(range)) => {
+            let r = range.check(size)?;
+            Ok(Selection { content_range: content_range(&r), range: r, parts_count: None })
+        }
+        (Some(_), Some(_)) => Err(s3_error!(InvalidRequest, "cannot specify both Range and partNumber")),
+        // A single-part object is its own part 1.
+        (Some(1), None) if record.part_sizes.is_empty() => {
+            Ok(Selection { range: 0..size, content_range: None, parts_count: None })
+        }
+        (Some(n), None) => {
+            let index = usize::try_from(n).ok().filter(|&n| n >= 1 && n <= record.part_sizes.len());
+            let Some(index) = index else {
+                let mut e = S3Error::with_message(
+                    S3ErrorCode::Custom("InvalidPartNumber".into()),
+                    "the requested part number is not satisfiable",
+                );
+                e.set_status_code(axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
+                return Err(e);
+            };
+            let start: u64 = record.part_sizes[..index - 1].iter().sum();
+            let r = start..start + record.part_sizes[index - 1];
+            Ok(Selection {
+                content_range: content_range(&r),
+                range: r,
+                parts_count: Some(record.part_sizes.len() as i32),
+            })
         }
     }
 }
 
-/// The byte range to send and, for partial responses, the `Content-Range` value.
-pub fn resolve_range(range: Option<&dto::Range>, size: u64) -> S3Result<(Range<u64>, Option<String>)> {
-    match range {
-        None => Ok((0..size, None)),
-        Some(range) => {
-            let r = range.check(size)?;
-            let content_range = format!("bytes {}-{}/{}", r.start, r.end - 1, size);
-            Ok((r, Some(content_range)))
-        }
+/// Only the STANDARD storage class exists.
+pub fn check_storage_class(class: Option<&dto::StorageClass>) -> S3Result<()> {
+    match class {
+        Some(class) if class.as_str() != dto::StorageClass::STANDARD => Err(s3_error!(InvalidStorageClass)),
+        _ => Ok(()),
     }
+}
+
+/// Parses `x-amz-copy-source-range` (`bytes=first-last`) against the source size.
+pub fn copy_source_range(range: Option<&str>, size: u64) -> S3Result<Range<u64>> {
+    let Some(range) = range else { return Ok(0..size) };
+    let parsed = range
+        .strip_prefix("bytes=")
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(first, last)| Some((first.trim().parse::<u64>().ok()?, last.trim().parse::<u64>().ok()?)));
+    match parsed {
+        Some((first, last)) if first <= last && last < size => Ok(first..last + 1),
+        _ => Err(s3_error!(InvalidArgument, "the copy source range is not valid for an object of size {size}")),
+    }
+}
+
+pub fn parse_upload_id(upload_id: &str) -> S3Result<uuid::Uuid> {
+    uuid::Uuid::try_parse(upload_id).map_err(|_| s3_error!(NoSuchUpload))
+}
+
+pub fn part_number(n: i32) -> S3Result<u32> {
+    u32::try_from(n)
+        .ok()
+        .filter(|n| (1..=crate::engine::MAX_PARTS).contains(n))
+        .ok_or_else(|| s3_error!(InvalidArgument, "part numbers must be between 1 and {}", crate::engine::MAX_PARTS))
+}
+
+/// Attributes for a new object from request headers.
+macro_rules! object_attrs {
+    ($input:ident) => {
+        $crate::meta::ObjectAttrs {
+            content_type: $input.content_type,
+            content_encoding: $input.content_encoding,
+            content_disposition: $input.content_disposition,
+            content_language: $input.content_language,
+            cache_control: $input.cache_control,
+            expires: $input.expires,
+            user_metadata: $input.metadata.map(std::collections::BTreeMap::from_iter).unwrap_or_default(),
+            checksums: std::collections::BTreeMap::new(),
+            checksum_type: None,
+        }
+    };
+}
+
+/// The `x-amz-checksum-*` values of a request (or a `CompletedPart`).
+macro_rules! sent_checksum {
+    ($input:ident) => {
+        s3s::dto::Checksum {
+            checksum_crc32: $input.checksum_crc32,
+            checksum_crc32c: $input.checksum_crc32c,
+            checksum_crc64nvme: $input.checksum_crc64nvme,
+            checksum_md5: $input.checksum_md5,
+            checksum_sha1: $input.checksum_sha1,
+            checksum_sha256: $input.checksum_sha256,
+            checksum_sha512: $input.checksum_sha512,
+            checksum_xxhash3: $input.checksum_xxhash3,
+            checksum_xxhash64: $input.checksum_xxhash64,
+            checksum_xxhash128: $input.checksum_xxhash128,
+            checksum_type: None,
+        }
+    };
+}
+
+pub(crate) use {object_attrs, sent_checksum};
+
+/// The checksum type reported with stored checksums: whatever a multipart
+/// upload recorded, otherwise `FULL_OBJECT`.
+pub fn stored_checksum_type(attrs: &ObjectAttrs) -> Option<dto::ChecksumType> {
+    if attrs.checksums.is_empty() {
+        return None;
+    }
+    let ty = attrs.checksum_type.clone().unwrap_or_else(|| dto::ChecksumType::FULL_OBJECT.to_owned());
+    Some(dto::ChecksumType::from(ty))
 }
 
 // ---- checksums ----
@@ -153,6 +258,19 @@ macro_rules! for_each_checksum {
     };
 }
 
+/// Copies stored checksums into a DTO that only has the five checksums S3
+/// supports for copies (`CopyObjectResult`, `CopyPartResult`).
+macro_rules! set_copy_checksums {
+    ($out:expr, $checksum:expr) => {{
+        let checksum: s3s::dto::Checksum = $checksum;
+        $out.checksum_crc32 = checksum.checksum_crc32;
+        $out.checksum_crc32c = checksum.checksum_crc32c;
+        $out.checksum_crc64nvme = checksum.checksum_crc64nvme;
+        $out.checksum_sha1 = checksum.checksum_sha1;
+        $out.checksum_sha256 = checksum.checksum_sha256;
+    }};
+}
+
 /// Copies stored checksums into the checksum fields of an output DTO.
 macro_rules! set_checksums {
     ($out:expr, $checksum:expr) => {{
@@ -170,7 +288,7 @@ macro_rules! set_checksums {
     }};
 }
 
-pub(crate) use set_checksums;
+pub(crate) use {set_checksums, set_copy_checksums};
 
 pub fn checksum_to_map(checksum: Checksum) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
@@ -213,21 +331,27 @@ pub fn checksum_hasher(
 
     let mut hasher = ChecksumHasher::default();
     for alg in requested {
-        match alg.as_str() {
-            "crc32" => hasher.crc32 = Some(Default::default()),
-            "crc32c" => hasher.crc32c = Some(Default::default()),
-            "crc64nvme" => hasher.crc64nvme = Some(Default::default()),
-            "md5" => hasher.md5 = Some(Default::default()),
-            "sha1" => hasher.sha1 = Some(Default::default()),
-            "sha256" => hasher.sha256 = Some(Default::default()),
-            "sha512" => hasher.sha512 = Some(Default::default()),
-            "xxhash3" => hasher.xxhash3 = Some(Default::default()),
-            "xxhash64" => hasher.xxhash64 = Some(Default::default()),
-            "xxhash128" => hasher.xxhash128 = Some(Default::default()),
-            other => return Err(s3_error!(InvalidRequest, "unsupported checksum algorithm: {other}")),
-        }
+        enable_checksum(&mut hasher, &alg)?;
     }
     Ok(hasher)
+}
+
+/// Turns on one algorithm (lowercase name) in a hasher.
+pub fn enable_checksum(hasher: &mut ChecksumHasher, algorithm: &str) -> S3Result<()> {
+    match algorithm {
+        "crc32" => hasher.crc32 = Some(Default::default()),
+        "crc32c" => hasher.crc32c = Some(Default::default()),
+        "crc64nvme" => hasher.crc64nvme = Some(Default::default()),
+        "md5" => hasher.md5 = Some(Default::default()),
+        "sha1" => hasher.sha1 = Some(Default::default()),
+        "sha256" => hasher.sha256 = Some(Default::default()),
+        "sha512" => hasher.sha512 = Some(Default::default()),
+        "xxhash3" => hasher.xxhash3 = Some(Default::default()),
+        "xxhash64" => hasher.xxhash64 = Some(Default::default()),
+        "xxhash128" => hasher.xxhash128 = Some(Default::default()),
+        other => return Err(s3_error!(InvalidRequest, "unsupported checksum algorithm: {other}")),
+    }
+    Ok(())
 }
 
 /// Adds checksum values sent as aws-chunked trailers to those sent as headers.

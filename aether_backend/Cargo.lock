@@ -13,6 +13,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "crc-fast",
  "crc32c",
  "figment",
  "futures",

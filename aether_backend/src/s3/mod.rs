@@ -5,6 +5,8 @@
 //! such as checksum verification and conditional requests.
 
 pub(crate) mod convert;
+mod copy;
+mod multipart;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -12,12 +14,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use s3s::dto::*;
-use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3, S3Request, S3Response, S3Result, TrailingHeaders, s3_error};
 use sync_wrapper::SyncStream;
 
 use self::convert::*;
-use crate::engine::Engine;
-use crate::meta::{ListPage, ListQuery, ObjectAttrs, ObjectRecord};
+use crate::engine::{Engine, StagedObject};
+use crate::meta::{ListPage, ListQuery, ObjectRecord};
 
 /// S3 limit on keys per DeleteObjects request.
 const MAX_DELETE_KEYS: usize = 1000;
@@ -39,6 +41,46 @@ impl AetherS3 {
     async fn list(&self, bucket: &str, query: ListQuery) -> S3Result<ListPage> {
         self.engine.list_objects(bucket, query).await.map_err(s3_error)
     }
+
+    /// Streams an upload body to disk and verifies every integrity check the
+    /// client sent. Returns the staged body and the checksums to store with it.
+    async fn stage_body(
+        &self,
+        body: Option<StreamingBlob>,
+        checks: BodyChecks<'_>,
+        part: bool,
+    ) -> S3Result<(StagedObject, BTreeMap<String, String>)> {
+        let BodyChecks { mut sent, algorithm, also, content_md5, trailer, trailing_headers } = checks;
+        let mut hasher = checksum_hasher(&sent, algorithm, trailer)?;
+        if let Some(alg) = also {
+            enable_checksum(&mut hasher, alg)?;
+        }
+        let body = body.unwrap_or_else(|| StreamingBlob::from(Bytes::new()));
+        let stream = body.inspect_ok(|chunk| hasher.update(chunk));
+        let staged = if part { self.engine.stage_part(stream).await } else { self.engine.stage(stream).await };
+        let staged = staged.map_err(s3_error)?;
+
+        verify_content_md5(content_md5, &staged.md5)?;
+        if let Some(trailers) = trailing_headers.and_then(|t| t.take()) {
+            add_trailer_checksums(&mut sent, &trailers)?;
+        }
+        let checksums = verify_checksums(hasher.finalize(), &sent)?;
+        Ok((staged, checksums))
+    }
+}
+
+/// Integrity checks a client can attach to an upload.
+struct BodyChecks<'a> {
+    /// `x-amz-checksum-*` header values.
+    sent: Checksum,
+    /// `x-amz-sdk-checksum-algorithm`: compute this even without a value.
+    algorithm: Option<&'a ChecksumAlgorithm>,
+    /// Also compute this algorithm (a multipart upload's).
+    also: Option<&'a str>,
+    content_md5: Option<&'a str>,
+    /// `x-amz-trailer`: checksums that will follow the body.
+    trailer: Option<&'a str>,
+    trailing_headers: Option<TrailingHeaders>,
 }
 
 /// Fields shared by GetObject and HeadObject responses.
@@ -51,6 +93,7 @@ struct ObjectHeaders {
     expires: Option<String>,
     metadata: Option<Metadata>,
     checksum: Checksum,
+    checksum_type: Option<ChecksumType>,
 }
 
 impl ObjectHeaders {
@@ -70,6 +113,7 @@ impl ObjectHeaders {
     ) -> Self {
         let attrs = &record.attrs;
         let wants_checksum = checksum_mode.is_some_and(|m| m.as_str().eq_ignore_ascii_case(ChecksumMode::ENABLED));
+        let with_checksum = whole_object && wants_checksum;
         let expires = match response_expires {
             Some(ts) => {
                 let mut buf = Vec::new();
@@ -86,11 +130,8 @@ impl ObjectHeaders {
             expires,
             metadata: (!attrs.user_metadata.is_empty())
                 .then(|| attrs.user_metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
-            checksum: if whole_object && wants_checksum {
-                checksum_from_map(&attrs.checksums)
-            } else {
-                Checksum::default()
-            },
+            checksum: if with_checksum { checksum_from_map(&attrs.checksums) } else { Checksum::default() },
+            checksum_type: if with_checksum { stored_checksum_type(attrs) } else { None },
         }
     }
 }
@@ -165,56 +206,34 @@ impl S3 for AetherS3 {
         if input.write_offset_bytes.is_some() {
             return Err(s3_error!(NotImplemented, "appends are not supported"));
         }
-        if let Some(class) = &input.storage_class
-            && class.as_str() != StorageClass::STANDARD
-        {
-            return Err(s3_error!(InvalidStorageClass));
-        }
+        check_storage_class(input.storage_class.as_ref())?;
         // Canned ACLs (e.g. `x-amz-acl: private`, sent by many tools) are accepted
         // and ignored: access is governed by access keys, not ACLs.
 
         let condition = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
         self.engine.precheck_put(&input.bucket, &input.key, &condition).await.map_err(s3_error)?;
 
-        let mut sent = Checksum {
-            checksum_crc32: input.checksum_crc32,
-            checksum_crc32c: input.checksum_crc32c,
-            checksum_crc64nvme: input.checksum_crc64nvme,
-            checksum_md5: input.checksum_md5,
-            checksum_sha1: input.checksum_sha1,
-            checksum_sha256: input.checksum_sha256,
-            checksum_sha512: input.checksum_sha512,
-            checksum_xxhash3: input.checksum_xxhash3,
-            checksum_xxhash64: input.checksum_xxhash64,
-            checksum_xxhash128: input.checksum_xxhash128,
-            checksum_type: None,
+        let (bucket, key, body) = (input.bucket.clone(), input.key.clone(), input.body);
+        let (algorithm, content_md5) = (input.checksum_algorithm.clone(), input.content_md5.clone());
+        let checks = BodyChecks {
+            sent: sent_checksum!(input),
+            algorithm: algorithm.as_ref(),
+            also: None,
+            content_md5: content_md5.as_deref(),
+            trailer: headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()),
+            trailing_headers,
         };
-        let trailer = headers.get("x-amz-trailer").and_then(|v| v.to_str().ok());
-        let mut hasher = checksum_hasher(&sent, input.checksum_algorithm.as_ref(), trailer)?;
+        let (staged, checksums) = self.stage_body(body, checks, false).await?;
 
-        let body = input.body.unwrap_or_else(|| StreamingBlob::from(Bytes::new()));
-        let staged = self.engine.stage(body.inspect_ok(|chunk| hasher.update(chunk))).await.map_err(s3_error)?;
+        let mut attrs = object_attrs!(input);
+        attrs.checksums = checksums;
+        let record = self.engine.commit_put(&bucket, &key, staged, attrs, condition).await.map_err(s3_error)?;
 
-        verify_content_md5(input.content_md5.as_deref(), &staged.md5)?;
-        if let Some(trailers) = trailing_headers.and_then(|t| t.take()) {
-            add_trailer_checksums(&mut sent, &trailers)?;
-        }
-        let checksums = verify_checksums(hasher.finalize(), &sent)?;
-
-        let attrs = ObjectAttrs {
-            content_type: input.content_type,
-            content_encoding: input.content_encoding,
-            content_disposition: input.content_disposition,
-            content_language: input.content_language,
-            cache_control: input.cache_control,
-            expires: input.expires,
-            user_metadata: input.metadata.map(BTreeMap::from_iter).unwrap_or_default(),
-            checksums,
+        let mut output = PutObjectOutput {
+            e_tag: Some(etag(&record)),
+            checksum_type: stored_checksum_type(&record.attrs),
+            ..Default::default()
         };
-        let record =
-            self.engine.commit_put(&input.bucket, &input.key, staged, attrs, condition).await.map_err(s3_error)?;
-
-        let mut output = PutObjectOutput { e_tag: Some(etag(&record)), ..Default::default() };
         set_checksums!(output, checksum_from_map(&record.attrs.checksums));
         Ok(S3Response::new(output))
     }
@@ -225,7 +244,6 @@ impl S3 for AetherS3 {
             return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
         }
         check_version_id(input.version_id.as_deref())?;
-        check_part_number(input.part_number)?;
         let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
         check_read_conditions(
             &record,
@@ -234,10 +252,10 @@ impl S3 for AetherS3 {
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
         )?;
-        let (range, content_range) = resolve_range(input.range.as_ref(), record.size)?;
+        let Selection { range, content_range, parts_count } = select(&record, input.part_number, input.range.as_ref())?;
         let headers = ObjectHeaders::new(
             &record,
-            content_range.is_none(),
+            content_range.is_none() && parts_count.is_none(),
             input.checksum_mode.as_ref(),
             input.response_content_type,
             input.response_content_encoding,
@@ -252,6 +270,7 @@ impl S3 for AetherS3 {
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some((range.end - range.start) as i64),
             content_range,
+            parts_count,
             accept_ranges: Some("bytes".into()),
             e_tag: Some(etag(&record)),
             last_modified: Some(timestamp(record.last_modified)),
@@ -262,6 +281,7 @@ impl S3 for AetherS3 {
             cache_control: headers.cache_control,
             expires: headers.expires,
             metadata: headers.metadata,
+            checksum_type: headers.checksum_type,
             ..Default::default()
         };
         set_checksums!(output, headers.checksum);
@@ -271,7 +291,6 @@ impl S3 for AetherS3 {
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
         check_version_id(input.version_id.as_deref())?;
-        check_part_number(input.part_number)?;
         let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
         check_read_conditions(
             &record,
@@ -280,10 +299,10 @@ impl S3 for AetherS3 {
             input.if_modified_since.as_ref(),
             input.if_unmodified_since.as_ref(),
         )?;
-        let (range, content_range) = resolve_range(input.range.as_ref(), record.size)?;
+        let Selection { range, content_range, parts_count } = select(&record, input.part_number, input.range.as_ref())?;
         let headers = ObjectHeaders::new(
             &record,
-            content_range.is_none(),
+            content_range.is_none() && parts_count.is_none(),
             input.checksum_mode.as_ref(),
             input.response_content_type,
             input.response_content_encoding,
@@ -295,6 +314,8 @@ impl S3 for AetherS3 {
         let mut output = HeadObjectOutput {
             content_length: Some((range.end - range.start) as i64),
             content_range,
+            parts_count,
+            checksum_type: headers.checksum_type,
             accept_ranges: Some("bytes".into()),
             e_tag: Some(etag(&record)),
             last_modified: Some(timestamp(record.last_modified)),
@@ -348,6 +369,55 @@ impl S3 for AetherS3 {
             .then(|| keys.into_iter().map(|key| DeletedObject { key: Some(key), ..Default::default() }).collect());
         let output = DeleteObjectsOutput { deleted, errors: Some(errors), ..Default::default() };
         Ok(S3Response::new(output))
+    }
+
+    async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        self.copy_object_op(req).await
+    }
+
+    // ---- multipart uploads ----
+
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        self.create_multipart_upload_op(req).await
+    }
+
+    async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        self.upload_part_op(req).await
+    }
+
+    async fn upload_part_copy(
+        &self,
+        req: S3Request<UploadPartCopyInput>,
+    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        self.upload_part_copy_op(req).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        self.complete_multipart_upload_op(req).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        self.abort_multipart_upload_op(req).await
+    }
+
+    async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        self.list_parts_op(req).await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        req: S3Request<ListMultipartUploadsInput>,
+    ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        self.list_multipart_uploads_op(req).await
     }
 
     // ---- listing ----

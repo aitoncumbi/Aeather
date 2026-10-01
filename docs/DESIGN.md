@@ -95,10 +95,15 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 | `objects` | bucket_id (16 B) ‖ object key bytes | `ObjectRecord` |
 | `blocks` | block_id (16 B) | reference count |
 | `gc_queue` | due_at (u64 BE) ‖ block_id | – |
+| `uploads` | bucket_id ‖ object key ‖ 0x00 ‖ upload_id | `UploadRecord` |
+| `parts` | upload_id ‖ part number (u32 BE) | `PartRecord` |
 | `system` | name | schema version and other node-level values |
 
-Added in later milestones: `uploads` and `parts` (multipart), `access_keys`,
-`versions` (v2).
+Added in later milestones: `access_keys`, `versions` (v2).
+
+Object keys may not contain NUL: S3's XML responses cannot carry it, and the
+`uploads` key uses it as a separator so uploads sort by key, then by start time
+(upload ids are UUIDv7, which are time-ordered).
 
 Notes:
 
@@ -168,6 +173,49 @@ due blocks.
 The orphan sweeper deletes block files that have no `blocks` entry, are older than
 the grace period, and are not being written right now. It runs at startup and
 periodically.
+
+### Multipart uploads
+
+Each part is staged and committed like a small object: its blocks are written and
+fsynced, then a `PutPart` command stores a `PartRecord` and takes a reference on
+them. Parts are never inlined. Re-uploading a part number releases the old part's
+blocks.
+
+Completing an upload writes only metadata. The engine validates the requested part
+list (ascending, ETags match, every part but the last at least 5 MiB), then a
+`CompleteUpload` command creates the object from the parts' blocks. The object
+takes over the parts' block references, so no data is copied. Parts that were
+uploaded but not listed are released. The command carries the block list it was
+built from and fails with a conflict if a part was replaced in the meantime, so a
+completed object can never point at released blocks.
+
+The object's ETag is the MD5 of the parts' MD5s followed by `-<part count>`, as in
+S3, and the object keeps each part's size so `GetObject?partNumber=N` can serve a
+single part.
+
+**Checksums.** When an upload is created with a checksum algorithm, every part is
+hashed with it, whether or not the client sends a value. On completion the
+object's checksum is derived from the parts' checksums:
+
+- `COMPOSITE` (default except for CRC64NVME): the checksum of the concatenated part
+  checksums, with a `-<part count>` suffix. SDKs do not validate these on download.
+- `FULL_OBJECT` (CRC32, CRC32C, CRC64NVME): the part CRCs combined mathematically
+  into the CRC of the whole object, which SDKs do validate on download.
+
+**Abandoned uploads** are aborted after `gc.abandoned_upload_secs` (default 7 days),
+and deleting a bucket aborts its uploads.
+
+### Copies
+
+`CopyObject` writes a new object record that points at the source's blocks and
+increments their reference counts, so a copy of any size is instant and uses no
+space. The command checks that the source is still the version that was read; if it
+changed, the gateway retries. References are added before the destination's old
+blocks are released, which makes copying an object onto itself (to change its
+metadata) safe.
+
+`UploadPartCopy` copies bytes into new blocks, because the requested range rarely
+lines up with block boundaries.
 
 ### Listing
 

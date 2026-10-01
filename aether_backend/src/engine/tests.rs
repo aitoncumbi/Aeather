@@ -13,6 +13,7 @@ async fn test_engine() -> (Engine, tempfile::TempDir) {
         inline_threshold: 100,
         gc_grace: Duration::ZERO,
         orphan_grace: Duration::ZERO,
+        min_part_size: 1000,
         ..EngineConfig::default()
     };
     (Engine::open(config).await.unwrap(), dir)
@@ -418,4 +419,354 @@ async fn listing_details() {
     assert_eq!(engine.list_objects("bkt", query).await.unwrap().objects.len(), 2);
 
     assert!(matches!(engine.list_objects("nope", ListQuery::default()).await, Err(Error::NoSuchBucket)));
+}
+
+// ---- multipart uploads ----
+
+async fn upload_part(engine: &Engine, key: &str, upload_id: Uuid, number: u32, data: &[u8]) -> PartRecord {
+    let staged = engine.stage_part(body(data, 333)).await.unwrap();
+    engine.commit_part("bkt", key, upload_id, number, staged, BTreeMap::new()).await.unwrap()
+}
+
+async fn complete(engine: &Engine, key: &str, upload_id: Uuid, parts: &[(u32, &PartRecord)]) -> Result<ObjectRecord> {
+    let requested: Vec<_> = parts.iter().map(|(n, p)| (*n, p.etag.clone())).collect();
+    let completion = engine.prepare_completion("bkt", key, upload_id, &requested).await?;
+    engine.complete_upload("bkt", key, completion, BTreeMap::new(), None, WriteCondition::None).await
+}
+
+fn other_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 13) as u8).collect()
+}
+
+#[tokio::test]
+async fn multipart_upload_round_trip() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let attrs = ObjectAttrs { content_type: Some("video/mp4".into()), ..Default::default() };
+    let upload = engine.create_upload("bkt", "video.mp4", attrs, None, None).await.unwrap();
+    let id = upload.upload_id;
+
+    let (d1, d2, d3) = (pattern(1500), other_pattern(1500), pattern(700));
+    // Parts may arrive in any order.
+    let p2 = upload_part(&engine, "video.mp4", id, 2, &d2).await;
+    let p1 = upload_part(&engine, "video.mp4", id, 1, &d1).await;
+    let p3 = upload_part(&engine, "video.mp4", id, 3, &d3).await;
+    assert_eq!(p1.etag, hex::encode(Md5::digest(&d1)));
+
+    let record = complete(&engine, "video.mp4", id, &[(1, &p1), (2, &p2), (3, &p3)]).await.unwrap();
+    let whole = [d1.clone(), d2.clone(), d3.clone()].concat();
+    let mut md5s = Md5::new();
+    for part in [&d1, &d2, &d3] {
+        md5s.update(Md5::digest(part));
+    }
+    assert_eq!(record.etag, format!("{}-3", hex::encode(md5s.finalize())));
+    assert_eq!(record.size, 3700);
+    assert_eq!(record.part_sizes, [1500, 1500, 700]);
+    assert_eq!(record.attrs.content_type.as_deref(), Some("video/mp4"));
+    assert_eq!(engine.get_object("bkt", "video.mp4").await.unwrap(), record);
+    assert_eq!(read_all(&engine, &record, 0..3700).await, whole);
+    assert_eq!(read_all(&engine, &record, 1400..3100).await, &whole[1400..3100]);
+
+    // Completing moved the parts' blocks into the object: nothing to collect.
+    assert!(matches!(engine.get_upload("bkt", "video.mp4", id).await, Err(Error::NoSuchUpload)));
+    assert_eq!(engine.collect_garbage().await.unwrap(), 0);
+    assert_eq!(engine.meta.block_count().unwrap(), 5);
+    assert_eq!(block_files(&engine).await, 5);
+}
+
+#[tokio::test]
+async fn replaced_and_unused_parts_are_released() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+
+    upload_part(&engine, "k", id, 1, &pattern(1500)).await;
+    let p1 = upload_part(&engine, "k", id, 1, &other_pattern(1200)).await;
+    assert_eq!(engine.collect_garbage().await.unwrap(), 2);
+    let p2 = upload_part(&engine, "k", id, 2, &pattern(500)).await;
+    upload_part(&engine, "k", id, 3, &pattern(500)).await;
+
+    let record = complete(&engine, "k", id, &[(1, &p1), (2, &p2)]).await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 1, "part 3 was not used");
+    assert_eq!(engine.meta.block_count().unwrap(), 3);
+    assert_eq!(read_all(&engine, &record, 0..1700).await, [other_pattern(1200), pattern(500)].concat());
+}
+
+#[tokio::test]
+async fn completion_is_validated() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "k", id, 1, &pattern(500)).await;
+    let p2 = upload_part(&engine, "k", id, 2, &pattern(1500)).await;
+    let p3 = upload_part(&engine, "k", id, 3, &pattern(100)).await;
+
+    let prepare = |parts: Vec<(u32, String)>| {
+        let engine = &engine;
+        async move { engine.prepare_completion("bkt", "k", id, &parts).await }
+    };
+    assert!(matches!(prepare(vec![(2, p2.etag.clone()), (1, p1.etag.clone())]).await, Err(Error::InvalidPartOrder)));
+    assert!(matches!(prepare(vec![(2, p2.etag.clone()), (2, p2.etag.clone())]).await, Err(Error::InvalidPartOrder)));
+    assert!(matches!(prepare(vec![(1, "nope".into())]).await, Err(Error::InvalidPart(_))));
+    assert!(matches!(prepare(vec![(4, p1.etag.clone())]).await, Err(Error::InvalidPart(_))));
+    assert!(matches!(prepare(vec![]).await, Err(Error::InvalidPart(_))));
+    assert!(matches!(prepare(vec![(1, p1.etag.clone()), (2, p2.etag.clone())]).await, Err(Error::EntityTooSmall(1))));
+    // Only the last part may be small; quoted ETags are accepted.
+    let ok = prepare(vec![(2, format!("\"{}\"", p2.etag)), (3, p3.etag.clone())]).await.unwrap();
+    assert_eq!(ok.size(), 1600);
+
+    for bad in [0, MAX_PARTS + 1] {
+        let staged = engine.stage_part(body(b"x", 1)).await.unwrap();
+        let err = engine.commit_part("bkt", "k", id, bad, staged, BTreeMap::new()).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+    // An upload id only works with the key it was created for.
+    assert!(matches!(engine.get_upload("bkt", "other", id).await, Err(Error::NoSuchUpload)));
+    assert!(matches!(
+        engine.create_upload("bkt", "nul\0key", ObjectAttrs::default(), None, None).await,
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[tokio::test]
+async fn completion_detects_a_part_replaced_concurrently() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "k", id, 1, &pattern(1500)).await;
+    let completion = engine.prepare_completion("bkt", "k", id, &[(1, p1.etag.clone())]).await.unwrap();
+
+    // Same content, so the same ETag, but new blocks: the stale completion must not commit.
+    upload_part(&engine, "k", id, 1, &pattern(1500)).await;
+    let err =
+        engine.complete_upload("bkt", "k", completion, BTreeMap::new(), None, WriteCondition::None).await.unwrap_err();
+    assert!(matches!(err, Error::Conflict(_)));
+
+    let record = complete(&engine, "k", id, &[(1, &p1)]).await.unwrap();
+    engine.collect_garbage().await.unwrap();
+    assert_eq!(read_all(&engine, &record, 0..1500).await, pattern(1500));
+}
+
+#[tokio::test]
+async fn complete_honours_write_conditions() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    put(&engine, "bkt", "k", b"existing").await;
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "k", id, 1, &pattern(10)).await;
+    let completion = engine.prepare_completion("bkt", "k", id, &[(1, p1.etag.clone())]).await.unwrap();
+    let err = engine
+        .complete_upload("bkt", "k", completion, BTreeMap::new(), None, WriteCondition::IfNoneMatchAny)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::PreconditionFailed));
+    // The upload survives a failed condition and can still be completed.
+    complete(&engine, "k", id, &[(1, &p1)]).await.unwrap();
+}
+
+#[tokio::test]
+async fn abort_releases_parts() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    upload_part(&engine, "k", id, 1, &pattern(1500)).await;
+    upload_part(&engine, "k", id, 2, &pattern(500)).await;
+
+    engine.abort_upload("bkt", "k", id).await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 3);
+    assert_eq!(engine.meta.block_count().unwrap(), 0);
+    assert!(matches!(engine.abort_upload("bkt", "k", id).await, Err(Error::NoSuchUpload)));
+
+    // A part uploaded after the abort is rejected and its blocks removed.
+    let staged = engine.stage_part(body(&pattern(1500), 500)).await.unwrap();
+    let err = engine.commit_part("bkt", "k", id, 3, staged, BTreeMap::new()).await.unwrap_err();
+    assert!(matches!(err, Error::NoSuchUpload));
+    wait_for_block_files(&engine, 0).await;
+}
+
+#[tokio::test]
+async fn abandoned_uploads_expire() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        gc_grace: Duration::ZERO,
+        upload_expiry: Duration::from_millis(1),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(config).await.unwrap();
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    upload_part(&engine, "k", id, 1, &pattern(10)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    assert_eq!(engine.abort_stale_uploads().await.unwrap(), 1);
+    assert!(matches!(engine.get_upload("bkt", "k", id).await, Err(Error::NoSuchUpload)));
+    assert_eq!(engine.collect_garbage().await.unwrap(), 1);
+
+    let (fresh, _dir) = test_engine().await;
+    fresh.create_bucket("bkt").await.unwrap();
+    fresh.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap();
+    assert_eq!(fresh.abort_stale_uploads().await.unwrap(), 0, "a week has not passed");
+}
+
+#[tokio::test]
+async fn deleting_a_bucket_aborts_its_uploads() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    upload_part(&engine, "k", id, 1, &pattern(1500)).await;
+
+    engine.delete_bucket("bkt").await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 2);
+    assert_eq!(engine.meta.block_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn list_parts_pages() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    for n in [5, 1, 3, 2, 4] {
+        upload_part(&engine, "k", id, n, &pattern(n as usize)).await;
+    }
+    let numbers = |parts: &[(u32, PartRecord)]| parts.iter().map(|(n, _)| *n).collect::<Vec<_>>();
+    let page = engine.list_parts("bkt", "k", id, 0, 2).await.unwrap();
+    assert_eq!((numbers(&page.parts), page.truncated), (vec![1, 2], true));
+    let page = engine.list_parts("bkt", "k", id, 2, 2).await.unwrap();
+    assert_eq!((numbers(&page.parts), page.truncated), (vec![3, 4], true));
+    let page = engine.list_parts("bkt", "k", id, 4, 2).await.unwrap();
+    assert_eq!((numbers(&page.parts), page.truncated), (vec![5], false));
+    assert_eq!(page.parts[0].1.size, 5);
+}
+
+#[tokio::test]
+async fn list_uploads_groups_and_pages() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let mut ids = Vec::new();
+    for key in ["c/x/y", "b", "a/1", "b", "a/2"] {
+        ids.push((key, engine.create_upload("bkt", key, ObjectAttrs::default(), None, None).await.unwrap().upload_id));
+    }
+    let (b_first, b_second) = (ids[1].1, ids[3].1);
+    let list = |query: UploadListQuery| {
+        let engine = &engine;
+        async move { engine.list_uploads("bkt", query).await.unwrap() }
+    };
+    let entries = |page: &UploadPage| page.uploads.iter().map(|u| u.key.clone()).collect::<Vec<_>>();
+
+    let all = list(UploadListQuery { max_uploads: 10, ..Default::default() }).await;
+    assert_eq!(entries(&all), ["a/1", "a/2", "b", "b", "c/x/y"]);
+    assert_eq!(all.uploads[2].upload_id, b_first, "same key: oldest first");
+    assert!(!all.truncated);
+
+    let grouped = list(UploadListQuery { delimiter: Some("/".into()), max_uploads: 10, ..Default::default() }).await;
+    assert_eq!(entries(&grouped), ["b", "b"]);
+    assert_eq!(grouped.common_prefixes, ["a/", "c/"]);
+
+    let page1 = list(UploadListQuery { delimiter: Some("/".into()), max_uploads: 2, ..Default::default() }).await;
+    assert_eq!((page1.common_prefixes.clone(), entries(&page1)), (vec!["a/".to_string()], vec!["b".to_string()]));
+    assert!(page1.truncated);
+    assert_eq!((page1.next_key_marker.as_deref(), page1.next_upload_id_marker), (Some("b"), Some(b_first)));
+    let page2 = list(UploadListQuery {
+        delimiter: Some("/".into()),
+        key_marker: page1.next_key_marker,
+        upload_id_marker: page1.next_upload_id_marker,
+        max_uploads: 2,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(page2.uploads[0].upload_id, b_second);
+    assert_eq!(page2.common_prefixes, ["c/"]);
+    assert!(!page2.truncated);
+
+    // A key marker that is a common prefix skips everything under it.
+    let after_a = list(UploadListQuery {
+        delimiter: Some("/".into()),
+        key_marker: Some("a/".into()),
+        max_uploads: 10,
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(entries(&after_a), ["b", "b"]);
+    assert_eq!(after_a.common_prefixes, ["c/"]);
+
+    // One at a time, without a delimiter, visits every upload once.
+    let mut seen = Vec::new();
+    let (mut key_marker, mut upload_id_marker) = (None, None);
+    loop {
+        let page = list(UploadListQuery { key_marker, upload_id_marker, max_uploads: 1, ..Default::default() }).await;
+        seen.extend(page.uploads.iter().map(|u| u.upload_id));
+        if !page.truncated {
+            break;
+        }
+        (key_marker, upload_id_marker) = (page.next_key_marker, page.next_upload_id_marker);
+    }
+    assert_eq!(seen, all.uploads.iter().map(|u| u.upload_id).collect::<Vec<_>>());
+
+    let prefixed = list(UploadListQuery { prefix: "a/".into(), max_uploads: 10, ..Default::default() }).await;
+    assert_eq!(entries(&prefixed), ["a/1", "a/2"]);
+}
+
+// ---- copies ----
+
+#[tokio::test]
+async fn copies_share_blocks() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    engine.create_bucket("other").await.unwrap();
+    let source = put(&engine, "bkt", "src", &pattern(2500)).await;
+
+    let attrs = ObjectAttrs { content_type: Some("text/plain".into()), ..Default::default() };
+    let copy =
+        engine.copy_object("bkt", "src", &source, "other", "dst", attrs.clone(), WriteCondition::None).await.unwrap();
+    assert_eq!((copy.etag.as_str(), copy.size, &copy.data), (source.etag.as_str(), 2500, &source.data));
+    assert_eq!(copy.attrs, attrs);
+    assert_ne!(copy.version_id, source.version_id);
+    assert_eq!(engine.meta.block_count().unwrap(), 3, "no data was copied");
+
+    engine.delete_object("bkt", "src").await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 0, "the copy still uses the blocks");
+    assert_eq!(read_all(&engine, &copy, 0..2500).await, pattern(2500));
+    engine.delete_object("other", "dst").await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn copy_onto_itself_replaces_metadata() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let source = put(&engine, "bkt", "k", &pattern(1500)).await;
+    let attrs = ObjectAttrs { content_type: Some("image/png".into()), ..Default::default() };
+    let copy = engine.copy_object("bkt", "k", &source, "bkt", "k", attrs, WriteCondition::None).await.unwrap();
+    assert_eq!(engine.collect_garbage().await.unwrap(), 0);
+    assert_eq!(engine.get_object("bkt", "k").await.unwrap().attrs.content_type.as_deref(), Some("image/png"));
+    assert_eq!(read_all(&engine, &copy, 0..1500).await, pattern(1500));
+}
+
+#[tokio::test]
+async fn copy_checks_source_and_destination() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let stale = put(&engine, "bkt", "src", &pattern(1500)).await;
+    put(&engine, "bkt", "src", &pattern(1200)).await;
+    let copy = |source: ObjectRecord, dst_bucket: &'static str, condition: WriteCondition| {
+        let engine = &engine;
+        async move { engine.copy_object("bkt", "src", &source, dst_bucket, "dst", ObjectAttrs::default(), condition).await }
+    };
+    assert!(matches!(copy(stale, "bkt", WriteCondition::None).await, Err(Error::Conflict(_))));
+
+    let current = engine.get_object("bkt", "src").await.unwrap();
+    assert!(matches!(copy(current.clone(), "nope", WriteCondition::None).await, Err(Error::NoSuchBucket)));
+    copy(current.clone(), "bkt", WriteCondition::None).await.unwrap();
+    assert!(matches!(
+        copy(current.clone(), "bkt", WriteCondition::IfNoneMatchAny).await,
+        Err(Error::PreconditionFailed)
+    ));
+
+    let small = put(&engine, "bkt", "small", b"inline").await;
+    let copied = engine
+        .copy_object("bkt", "small", &small, "bkt", "small-copy", ObjectAttrs::default(), WriteCondition::None)
+        .await
+        .unwrap();
+    assert_eq!(read_all(&engine, &copied, 0..6).await, b"inline");
 }

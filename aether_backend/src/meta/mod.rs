@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use self::keys::prefix_successor;
-use self::keys::{gc_key, object_key, parse_gc_key};
+use self::keys::{gc_key, object_key, parse_gc_key, parse_part_number, parse_upload_key, part_key, upload_key};
 pub use self::types::*;
 use crate::error::{Error, Result};
 
@@ -27,6 +27,10 @@ const BUCKETS: TableDefinition<&str, &[u8]> = TableDefinition::new("buckets");
 const OBJECTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("objects");
 /// block id → number of objects referencing it. Entries at zero are waiting in `gc_queue`.
 const BLOCKS: TableDefinition<&[u8], u64> = TableDefinition::new("blocks");
+/// bucket id ‖ object key ‖ 0x00 ‖ upload id → `UploadRecord`
+const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
+/// upload id ‖ part number → `PartRecord`
+const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
 /// due time ‖ block id → ()
 const GC_QUEUE: TableDefinition<&[u8], ()> = TableDefinition::new("gc_queue");
 /// name → value
@@ -43,8 +47,10 @@ pub enum Command {
         id: Uuid,
         created_at: Millis,
     },
+    /// Fails if the bucket has objects; aborts its in-progress uploads.
     DeleteBucket {
         name: String,
+        gc_due_at: Millis,
     },
     PutObject {
         bucket: String,
@@ -63,6 +69,49 @@ pub enum Command {
     DeleteObjects {
         bucket: String,
         keys: Vec<String>,
+        gc_due_at: Millis,
+    },
+    CreateUpload {
+        bucket: String,
+        upload: UploadRecord,
+    },
+    /// Stores a part, replacing any earlier upload of the same part number.
+    PutPart {
+        bucket: String,
+        key: String,
+        upload_id: Uuid,
+        part_number: u32,
+        part: PartRecord,
+        gc_due_at: Millis,
+    },
+    /// Turns an upload into an object. `record` was assembled from the parts
+    /// named in `part_numbers`; if any of them changed since, the command fails
+    /// with `Conflict` rather than reference blocks that may be gone.
+    CompleteUpload {
+        bucket: String,
+        key: String,
+        upload_id: Uuid,
+        part_numbers: Vec<u32>,
+        record: ObjectRecord,
+        condition: WriteCondition,
+        gc_due_at: Millis,
+    },
+    AbortUpload {
+        bucket: String,
+        key: String,
+        upload_id: Uuid,
+        gc_due_at: Millis,
+    },
+    /// Makes `dst` share the source's blocks. Fails with `Conflict` if the
+    /// source is no longer the version `record` was built from.
+    CopyObject {
+        src_bucket: String,
+        src_key: String,
+        src_version: Uuid,
+        dst_bucket: String,
+        dst_key: String,
+        record: ObjectRecord,
+        condition: WriteCondition,
         gc_due_at: Millis,
     },
     /// Drop GC queue entries whose block files have been deleted.
@@ -93,6 +142,8 @@ impl MetaStore {
             txn.open_table(OBJECTS)?;
             txn.open_table(BLOCKS)?;
             txn.open_table(GC_QUEUE)?;
+            txn.open_table(UPLOADS)?;
+            txn.open_table(PARTS)?;
             let mut system = txn.open_table(SYSTEM)?;
             let stored = system.get("schema_version")?.map(|v| codec::decode::<u32>(v.value())).transpose()?;
             match stored {
@@ -123,7 +174,7 @@ impl MetaStore {
                 buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
                 Outcome::Bucket(record)
             }
-            Command::DeleteBucket { name } => {
+            Command::DeleteBucket { name, gc_due_at } => {
                 let mut buckets = txn.open_table(BUCKETS)?;
                 let bucket: BucketRecord = match buckets.get(name.as_str())? {
                     Some(v) => codec::decode(v.value())?,
@@ -132,6 +183,15 @@ impl MetaStore {
                 let objects = txn.open_table(OBJECTS)?;
                 if objects.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?.next().is_some() {
                     return Err(Error::BucketNotEmpty);
+                }
+                let uploads: Vec<Vec<u8>> = {
+                    let table = txn.open_table(UPLOADS)?;
+                    let range = table.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?;
+                    range.map(|entry| Ok(entry?.0.value().to_vec())).collect::<Result<_>>()?
+                };
+                for ukey in uploads {
+                    let (_, upload_id) = parse_upload_key(&ukey[16..]).ok_or_else(bad_upload_key)?;
+                    remove_upload(&txn, &ukey, &upload_id, &[], gc_due_at)?;
                 }
                 buckets.remove(name.as_str())?;
                 Outcome::Done
@@ -142,16 +202,117 @@ impl MetaStore {
                 let okey = object_key(&bucket.id, key.as_bytes());
                 let previous: Option<ObjectRecord> =
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                match (&condition, &previous) {
-                    (WriteCondition::None, _) => {}
-                    (WriteCondition::IfNoneMatchAny, None) => {}
-                    (WriteCondition::IfNoneMatchAny, Some(_)) => return Err(Error::PreconditionFailed),
-                    (WriteCondition::IfMatch(_), None) => return Err(Error::NoSuchKey),
-                    (WriteCondition::IfMatch(etag), Some(prev)) if *etag == prev.etag => {}
-                    (WriteCondition::IfMatch(_), Some(_)) => return Err(Error::PreconditionFailed),
-                }
+                check_condition(&condition, previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
 
+                let mut blocks = txn.open_table(BLOCKS)?;
+                let mut gc = txn.open_table(GC_QUEUE)?;
+                for block in record.data.blocks() {
+                    add_block_ref(&mut blocks, &block.id)?;
+                }
+                if let Some(prev) = &previous {
+                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+                }
+                Outcome::Object(previous)
+            }
+            Command::CreateUpload { bucket, upload } => {
+                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                let ukey = upload_key(&bucket.id, upload.key.as_bytes(), &upload.upload_id);
+                txn.open_table(UPLOADS)?.insert(ukey.as_slice(), codec::encode(&upload).as_slice())?;
+                Outcome::Done
+            }
+            Command::PutPart { bucket, key, upload_id, part_number, part, gc_due_at } => {
+                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+                let mut parts = txn.open_table(PARTS)?;
+                let pkey = part_key(&upload_id, part_number);
+                let previous: Option<PartRecord> =
+                    parts.get(pkey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+                parts.insert(pkey.as_slice(), codec::encode(&part).as_slice())?;
+
+                let mut blocks = txn.open_table(BLOCKS)?;
+                let mut gc = txn.open_table(GC_QUEUE)?;
+                for block in &part.blocks {
+                    add_block_ref(&mut blocks, &block.id)?;
+                }
+                if let Some(prev) = &previous {
+                    release_blocks(&mut blocks, &mut gc, &prev.blocks, gc_due_at)?;
+                }
+                Outcome::Done
+            }
+            Command::CompleteUpload { bucket, key, upload_id, part_numbers, record, condition, gc_due_at } => {
+                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+                {
+                    let parts = txn.open_table(PARTS)?;
+                    let mut current = Vec::new();
+                    for number in &part_numbers {
+                        let part: PartRecord = match parts.get(part_key(&upload_id, *number).as_slice())? {
+                            Some(v) => codec::decode(v.value())?,
+                            None => return Err(Error::Conflict(format!("part {number} was removed"))),
+                        };
+                        current.extend(part.blocks);
+                    }
+                    if current != record.data.blocks() {
+                        return Err(Error::Conflict("a part was replaced while the upload was completing".into()));
+                    }
+                }
+
+                let mut objects = txn.open_table(OBJECTS)?;
+                let okey = object_key(&bucket.id, key.as_bytes());
+                let previous: Option<ObjectRecord> =
+                    objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+                check_condition(&condition, previous.as_ref())?;
+                objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+                drop(objects);
+
+                // The object takes over the references held by the parts it uses.
+                let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
+                remove_upload(&txn, &ukey, &upload_id, &part_numbers, gc_due_at)?;
+                if let Some(prev) = &previous {
+                    let mut blocks = txn.open_table(BLOCKS)?;
+                    let mut gc = txn.open_table(GC_QUEUE)?;
+                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+                }
+                Outcome::Object(previous)
+            }
+            Command::AbortUpload { bucket, key, upload_id, gc_due_at } => {
+                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+                let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
+                remove_upload(&txn, &ukey, &upload_id, &[], gc_due_at)?;
+                Outcome::Done
+            }
+            Command::CopyObject {
+                src_bucket,
+                src_key,
+                src_version,
+                dst_bucket,
+                dst_key,
+                record,
+                condition,
+                gc_due_at,
+            } => {
+                let buckets = txn.open_table(BUCKETS)?;
+                let src_bucket = load_bucket(&buckets, &src_bucket)?;
+                let dst_bucket = load_bucket(&buckets, &dst_bucket)?;
+                let mut objects = txn.open_table(OBJECTS)?;
+                let source: ObjectRecord =
+                    match objects.get(object_key(&src_bucket.id, src_key.as_bytes()).as_slice())? {
+                        Some(v) => codec::decode(v.value())?,
+                        None => return Err(Error::NoSuchKey),
+                    };
+                if source.version_id != src_version || source.data != record.data {
+                    return Err(Error::Conflict("the source object changed during the copy".into()));
+                }
+                let okey = object_key(&dst_bucket.id, dst_key.as_bytes());
+                let previous: Option<ObjectRecord> =
+                    objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+                check_condition(&condition, previous.as_ref())?;
+                objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+
+                // Add references before releasing the previous object: when copying
+                // an object onto itself they are the same blocks.
                 let mut blocks = txn.open_table(BLOCKS)?;
                 let mut gc = txn.open_table(GC_QUEUE)?;
                 for block in record.data.blocks() {
@@ -278,6 +439,136 @@ impl MetaStore {
         Ok(page)
     }
 
+    /// Fails with `NoSuchBucket` or `NoSuchUpload`.
+    pub fn get_upload(&self, bucket: &str, key: &str, upload_id: &Uuid) -> Result<UploadRecord> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        load_upload(&txn.open_table(UPLOADS)?, &bucket, key, upload_id)
+    }
+
+    /// Parts with numbers greater than `after`, in order, up to `max`.
+    pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &Uuid, after: u32, max: usize) -> Result<PartsPage> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        let upload = load_upload(&txn.open_table(UPLOADS)?, &bucket, key, upload_id)?;
+        let parts = txn.open_table(PARTS)?;
+        let Some(first) = after.checked_add(1) else {
+            return Ok(PartsPage { upload, parts: Vec::new(), truncated: false });
+        };
+        let start = part_key(upload_id, first);
+        let end = part_key(upload_id, u32::MAX);
+        let mut out = Vec::new();
+        let mut truncated = false;
+        for entry in parts.range::<&[u8]>(start.as_slice()..=end.as_slice())? {
+            let (k, v) = entry?;
+            if out.len() == max {
+                truncated = true;
+                break;
+            }
+            let number = parse_part_number(k.value()).ok_or_else(|| Error::Corrupt("bad parts key".into()))?;
+            out.push((number, codec::decode(v.value())?));
+        }
+        Ok(PartsPage { upload, parts: out, truncated })
+    }
+
+    /// In-progress uploads of a bucket, ordered by key and then by start time.
+    /// Common prefixes count toward `max_uploads`.
+    pub fn list_uploads(&self, bucket: &str, query: &UploadListQuery) -> Result<UploadPage> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        let uploads = txn.open_table(UPLOADS)?;
+
+        let base = bucket.id.as_bytes();
+        let prefix = query.prefix.as_bytes();
+        let delimiter = query.delimiter.as_deref().filter(|d| !d.is_empty()).map(str::as_bytes);
+        let upper = match prefix_successor(&object_key(&bucket.id, prefix)) {
+            Some(end) => Bound::Excluded(end),
+            None => Bound::Unbounded,
+        };
+        let marker_start = match (&query.key_marker, &query.upload_id_marker) {
+            (Some(key), Some(id)) => {
+                let mut start = upload_key(&bucket.id, key.as_bytes(), id)[16..].to_vec();
+                start.push(0);
+                Some(start)
+            }
+            (Some(key), None) => Some(
+                common_prefix_of(key.as_bytes(), prefix, delimiter)
+                    .filter(|common| common.len() == key.len())
+                    .and_then(prefix_successor)
+                    .unwrap_or_else(|| [key.as_bytes(), &[1u8][..]].concat()),
+            ),
+            (None, _) => None,
+        };
+        let mut lower = match marker_start {
+            Some(start) if start.as_slice() > prefix => start,
+            _ => prefix.to_vec(),
+        };
+
+        let mut page = UploadPage::default();
+        let mut count = 0;
+        'scan: loop {
+            let range = (Bound::Included(object_key(&bucket.id, &lower)), upper.clone());
+            let mut restart_at = None;
+            for entry in uploads.range::<&[u8]>(as_slice_bounds(&range))? {
+                let (k, v) = entry?;
+                let (key, upload_id) = parse_upload_key(&k.value()[base.len()..]).ok_or_else(bad_upload_key)?;
+                if count == query.max_uploads {
+                    page.truncated = true;
+                    break 'scan;
+                }
+                if let Some(common) = common_prefix_of(key, prefix, delimiter) {
+                    page.common_prefixes.push(utf8(common)?);
+                    page.next_key_marker = Some(utf8(common)?);
+                    page.next_upload_id_marker = None;
+                    count += 1;
+                    match prefix_successor(common) {
+                        Some(next) => {
+                            restart_at = Some(next);
+                            break;
+                        }
+                        None => break 'scan,
+                    }
+                }
+                let upload: UploadRecord = codec::decode(v.value())?;
+                page.next_key_marker = Some(upload.key.clone());
+                page.next_upload_id_marker = Some(upload_id);
+                page.uploads.push(upload);
+                count += 1;
+            }
+            match restart_at {
+                Some(next) => lower = next,
+                None => break,
+            }
+        }
+        if !page.truncated {
+            page.next_key_marker = None;
+            page.next_upload_id_marker = None;
+        }
+        Ok(page)
+    }
+
+    /// Uploads (bucket, key, id) started before `cutoff`, across all buckets.
+    pub fn uploads_started_before(&self, cutoff: Millis) -> Result<Vec<(String, String, Uuid)>> {
+        let txn = self.db.begin_read()?;
+        let mut names = std::collections::HashMap::new();
+        for entry in txn.open_table(BUCKETS)?.iter()? {
+            let bucket: BucketRecord = codec::decode(entry?.1.value())?;
+            names.insert(bucket.id, bucket.name);
+        }
+        let mut out = Vec::new();
+        for entry in txn.open_table(UPLOADS)?.iter()? {
+            let (k, v) = entry?;
+            let upload: UploadRecord = codec::decode(v.value())?;
+            let bucket_id = Uuid::from_slice(&k.value()[..16]).map_err(|_| bad_upload_key())?;
+            if upload.initiated < cutoff
+                && let Some(name) = names.get(&bucket_id)
+            {
+                out.push((name.clone(), upload.key, upload.upload_id));
+            }
+        }
+        Ok(out)
+    }
+
     /// GC queue entries due at or before `now`, oldest first.
     pub fn due_gc(&self, now: Millis, limit: usize) -> Result<Vec<(Millis, Uuid)>> {
         let txn = self.db.begin_read()?;
@@ -309,6 +600,66 @@ fn load_bucket(buckets: &impl ReadableTable<&'static str, &'static [u8]>, name: 
         Some(v) => codec::decode(v.value()),
         None => Err(Error::NoSuchBucket),
     }
+}
+
+fn load_upload(
+    uploads: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    bucket: &BucketRecord,
+    key: &str,
+    upload_id: &Uuid,
+) -> Result<UploadRecord> {
+    match uploads.get(upload_key(&bucket.id, key.as_bytes(), upload_id).as_slice())? {
+        Some(v) => codec::decode(v.value()),
+        None => Err(Error::NoSuchUpload),
+    }
+}
+
+fn check_condition(condition: &WriteCondition, existing: Option<&ObjectRecord>) -> Result<()> {
+    match (condition, existing) {
+        (WriteCondition::None, _) | (WriteCondition::IfNoneMatchAny, None) => Ok(()),
+        (WriteCondition::IfNoneMatchAny, Some(_)) => Err(Error::PreconditionFailed),
+        (WriteCondition::IfMatch(_), None) => Err(Error::NoSuchKey),
+        (WriteCondition::IfMatch(etag), Some(prev)) if *etag == prev.etag => Ok(()),
+        (WriteCondition::IfMatch(_), Some(_)) => Err(Error::PreconditionFailed),
+    }
+}
+
+/// Deletes an upload and its parts. Parts listed in `kept` (sorted) hand their
+/// block references to a completed object; all others release them.
+fn remove_upload(
+    txn: &redb::WriteTransaction,
+    ukey: &[u8],
+    upload_id: &Uuid,
+    kept: &[u32],
+    gc_due_at: Millis,
+) -> Result<()> {
+    txn.open_table(UPLOADS)?.remove(ukey)?;
+    let mut parts = txn.open_table(PARTS)?;
+    let mut blocks = txn.open_table(BLOCKS)?;
+    let mut gc = txn.open_table(GC_QUEUE)?;
+    let start = part_key(upload_id, 0);
+    let end = part_key(upload_id, u32::MAX);
+    for entry in parts.extract_from_if::<&[u8], _>(start.as_slice()..=end.as_slice(), |_, _| true)? {
+        let (k, v) = entry?;
+        let number = parse_part_number(k.value()).ok_or_else(|| Error::Corrupt("bad parts key".into()))?;
+        if kept.binary_search(&number).is_err() {
+            let part: PartRecord = codec::decode(v.value())?;
+            release_blocks(&mut blocks, &mut gc, &part.blocks, gc_due_at)?;
+        }
+    }
+    Ok(())
+}
+
+/// The common prefix `key` rolls up into under `prefix` and `delimiter`, if any.
+fn common_prefix_of<'k>(key: &'k [u8], prefix: &[u8], delimiter: Option<&[u8]>) -> Option<&'k [u8]> {
+    let delim = delimiter?;
+    let rest = key.strip_prefix(prefix)?;
+    let pos = memchr::memmem::find(rest, delim)?;
+    Some(&key[..prefix.len() + pos + delim.len()])
+}
+
+fn bad_upload_key() -> Error {
+    Error::Corrupt("bad uploads key".into())
 }
 
 fn delete_object(

@@ -29,6 +29,9 @@ interval_secs = 30
 # Leftovers from interrupted uploads are removed after this long.
 orphan_grace_secs = 3600
 sweep_interval_secs = 3600
+# Multipart uploads not completed within this time are aborted and their parts
+# deleted. 0 keeps them forever.
+abandoned_upload_secs = 604800   # 7 days
 
 [log]
 # Filter directive; RUST_LOG overrides it.

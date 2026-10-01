@@ -44,6 +44,7 @@ mod tests {
                 ..Default::default()
             },
             data: ObjectData::Blocks(vec![BlockRef { id: Uuid::new_v4(), len: 3, crc32c: 7 }]),
+            part_sizes: vec![3],
         };
         let back: ObjectRecord = decode(&encode(&record)).unwrap();
         assert_eq!(back, record);
@@ -61,6 +62,30 @@ mod tests {
         let attrs: ObjectAttrs = decode(&encode(&Old { content_type: Some("a/b".into()) })).unwrap();
         assert_eq!(attrs.content_type.as_deref(), Some("a/b"));
         assert!(attrs.user_metadata.is_empty());
+    }
+
+    #[test]
+    fn records_from_before_multipart_still_decode() {
+        #[derive(Serialize)]
+        struct V1Record {
+            version_id: Uuid,
+            size: u64,
+            etag: String,
+            last_modified: i64,
+            attrs: ObjectAttrs,
+            data: ObjectData,
+        }
+        let old = V1Record {
+            version_id: Uuid::now_v7(),
+            size: 1,
+            etag: "e".into(),
+            last_modified: 1,
+            attrs: ObjectAttrs::default(),
+            data: ObjectData::Inline(b"x".to_vec()),
+        };
+        let record: ObjectRecord = decode(&encode(&old)).unwrap();
+        assert!(record.part_sizes.is_empty());
+        assert_eq!(record.attrs.checksum_type, None);
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! Blocks that never get committed are deleted when their [`StagedObject`] is
 //! dropped, or by the orphan sweeper after a crash.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::ops::Range;
@@ -30,13 +31,17 @@ use crate::blocks::{BlockStore, BlockWriter};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
     BlockRef, BucketRecord, Command, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs, ObjectData, ObjectRecord,
-    Outcome, WriteCondition,
+    Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord, WriteCondition,
 };
 
 /// S3's limit for one ListObjects page.
 pub const MAX_LIST_KEYS: usize = 1000;
 /// S3's limit on object key length, in bytes.
 pub const MAX_KEY_LEN: usize = 1024;
+/// S3's limit on parts per multipart upload (and the highest part number).
+pub const MAX_PARTS: u32 = 10_000;
+/// S3's limit for one ListParts or ListMultipartUploads page.
+pub const MAX_LIST_PARTS: usize = 1000;
 
 const READ_CHUNK: u64 = 256 * 1024;
 const GC_BATCH: usize = 1000;
@@ -55,6 +60,10 @@ pub struct EngineConfig {
     /// Unreferenced block files younger than this are left alone by the sweeper.
     pub orphan_grace: Duration,
     pub sweep_interval: Duration,
+    /// Every part of a multipart upload except the last must be at least this big.
+    pub min_part_size: u64,
+    /// Multipart uploads not completed within this time are aborted. Zero disables.
+    pub upload_expiry: Duration,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +76,8 @@ impl Default for EngineConfig {
             gc_interval: Duration::from_secs(30),
             orphan_grace: Duration::from_secs(60 * 60),
             sweep_interval: Duration::from_secs(60 * 60),
+            min_part_size: 5 * 1024 * 1024,
+            upload_expiry: Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
 }
@@ -105,8 +116,10 @@ impl Engine {
     }
 
     /// Fails with `BucketNotEmpty` unless the bucket has no objects.
+    /// Multipart uploads still in progress are aborted.
     pub async fn delete_bucket(&self, name: &str) -> Result<()> {
-        self.apply(Command::DeleteBucket { name: name.to_owned() }).await?;
+        let command = Command::DeleteBucket { name: name.to_owned(), gc_due_at: self.gc_due_at() };
+        self.apply(command).await?;
         Ok(())
     }
 
@@ -147,7 +160,25 @@ impl Engine {
 
     /// Streams a body into durable blocks (or an inline buffer) without
     /// committing it. Dropping the result deletes the blocks.
-    pub async fn stage<S, E>(&self, mut body: S) -> Result<StagedObject>
+    pub async fn stage<S, E>(&self, body: S) -> Result<StagedObject>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<BoxError>,
+    {
+        self.stage_with(body, self.config.inline_threshold).await
+    }
+
+    /// Like [`stage`](Self::stage), for a part of a multipart upload. Parts are
+    /// never inlined, since the completed object is a sequence of blocks.
+    pub async fn stage_part<S, E>(&self, body: S) -> Result<StagedObject>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<BoxError>,
+    {
+        self.stage_with(body, 0).await
+    }
+
+    async fn stage_with<S, E>(&self, mut body: S, inline_threshold: usize) -> Result<StagedObject>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
@@ -169,7 +200,7 @@ impl Engine {
             md5.update(&chunk);
             staged.size += chunk.len() as u64;
             if let Some(buf) = &mut inline {
-                if buf.len() + chunk.len() <= self.config.inline_threshold {
+                if buf.len() + chunk.len() <= inline_threshold {
                     buf.extend_from_slice(&chunk);
                     continue;
                 }
@@ -206,6 +237,7 @@ impl Engine {
             last_modified: now,
             attrs,
             data: staged.data.clone(),
+            part_sizes: Vec::new(),
         };
         let command = Command::PutObject {
             bucket: bucket.to_owned(),
@@ -214,17 +246,7 @@ impl Engine {
             condition,
             gc_due_at: now + self.gc_grace_millis(),
         };
-        // The staged blocks move into the blocking task, so they outlive the
-        // commit even if this future is cancelled (the client disconnects).
-        // Otherwise a cancelled request could delete blocks of a committed object.
-        let meta = Arc::clone(&self.meta);
-        tokio::task::spawn_blocking(move || {
-            let mut staged = staged;
-            let result = meta.apply(command);
-            staged.committed = result.is_ok();
-            result
-        })
-        .await??;
+        self.commit_staged(staged, command).await?;
         Ok(record)
     }
 
@@ -268,6 +290,232 @@ impl Engine {
         };
         self.apply(command).await?;
         Ok(())
+    }
+
+    /// Makes `dst_bucket/dst_key` a copy of `source`, which the caller read from
+    /// `src_bucket/src_key`. The copy shares the source's blocks, so no data is
+    /// written. Fails with `Conflict` if the source changed in the meantime.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        source: &ObjectRecord,
+        dst_bucket: &str,
+        dst_key: &str,
+        attrs: ObjectAttrs,
+        condition: WriteCondition,
+    ) -> Result<ObjectRecord> {
+        validate_key(dst_key)?;
+        let now = now_millis();
+        let record = ObjectRecord {
+            version_id: Uuid::now_v7(),
+            size: source.size,
+            etag: source.etag.clone(),
+            last_modified: now,
+            attrs,
+            data: source.data.clone(),
+            part_sizes: source.part_sizes.clone(),
+        };
+        let command = Command::CopyObject {
+            src_bucket: src_bucket.to_owned(),
+            src_key: src_key.to_owned(),
+            src_version: source.version_id,
+            dst_bucket: dst_bucket.to_owned(),
+            dst_key: dst_key.to_owned(),
+            record: record.clone(),
+            condition,
+            gc_due_at: now + self.gc_grace_millis(),
+        };
+        self.apply(command).await?;
+        Ok(record)
+    }
+
+    // ---- multipart uploads ----
+
+    pub async fn create_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        attrs: ObjectAttrs,
+        checksum_algorithm: Option<String>,
+        checksum_type: Option<String>,
+    ) -> Result<UploadRecord> {
+        validate_key(key)?;
+        let upload = UploadRecord {
+            upload_id: Uuid::now_v7(),
+            key: key.to_owned(),
+            initiated: now_millis(),
+            attrs,
+            checksum_algorithm,
+            checksum_type,
+        };
+        self.apply(Command::CreateUpload { bucket: bucket.to_owned(), upload: upload.clone() }).await?;
+        Ok(upload)
+    }
+
+    /// Fails with `NoSuchBucket` or `NoSuchUpload`.
+    pub async fn get_upload(&self, bucket: &str, key: &str, upload_id: Uuid) -> Result<UploadRecord> {
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        self.read(move |meta| meta.get_upload(&bucket, &key, &upload_id)).await
+    }
+
+    /// Commits a body staged with [`stage_part`](Self::stage_part) as part
+    /// `part_number`, replacing an earlier upload of the same part.
+    pub async fn commit_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        staged: StagedObject,
+        checksums: BTreeMap<String, String>,
+    ) -> Result<PartRecord> {
+        validate_part_number(part_number)?;
+        if matches!(&staged.data, ObjectData::Inline(data) if !data.is_empty()) {
+            return Err(Error::InvalidArgument("parts must be staged with stage_part".into()));
+        }
+        let now = now_millis();
+        let part = PartRecord {
+            size: staged.size,
+            etag: staged.etag(),
+            last_modified: now,
+            blocks: staged.data.blocks().to_vec(),
+            checksums,
+        };
+        let command = Command::PutPart {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload_id,
+            part_number,
+            part: part.clone(),
+            gc_due_at: now + self.gc_grace_millis(),
+        };
+        self.commit_staged(staged, command).await?;
+        Ok(part)
+    }
+
+    /// Parts numbered above `after`, up to `max` (capped at 1000).
+    pub async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        after: u32,
+        max: usize,
+    ) -> Result<PartsPage> {
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        let max = max.min(MAX_LIST_PARTS);
+        self.read(move |meta| meta.list_parts(&bucket, &key, &upload_id, after, max)).await
+    }
+
+    /// Validates the part list of a CompleteMultipartUpload request (part
+    /// number and ETag pairs, as sent by the client).
+    pub async fn prepare_completion(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        requested: &[(u32, String)],
+    ) -> Result<Completion> {
+        if requested.is_empty() {
+            return Err(Error::InvalidPart("at least one part must be specified".into()));
+        }
+        if requested.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return Err(Error::InvalidPartOrder);
+        }
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        let PartsPage { upload, parts: uploaded, .. } =
+            self.read(move |meta| meta.list_parts(&bucket, &key, &upload_id, 0, usize::MAX)).await?;
+
+        let mut parts = Vec::with_capacity(requested.len());
+        for (i, (number, etag)) in requested.iter().enumerate() {
+            let Ok(found) = uploaded.binary_search_by_key(number, |(n, _)| *n) else {
+                return Err(Error::InvalidPart(format!("part {number} has not been uploaded")));
+            };
+            let part = &uploaded[found].1;
+            if etag.trim_matches('"') != part.etag {
+                return Err(Error::InvalidPart(format!("the ETag of part {number} does not match")));
+            }
+            if i + 1 < requested.len() && part.size < self.config.min_part_size {
+                return Err(Error::EntityTooSmall(*number));
+            }
+            parts.push((*number, part.clone()));
+        }
+        Ok(Completion { upload, parts })
+    }
+
+    /// Turns a validated upload into an object. Only metadata is written: the
+    /// object takes over the parts' blocks.
+    pub async fn complete_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        completion: Completion,
+        checksums: BTreeMap<String, String>,
+        checksum_type: Option<String>,
+        condition: WriteCondition,
+    ) -> Result<ObjectRecord> {
+        let now = now_millis();
+        let mut attrs = completion.upload.attrs.clone();
+        attrs.checksums = checksums;
+        attrs.checksum_type = checksum_type;
+        let record = ObjectRecord {
+            version_id: Uuid::now_v7(),
+            size: completion.size(),
+            etag: completion.etag()?,
+            last_modified: now,
+            attrs,
+            data: ObjectData::Blocks(completion.parts.iter().flat_map(|(_, p)| p.blocks.iter().copied()).collect()),
+            part_sizes: completion.parts.iter().map(|(_, p)| p.size).collect(),
+        };
+        let command = Command::CompleteUpload {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload_id: completion.upload.upload_id,
+            part_numbers: completion.parts.iter().map(|(n, _)| *n).collect(),
+            record: record.clone(),
+            condition,
+            gc_due_at: now + self.gc_grace_millis(),
+        };
+        self.apply(command).await?;
+        Ok(record)
+    }
+
+    pub async fn abort_upload(&self, bucket: &str, key: &str, upload_id: Uuid) -> Result<()> {
+        let command = Command::AbortUpload {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            upload_id,
+            gc_due_at: self.gc_due_at(),
+        };
+        self.apply(command).await?;
+        Ok(())
+    }
+
+    pub async fn list_uploads(&self, bucket: &str, mut query: UploadListQuery) -> Result<UploadPage> {
+        query.max_uploads = query.max_uploads.min(MAX_LIST_PARTS);
+        let bucket = bucket.to_owned();
+        self.read(move |meta| meta.list_uploads(&bucket, &query)).await
+    }
+
+    /// Aborts uploads older than `upload_expiry`. Returns how many.
+    pub async fn abort_stale_uploads(&self) -> Result<usize> {
+        if self.config.upload_expiry.is_zero() {
+            return Ok(0);
+        }
+        let cutoff = now_millis() - self.config.upload_expiry.as_millis() as Millis;
+        let stale = self.read(move |meta| meta.uploads_started_before(cutoff)).await?;
+        let mut aborted = 0;
+        for (bucket, key, upload_id) in stale {
+            match self.abort_upload(&bucket, &key, upload_id).await {
+                Ok(()) => aborted += 1,
+                // Completed, aborted or deleted with its bucket in the meantime.
+                Err(Error::NoSuchUpload | Error::NoSuchBucket) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(aborted)
     }
 
     // ---- reads ----
@@ -361,7 +609,8 @@ impl Engine {
         Ok(removed)
     }
 
-    /// Runs GC and the orphan sweeper until the returned handle is dropped.
+    /// Runs GC, the orphan sweeper and abandoned-upload cleanup until the
+    /// returned handle is dropped.
     pub fn start_background_tasks(self: &Arc<Self>) -> BackgroundTasks {
         let gc = {
             let engine = Arc::clone(self);
@@ -388,6 +637,11 @@ impl Engine {
                         Ok(n) => info!(files = n, "removed orphaned block files"),
                         Err(e) => warn!(error = %e, "orphan sweep failed"),
                     }
+                    match engine.abort_stale_uploads().await {
+                        Ok(0) => {}
+                        Ok(n) => info!(uploads = n, "aborted abandoned multipart uploads"),
+                        Err(e) => warn!(error = %e, "aborting abandoned uploads failed"),
+                    }
                 }
             })
         };
@@ -401,6 +655,21 @@ impl Engine {
         tokio::task::spawn_blocking(move || meta.apply(command)).await?
     }
 
+    /// Applies a command that references a staged body's blocks. The staged
+    /// body moves into the blocking task, so it outlives the commit even if
+    /// this future is cancelled (the client disconnects); otherwise a cancelled
+    /// request could delete the blocks of a committed object.
+    async fn commit_staged(&self, staged: StagedObject, command: Command) -> Result<Outcome> {
+        let meta = Arc::clone(&self.meta);
+        tokio::task::spawn_blocking(move || {
+            let mut staged = staged;
+            let result = meta.apply(command);
+            staged.committed = result.is_ok();
+            result
+        })
+        .await?
+    }
+
     async fn read<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -412,6 +681,34 @@ impl Engine {
 
     fn gc_grace_millis(&self) -> Millis {
         self.config.gc_grace.as_millis() as Millis
+    }
+
+    fn gc_due_at(&self) -> Millis {
+        now_millis() + self.gc_grace_millis()
+    }
+}
+
+/// A validated CompleteMultipartUpload request.
+#[derive(Clone, Debug)]
+pub struct Completion {
+    pub upload: UploadRecord,
+    /// The parts the object will consist of, in order.
+    pub parts: Vec<(u32, PartRecord)>,
+}
+
+impl Completion {
+    pub fn size(&self) -> u64 {
+        self.parts.iter().map(|(_, p)| p.size).sum()
+    }
+
+    /// S3's multipart ETag: the MD5 of the parts' binary MD5s, then `-<count>`.
+    pub fn etag(&self) -> Result<String> {
+        let mut md5 = Md5::new();
+        for (number, part) in &self.parts {
+            let digest = hex::decode(&part.etag).map_err(|_| Error::Corrupt(format!("bad ETag on part {number}")))?;
+            md5.update(&digest);
+        }
+        Ok(format!("{}-{}", hex::encode(md5.finalize()), self.parts.len()))
     }
 }
 
@@ -585,6 +882,17 @@ pub fn validate_bucket_name(name: &str) -> Result<()> {
 pub fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() || key.len() > MAX_KEY_LEN {
         return Err(Error::InvalidArgument(format!("object keys must be 1 to {MAX_KEY_LEN} bytes")));
+    }
+    // NUL cannot appear in S3's XML responses, and the uploads table uses it as a separator.
+    if key.contains('\0') {
+        return Err(Error::InvalidArgument("object keys must not contain NUL characters".into()));
+    }
+    Ok(())
+}
+
+pub fn validate_part_number(part_number: u32) -> Result<()> {
+    if !(1..=MAX_PARTS).contains(&part_number) {
+        return Err(Error::InvalidArgument(format!("part numbers must be between 1 and {MAX_PARTS}")));
     }
     Ok(())
 }

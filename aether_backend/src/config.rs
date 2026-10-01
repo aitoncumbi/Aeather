@@ -57,6 +57,8 @@ pub struct GcConfig {
     /// Unreferenced block files younger than this are never swept.
     pub orphan_grace_secs: u64,
     pub sweep_interval_secs: u64,
+    /// Multipart uploads not completed within this time are aborted. 0 disables.
+    pub abandoned_upload_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -124,6 +126,7 @@ impl Default for GcConfig {
             interval_secs: engine.gc_interval.as_secs(),
             orphan_grace_secs: engine.orphan_grace.as_secs(),
             sweep_interval_secs: engine.sweep_interval.as_secs(),
+            abandoned_upload_secs: engine.upload_expiry.as_secs(),
         }
     }
 }
@@ -193,6 +196,8 @@ impl Config {
             gc_interval: Duration::from_secs(self.gc.interval_secs),
             orphan_grace: Duration::from_secs(self.gc.orphan_grace_secs),
             sweep_interval: Duration::from_secs(self.gc.sweep_interval_secs),
+            upload_expiry: Duration::from_secs(self.gc.abandoned_upload_secs),
+            ..EngineConfig::default()
         }
     }
 }

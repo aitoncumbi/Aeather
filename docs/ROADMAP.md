@@ -28,11 +28,12 @@ anything from a 1 KB document to a 100 GB file.
 - [x] End-to-end tests with the Rust AWS SDK
 
 ### M3. Large objects and copies
-- [ ] Multipart upload: Create, UploadPart, Complete, Abort, ListParts, ListMultipartUploads
-- [ ] UploadPartCopy
-- [ ] Automatic cleanup of abandoned multipart uploads
-- [ ] CopyObject (shares blocks by reference count; no data copy)
-- [ ] GetObject/HeadObject `partNumber`
+- [x] Multipart upload: Create, UploadPart, Complete, Abort, ListParts, ListMultipartUploads
+- [x] UploadPartCopy
+- [x] Automatic cleanup of abandoned multipart uploads
+- [x] CopyObject (shares blocks by reference count; no data copy)
+- [x] GetObject/HeadObject `partNumber`
+- [x] Multipart checksums: `COMPOSITE` and `FULL_OBJECT` (CRCs combined across parts)
 
 ### M4. Access control and admin API
 - [ ] Access keys stored in metadata, per-bucket permissions (read, write, admin)

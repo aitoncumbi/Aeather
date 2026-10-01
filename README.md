@@ -3,9 +3,13 @@
 S3-compatible object storage written in Rust, for teams that run their own
 servers or containers and need object storage for internal applications.
 
-> **Status: early development.** Single-node object storage works with the AWS
-> SDKs, the AWS CLI and boto3. Multipart upload, per-application access keys and
-> the admin API are next. See the [roadmap](docs/ROADMAP.md).
+> **Status: early development.** Single-node object storage, including multipart
+> uploads and server-side copies, works with the AWS SDKs, the AWS CLI and boto3
+> using their default settings. Per-application access keys and the admin API are
+> next. See the [roadmap](docs/ROADMAP.md).
+
+No AWS account or cloud service is involved: Aether runs on your servers, and
+"AWS" below only refers to standard S3 client tools.
 
 - [Design](docs/DESIGN.md): architecture and the decisions behind it
 - [Roadmap](docs/ROADMAP.md): what is done and what comes next
@@ -61,9 +65,6 @@ s3.put_object(Bucket="reports", Key="hello.txt", Body=b"hello")
 
 Current limitations:
 
-- **Multipart upload is not implemented yet.** Until it is, raise the client's
-  multipart threshold (AWS CLI: `s3.multipart_threshold = 5GB`; boto3:
-  `TransferConfig(multipart_threshold=...)`). Single uploads go up to 5 GiB.
 - **Only Signature Version 4 is accepted.** AWS CLI v1 creates SigV2 presigned
   URLs by default; set `s3.signature_version = s3v4` in its config.
 - One root key for now; per-application keys come with the admin API.

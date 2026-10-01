@@ -24,6 +24,22 @@ pub enum Error {
     #[error("a precondition did not hold")]
     PreconditionFailed,
 
+    #[error("the specified multipart upload does not exist")]
+    NoSuchUpload,
+
+    #[error("invalid part: {0}")]
+    InvalidPart(String),
+
+    #[error("parts must be listed in ascending order")]
+    InvalidPartOrder,
+
+    #[error("part {0} is smaller than the minimum part size")]
+    EntityTooSmall(u32),
+
+    /// A concurrent change invalidated the request; retrying may succeed.
+    #[error("conflicting concurrent operation: {0}")]
+    Conflict(String),
+
     #[error("invalid bucket name: {0}")]
     InvalidBucketName(String),
 
