@@ -8,13 +8,13 @@ The bar: an internal team points an unmodified AWS SDK at Aether, and it works f
 anything from a 1 KB document to a 100 GB file.
 
 ### M1. Storage core
-- [ ] redb metadata store: buckets, objects, block index, GC queue, schema version
-- [ ] Block store: streaming writes split into blocks, tmp + fsync + rename, CRC32C per block
-- [ ] Inline storage for small objects
-- [ ] Engine: create/delete/list buckets; put/get/head/delete objects; byte ranges
-- [ ] Listing with prefix, delimiter and pagination
-- [ ] Conditional writes (`If-None-Match: *`, `If-Match`) checked inside the commit
-- [ ] Background GC with a grace period, orphan sweeper
+- [x] redb metadata store: buckets, objects, block index, GC queue, schema version
+- [x] Block store: streaming writes split into blocks, tmp + fsync + rename, CRC32C per block
+- [x] Inline storage for small objects
+- [x] Engine: create/delete/list buckets; put/get/head/delete objects; byte ranges
+- [x] Listing with prefix, delimiter and pagination
+- [x] Conditional writes (`If-None-Match: *`, `If-Match`) checked inside the commit
+- [x] Background GC with a grace period, orphan sweeper
 
 ### M2. S3 gateway
 - [ ] `s3s` on axum, replacing the actix-web prototype

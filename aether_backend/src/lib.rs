@@ -1,3 +1,7 @@
+pub mod blocks;
+pub mod engine;
+pub mod error;
+pub mod meta;
 pub mod logger;
 pub mod config;
 pub mod services;
