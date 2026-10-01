@@ -16,6 +16,7 @@ use std::net::Ipv4Addr;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -66,6 +67,12 @@ pub struct EngineConfig {
     pub min_part_size: u64,
     /// Multipart uploads not completed within this time are aborted. Zero disables.
     pub upload_expiry: Duration,
+    /// An upload whose body sends nothing for this long fails with a timeout.
+    pub body_timeout: Duration,
+    /// How often every block is re-read and its checksum verified. Zero disables.
+    pub scrub_interval: Duration,
+    /// Read rate limit for scrubbing, in bytes per second. Zero means unlimited.
+    pub scrub_rate: u64,
 }
 
 impl Default for EngineConfig {
@@ -80,6 +87,9 @@ impl Default for EngineConfig {
             sweep_interval: Duration::from_secs(60 * 60),
             min_part_size: 5 * 1024 * 1024,
             upload_expiry: Duration::from_secs(7 * 24 * 60 * 60),
+            body_timeout: Duration::from_secs(60),
+            scrub_interval: Duration::from_secs(7 * 24 * 60 * 60),
+            scrub_rate: 64 * 1024 * 1024,
         }
     }
 }
@@ -88,7 +98,28 @@ pub struct Engine {
     meta: Arc<MetaStore>,
     blocks: Arc<BlockStore>,
     keys: Arc<KeyCache>,
+    stats: Arc<EngineStats>,
+    scrub: scrub::ScrubState,
     config: EngineConfig,
+}
+
+/// Counters since startup, exported as metrics.
+#[derive(Debug, Default)]
+pub struct EngineStats {
+    /// Object data received from clients (uploads, parts, part copies).
+    pub bytes_received: AtomicU64,
+    /// Object data sent to clients.
+    pub bytes_sent: AtomicU64,
+    pub gc_blocks_deleted: AtomicU64,
+    pub orphans_removed: AtomicU64,
+    pub uploads_aborted: AtomicU64,
+    pub scrub_blocks_checked: AtomicU64,
+    pub scrub_bytes_checked: AtomicU64,
+    pub scrub_corrupt_blocks: AtomicU64,
+}
+
+fn count(counter: &AtomicU64, n: u64) {
+    counter.fetch_add(n, Ordering::Relaxed);
 }
 
 impl Engine {
@@ -102,11 +133,22 @@ impl Engine {
         let blocks = BlockStore::open(&config.data_dir).await?;
         let keys = KeyCache::default();
         KeyCache::load(&meta, &keys)?;
-        Ok(Self { meta: Arc::new(meta), blocks: Arc::new(blocks), keys: Arc::new(keys), config })
+        Ok(Self {
+            meta: Arc::new(meta),
+            blocks: Arc::new(blocks),
+            keys: Arc::new(keys),
+            stats: Arc::default(),
+            scrub: scrub::ScrubState::default(),
+            config,
+        })
     }
 
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    pub fn stats(&self) -> &EngineStats {
+        &self.stats
     }
 
     // ---- buckets ----
@@ -217,10 +259,13 @@ impl Engine {
         let mut inline = Some(Vec::new());
         let mut sink = BlockSink { engine: self, writer: None, blocks: Vec::new() };
 
-        while let Some(chunk) = body.next().await {
+        loop {
+            let next = tokio::time::timeout(self.config.body_timeout, body.next()).await;
+            let Some(chunk) = next.map_err(|_| Error::BodyTimeout)? else { break };
             let chunk = chunk.map_err(|e| Error::Body(e.into()))?;
             md5.update(&chunk);
             staged.size += chunk.len() as u64;
+            count(&self.stats.bytes_received, chunk.len() as u64);
             if let Some(buf) = &mut inline {
                 if buf.len() + chunk.len() <= inline_threshold {
                     buf.extend_from_slice(&chunk);
@@ -531,7 +576,10 @@ impl Engine {
         let mut aborted = 0;
         for (bucket, key, upload_id) in stale {
             match self.abort_upload(&bucket, &key, upload_id).await {
-                Ok(()) => aborted += 1,
+                Ok(()) => {
+                    aborted += 1;
+                    count(&self.stats.uploads_aborted, 1);
+                }
                 // Completed, aborted or deleted with its bucket in the meantime.
                 Err(Error::NoSuchUpload | Error::NoSuchBucket) => {}
                 Err(e) => return Err(e),
@@ -552,11 +600,13 @@ impl Engine {
         match &record.data {
             ObjectData::Inline(data) => {
                 let bytes = Bytes::copy_from_slice(&data[range.start as usize..range.end as usize]);
+                count(&self.stats.bytes_sent, bytes.len() as u64);
                 stream::once(async move { Ok(bytes) }).boxed()
             }
             ObjectData::Blocks(blocks) => {
                 let state = ReadState {
                     store: Arc::clone(&self.blocks),
+                    stats: Arc::clone(&self.stats),
                     segments: segments(blocks, range).into_iter(),
                     current: None,
                 };
@@ -587,6 +637,7 @@ impl Engine {
                 self.blocks.delete(id).await?;
             }
             self.apply(Command::ForgetBlocks { entries: due }).await?;
+            count(&self.stats.gc_blocks_deleted, batch as u64);
             total += batch;
             if batch < GC_BATCH {
                 break;
@@ -622,7 +673,10 @@ impl Engine {
                 .await?;
             for path in unknown {
                 match tokio::fs::remove_file(&path).await {
-                    Ok(()) => removed += 1,
+                    Ok(()) => {
+                        removed += 1;
+                        count(&self.stats.orphans_removed, 1);
+                    }
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -667,7 +721,11 @@ impl Engine {
                 }
             })
         };
-        BackgroundTasks { handles: vec![gc, sweeper] }
+        let mut handles = vec![gc, sweeper];
+        if !self.config.scrub_interval.is_zero() {
+            handles.push(tokio::spawn(scrub::run_periodically(Arc::clone(self))));
+        }
+        BackgroundTasks { handles }
     }
 
     // ---- helpers ----
@@ -843,6 +901,7 @@ fn segments(blocks: &[BlockRef], range: Range<u64>) -> Vec<(Uuid, u64, u64)> {
 
 struct ReadState {
     store: Arc<BlockStore>,
+    stats: Arc<EngineStats>,
     segments: std::vec::IntoIter<(Uuid, u64, u64)>,
     current: Option<(tokio::io::Take<tokio::fs::File>, u64)>,
 }
@@ -867,6 +926,7 @@ impl ReadState {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block file is shorter than its metadata"));
             }
             *remaining -= n as u64;
+            count(&self.stats.bytes_sent, n as u64);
             return Ok(Some((buf.freeze(), self)));
         }
     }
@@ -875,6 +935,13 @@ impl ReadState {
 /// Aborts the background tasks when dropped.
 pub struct BackgroundTasks {
     handles: Vec<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    /// Adds another task to stop with the others.
+    pub fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
 }
 
 impl Drop for BackgroundTasks {
@@ -920,6 +987,9 @@ pub fn validate_part_number(part_number: u32) -> Result<()> {
 }
 
 mod keys;
+mod scrub;
+
+pub use self::scrub::{CorruptBlock, ScrubReport};
 
 #[cfg(test)]
 mod tests;

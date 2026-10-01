@@ -16,6 +16,7 @@ use subtle::ConstantTimeEq;
 
 use crate::engine::Engine;
 use crate::meta::{AccessKeyRecord, BucketGrant};
+use crate::observe::RequestFacts;
 
 pub struct Authorizer {
     engine: Arc<Engine>,
@@ -177,8 +178,13 @@ impl S3Permissions {
 #[async_trait::async_trait]
 impl S3Access for S3Permissions {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
-        let credentials = cx.credentials().ok_or_else(|| s3_error!(AccessDenied, "Signature is required"))?;
-        let identity = self.0.identify(&credentials.access_key).ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
+        let access_key = cx.credentials().map(|c| c.access_key.clone());
+        let operation = cx.s3_op().name().to_owned();
+        if let Some(facts) = cx.extensions_mut().get::<RequestFacts>() {
+            facts.record(&operation, access_key.as_deref().unwrap_or("-"));
+        }
+        let access_key = access_key.ok_or_else(|| s3_error!(AccessDenied, "Signature is required"))?;
+        let identity = self.0.identify(&access_key).ok_or_else(|| s3_error!(InvalidAccessKeyId))?;
         let required = required(cx.s3_op().name());
         let permitted = match cx.s3_path() {
             S3Path::Bucket { bucket } | S3Path::Object { bucket, .. } => allowed(identity.grant(bucket), required),

@@ -23,11 +23,16 @@ figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
 getrandom = "0.4"
 hex = "0.4"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
 md-5 = "0.11"
 memchr = "2"
+prometheus-client = "0.25"
 redb = "4"
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rmp-serde = "1"
+rustix = { version = "1", features = ["fs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 s3s = "0.17"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_bytes = "0.11"
@@ -37,11 +42,14 @@ sync_wrapper = { version = "1", features = ["futures"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.46.1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "json"] }
 uuid = { version = "1.26", features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
 aws-sdk-s3 = "1"
+rcgen = "0.14"
 figment = { version = "0.10", features = ["test"] }
 tempfile = "3"

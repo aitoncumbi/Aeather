@@ -52,6 +52,9 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("the client sent no data for too long")]
+    BodyTimeout,
+
     #[error("reading the request body failed: {0}")]
     Body(#[source] BoxError),
 

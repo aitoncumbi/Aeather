@@ -20,7 +20,10 @@ pub struct Config {
     pub storage: StorageConfig,
     pub s3: S3Config,
     pub admin: AdminConfig,
+    pub tls: TlsConfig,
+    pub http: HttpConfig,
     pub gc: GcConfig,
+    pub scrub: ScrubConfig,
     pub log: LogConfig,
 }
 
@@ -57,6 +60,57 @@ pub struct AdminConfig {
     pub listen: SocketAddr,
 }
 
+/// HTTPS. Setting both files enables TLS on the S3 port.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM certificate chain, leaf first.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key (PKCS#8, PKCS#1 or SEC1).
+    pub key_file: Option<PathBuf>,
+    /// Also serve the admin API over TLS, with the same certificate.
+    pub admin: bool,
+    /// How often the files are checked for changes; a renewed certificate is
+    /// picked up without a restart. 0 disables.
+    pub reload_secs: u64,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self { cert_file: None, key_file: None, admin: false, reload_secs: 60 }
+    }
+}
+
+impl TlsConfig {
+    pub fn files(&self) -> Option<(&Path, &Path)> {
+        Some((self.cert_file.as_deref()?, self.key_file.as_deref()?))
+    }
+}
+
+/// Connection limits for both listeners.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HttpConfig {
+    /// Time allowed to send the request headers.
+    pub header_timeout_secs: u64,
+    /// Time allowed to complete a TLS handshake.
+    pub handshake_timeout_secs: u64,
+    /// An upload that sends no data for this long is aborted.
+    pub body_timeout_secs: u64,
+    /// On shutdown, how long to wait for in-flight requests before closing.
+    pub shutdown_timeout_secs: u64,
+}
+
+/// Background verification of stored data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScrubConfig {
+    /// Re-read every block and check its CRC32C this often. 0 disables.
+    pub interval_secs: u64,
+    /// Read rate limit in bytes per second, so scrubbing does not starve clients. 0: unlimited.
+    pub bytes_per_sec: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GcConfig {
@@ -77,6 +131,8 @@ pub struct LogConfig {
     /// Default filter, e.g. `info` or `aether_backend=debug,info`. `RUST_LOG` overrides it.
     pub level: String,
     pub format: LogFormat,
+    /// One line per request: method, path, status, operation, access key, duration.
+    pub access_log: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +190,19 @@ impl Default for AdminConfig {
     }
 }
 
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self { header_timeout_secs: 30, handshake_timeout_secs: 10, body_timeout_secs: 60, shutdown_timeout_secs: 30 }
+    }
+}
+
+impl Default for ScrubConfig {
+    fn default() -> Self {
+        let engine = EngineConfig::default();
+        Self { interval_secs: engine.scrub_interval.as_secs(), bytes_per_sec: engine.scrub_rate }
+    }
+}
+
 impl Default for GcConfig {
     fn default() -> Self {
         let engine = EngineConfig::default();
@@ -149,7 +218,7 @@ impl Default for GcConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: "info".into(), format: LogFormat::Text }
+        Self { level: "info".into(), format: LogFormat::Text, access_log: true }
     }
 }
 
@@ -200,6 +269,16 @@ impl Config {
         if self.gc.interval_secs == 0 || self.gc.sweep_interval_secs == 0 {
             return invalid("gc.interval_secs and gc.sweep_interval_secs must be positive");
         }
+        if self.tls.cert_file.is_some() != self.tls.key_file.is_some() {
+            return invalid("tls.cert_file and tls.key_file must be set together");
+        }
+        if self.tls.admin && self.tls.files().is_none() {
+            return invalid("tls.admin needs tls.cert_file and tls.key_file");
+        }
+        let http = &self.http;
+        if [http.header_timeout_secs, http.handshake_timeout_secs, http.body_timeout_secs].contains(&0) {
+            return invalid("http timeouts must be positive");
+        }
         Ok(())
     }
 
@@ -213,6 +292,9 @@ impl Config {
             orphan_grace: Duration::from_secs(self.gc.orphan_grace_secs),
             sweep_interval: Duration::from_secs(self.gc.sweep_interval_secs),
             upload_expiry: Duration::from_secs(self.gc.abandoned_upload_secs),
+            body_timeout: Duration::from_secs(self.http.body_timeout_secs),
+            scrub_interval: Duration::from_secs(self.scrub.interval_secs),
+            scrub_rate: self.scrub.bytes_per_sec,
             ..EngineConfig::default()
         }
     }

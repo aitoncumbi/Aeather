@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::auth::Authorizer;
-use crate::engine::{Engine, NewKey};
+use crate::engine::{Engine, NewKey, ScrubReport};
 use crate::error::Error;
 use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, KeyUpdate, Millis};
+use crate::metrics::{self, Metrics};
 
 #[derive(Clone)]
 struct AdminState {
@@ -32,10 +33,13 @@ struct AdminState {
     started: Instant,
 }
 
-pub fn router(engine: Arc<Engine>, auth: Arc<Authorizer>) -> Router {
+pub fn router(engine: Arc<Engine>, auth: Arc<Authorizer>, metrics: Arc<Metrics>) -> Router {
     let state = AdminState { engine, auth, started: Instant::now() };
+    // Prometheus scrapes without credentials; the listener is loopback-only by default.
+    let metrics = Router::new().route("/metrics", get(metrics::handler)).with_state(metrics);
     Router::new()
         .route("/api/v1/status", get(status))
+        .route("/api/v1/scrub", axum::routing::post(start_scrub))
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/{id}", get(get_key).patch(update_key).delete(delete_key))
         .route("/api/v1/keys/{id}/buckets/{bucket}", put(set_grant).delete(revoke_grant))
@@ -44,6 +48,7 @@ pub fn router(engine: Arc<Engine>, auth: Arc<Authorizer>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "NotFound", "no such endpoint") })
         .with_state(state)
+        .merge(metrics)
 }
 
 // ---- request and response bodies ----
@@ -125,6 +130,11 @@ pub struct StatusView {
     pub bytes: u64,
     pub blocks: u64,
     pub access_keys: usize,
+    /// Free and total space of the data directory's file system.
+    pub disk_available_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    /// The running scrub's progress, or the last one's result.
+    pub scrub: Option<ScrubReport>,
 }
 
 fn key_view(key: AccessKeyRecord) -> KeyView {
@@ -161,6 +171,7 @@ type ApiResult<T> = Result<T, ApiError>;
 
 async fn status(State(s): State<AdminState>) -> ApiResult<Json<StatusView>> {
     let buckets = s.engine.list_bucket_usage().await?;
+    let disk = metrics::disk_space(&s.engine.config().data_dir).ok();
     Ok(Json(StatusView {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         uptime_secs: s.started.elapsed().as_secs(),
@@ -169,7 +180,24 @@ async fn status(State(s): State<AdminState>) -> ApiResult<Json<StatusView>> {
         bytes: buckets.iter().map(|(_, u)| u.bytes).sum(),
         blocks: s.engine.block_count().await?,
         access_keys: s.engine.access_keys().len(),
+        disk_available_bytes: disk.map(|(available, _)| available),
+        disk_total_bytes: disk.map(|(_, total)| total),
+        scrub: s.engine.scrub_report(),
     }))
+}
+
+/// Starts a scrub in the background; progress shows in `/api/v1/status`.
+async fn start_scrub(State(s): State<AdminState>) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    if s.engine.scrub_report().is_some_and(|report| report.finished_at.is_none()) {
+        return Err(Error::Conflict("a scrub is already running".into()).into());
+    }
+    let engine = Arc::clone(&s.engine);
+    tokio::spawn(async move {
+        if let Err(e) = engine.scrub().await {
+            tracing::warn!(error = %e, "scrub failed");
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))))
 }
 
 async fn list_keys(State(s): State<AdminState>) -> Json<Vec<KeyView>> {
@@ -361,6 +389,7 @@ impl From<Error> for ApiError {
             Error::BucketAlreadyExists => (StatusCode::CONFLICT, "BucketAlreadyExists"),
             Error::BucketNotEmpty => (StatusCode::CONFLICT, "BucketNotEmpty"),
             Error::AccessKeyExists => (StatusCode::CONFLICT, "AccessKeyExists"),
+            Error::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
             Error::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
             Error::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
             _ => {

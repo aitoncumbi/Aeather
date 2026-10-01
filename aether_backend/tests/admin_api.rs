@@ -23,6 +23,7 @@ struct TestServer {
 }
 
 async fn start() -> TestServer {
+    aether_backend::http::tls::install_crypto_provider();
     let dir = tempfile::tempdir().unwrap();
     let mut config = Config::default();
     config.storage.data_dir = dir.path().to_path_buf();

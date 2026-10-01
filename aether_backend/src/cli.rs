@@ -28,6 +28,12 @@ pub struct ClientArgs {
     /// Admin secret key [default: the root secret from the config file]
     #[arg(long, env = "AETHER_ADMIN_SECRET_KEY", global = true, hide_env_values = true)]
     pub secret_key: Option<String>,
+    /// Trust this PEM CA certificate for an https admin URL (e.g. a private CA)
+    #[arg(long, env = "AETHER_ADMIN_CA_CERT", global = true)]
+    pub ca_cert: Option<std::path::PathBuf>,
+    /// Do not verify the admin API's TLS certificate (testing only)
+    #[arg(long, env = "AETHER_ADMIN_INSECURE", global = true)]
+    pub insecure: bool,
     /// Print the API's JSON instead of a table
     #[arg(long, global = true)]
     pub json: bool,
@@ -97,6 +103,7 @@ pub enum Request {
     Key(KeyCommand),
     Bucket(BucketCommand),
     Status,
+    Scrub,
 }
 
 pub async fn run(request: Request, args: &ClientArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -107,6 +114,10 @@ pub async fn run(request: Request, args: &ClientArgs, config_path: Option<&Path>
         Request::Status => {
             let status = client.call(Method::GET, "/api/v1/status", None).await?;
             if args.json { pretty(&status) } else { format_status(&status) }
+        }
+        Request::Scrub => {
+            client.call(Method::POST, "/api/v1/scrub", None).await?;
+            "Scrub started. Follow its progress with `aether status`.\n".to_owned()
         }
     };
     print!("{output}");
@@ -201,14 +212,15 @@ impl Client {
                 let config = Config::load(config_path).context(
                     "pass --url, --access-key and --secret-key, or run where the server's config file can be read",
                 )?;
-                let url = args.url.clone().unwrap_or_else(|| format!("http://{}", reachable(config.admin.listen)));
+                let scheme = if config.tls.admin { "https" } else { "http" };
+                let url = args.url.clone().unwrap_or_else(|| format!("{scheme}://{}", reachable(config.admin.listen)));
                 let access_key = args.access_key.clone().unwrap_or(config.s3.access_key);
                 let secret_key = args.secret_key.clone().unwrap_or_else(|| config.s3.secret_key.expose().to_owned());
                 (url, access_key, secret_key)
             }
         };
         let base = url.trim_end_matches('/').to_owned();
-        Ok(Self { http: reqwest::Client::new(), base, access_key, secret_key })
+        Ok(Self { http: http_client(args.ca_cert.as_deref(), args.insecure)?, base, access_key, secret_key })
     }
 
     /// Returns the response body, or `Value::Null` for 204 No Content.
@@ -233,6 +245,42 @@ impl Client {
         }
         Ok(value)
     }
+}
+
+fn http_client(ca_cert: Option<&Path>, accept_invalid_certs: bool) -> anyhow::Result<reqwest::Client> {
+    // reqwest is built without a bundled crypto backend; use the server's.
+    crate::http::tls::install_crypto_provider();
+    let mut builder = reqwest::Client::builder().tls_danger_accept_invalid_certs(accept_invalid_certs);
+    if let Some(path) = ca_cert {
+        let pem = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);
+    }
+    Ok(builder.build()?)
+}
+
+/// `aether health`: exits successfully when the S3 listener reports ready.
+/// Meant for container health checks, so it trusts any certificate: it
+/// connects to its own server over loopback.
+pub async fn health(url: Option<&str>, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let base = match url {
+        Some(url) => url.trim_end_matches('/').to_owned(),
+        None => {
+            let config = Config::load(config_path)?;
+            let scheme = if config.tls.files().is_some() { "https" } else { "http" };
+            format!("{scheme}://{}", reachable(config.s3.listen))
+        }
+    };
+    let client = http_client(None, true)?;
+    let response = client
+        .get(format!("{base}/_aether/health/ready"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("cannot reach {base}"))?;
+    if !response.status().is_success() {
+        bail!("not ready: {}", response.status());
+    }
+    Ok(())
 }
 
 /// A connectable address for a listen address (`0.0.0.0` → loopback).
@@ -406,6 +454,35 @@ fn format_status(status: &Value) -> String {
     let _ = writeln!(out, "Data:        {}", bytes(status["bytes"].as_u64().unwrap_or(0)));
     let _ = writeln!(out, "Blocks:      {}", text(&status["blocks"]));
     let _ = writeln!(out, "Access keys: {}", text(&status["access_keys"]));
+    if let (Some(available), Some(total)) =
+        (status["disk_available_bytes"].as_u64(), status["disk_total_bytes"].as_u64())
+    {
+        let _ = writeln!(out, "Disk:        {} free of {}", bytes(available), bytes(total));
+    }
+    let scrub = &status["scrub"];
+    if scrub.is_null() {
+        let _ = writeln!(out, "Scrub:       not run since the server started");
+    } else {
+        let progress = format!(
+            "{} objects, {} blocks, {} checked, {} damaged",
+            text(&scrub["objects_checked"]),
+            text(&scrub["blocks_checked"]),
+            bytes(scrub["bytes_checked"].as_u64().unwrap_or(0)),
+            scrub["corrupt"].as_array().map_or(0, Vec::len),
+        );
+        let state = if scrub["finished_at"].is_null() { "running" } else { "finished" };
+        let _ = writeln!(out, "Scrub:       {state}: {progress}");
+        for block in scrub["corrupt"].as_array().into_iter().flatten() {
+            let _ = writeln!(
+                out,
+                "  DAMAGED {}/{} (block {}): {}",
+                text(&block["bucket"]),
+                text(&block["key"]),
+                text(&block["block_id"]),
+                text(&block["problem"])
+            );
+        }
+    }
     out
 }
 

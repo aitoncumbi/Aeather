@@ -33,6 +33,10 @@ pub fn s3_error(e: Error) -> S3Error {
             format!("part {part} is smaller than the minimum allowed size; only the last part may be smaller"),
         ),
         Error::Conflict(msg) => S3Error::with_message(S3ErrorCode::OperationAborted, msg),
+        Error::BodyTimeout => S3Error::with_message(
+            S3ErrorCode::RequestTimeout,
+            "your socket connection to the server was not read from or written to within the timeout period",
+        ),
         // The body stream fails with s3s errors (bad chunk signature, size limit)
         // or I/O errors when the client goes away.
         Error::Body(source) => match source.downcast::<S3Error>() {

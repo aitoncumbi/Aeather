@@ -1,45 +1,62 @@
 use std::future::Future;
 use std::sync::Arc;
-
-use futures::FutureExt;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
 use axum::error_handling::HandleError;
 use axum::extract::State;
-use axum::http::{Response, StatusCode};
+use axum::http::{HeaderName, Response, StatusCode};
+use axum::middleware;
 use axum::routing::get;
+use futures::FutureExt;
 use s3s::config::StaticConfigProvider;
 use s3s::service::S3ServiceBuilder;
-use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::{Authorizer, S3Credentials, S3Permissions};
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::http::tls::ReloadingCert;
+use crate::http::{self, Limits};
+use crate::metrics::Metrics;
+use crate::observe::{Observer, observe};
 use crate::s3::AetherS3;
 
 /// Opens the engine and serves the S3 and admin APIs until `shutdown` resolves.
 pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
     let engine = Arc::new(Engine::open(config.engine_config()).await?);
-    let _background = engine.start_background_tasks();
+    let mut background = engine.start_background_tasks();
     let routers = routers(engine, &config);
     let shutdown = shutdown.shared();
+    let limits = Limits {
+        header_timeout: Duration::from_secs(config.http.header_timeout_secs),
+        handshake_timeout: Duration::from_secs(config.http.handshake_timeout_secs),
+        shutdown_timeout: Duration::from_secs(config.http.shutdown_timeout_secs),
+    };
 
-    let s3_listener = TcpListener::bind(config.s3.listen).await?;
-    info!(
-        addr = %s3_listener.local_addr()?,
-        data_dir = %config.storage.data_dir.display(),
-        region = %config.s3.region,
-        "S3 API listening"
-    );
-    let s3 = axum::serve(s3_listener, routers.s3).with_graceful_shutdown(shutdown.clone());
+    let tls = match config.tls.files() {
+        Some((cert_file, key_file)) => {
+            let cert = ReloadingCert::load(cert_file, key_file)?;
+            if config.tls.reload_secs > 0 {
+                background.push(cert.spawn_reloader(Duration::from_secs(config.tls.reload_secs)));
+            }
+            Some(cert.server_config()?)
+        }
+        None => None,
+    };
+    let admin_tls = if config.tls.admin { tls.clone() } else { None };
 
+    info!(data_dir = %config.storage.data_dir.display(), region = %config.s3.region, "starting");
+    let s3_listener = http::bind(config.s3.listen, "S3 API", tls.is_some()).await?;
+    let s3 = http::serve(s3_listener, routers.s3, tls, limits, shutdown.clone());
     if config.admin.enabled {
-        let admin_listener = TcpListener::bind(config.admin.listen).await?;
-        info!(addr = %admin_listener.local_addr()?, "admin API listening");
-        let admin = axum::serve(admin_listener, routers.admin).with_graceful_shutdown(shutdown);
-        tokio::try_join!(s3.into_future(), admin.into_future())?;
+        if !config.admin.listen.ip().is_loopback() && admin_tls.is_none() {
+            warn!("the admin API is reachable from the network without TLS; set tls.admin = true");
+        }
+        let admin_listener = http::bind(config.admin.listen, "admin API", admin_tls.is_some()).await?;
+        let admin = http::serve(admin_listener, routers.admin, admin_tls, limits, shutdown);
+        tokio::try_join!(s3, admin)?;
     } else {
         s3.await?;
     }
@@ -56,7 +73,18 @@ pub struct Routers {
 pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
     let auth =
         Authorizer::new(Arc::clone(&engine), config.s3.access_key.clone(), config.s3.secret_key.expose().to_owned());
-    Routers { s3: s3_router(Arc::clone(&engine), Arc::clone(&auth), config), admin: crate::admin::router(engine, auth) }
+    let metrics = Metrics::new(Arc::clone(&engine));
+    let observer = |api, id_header| Observer {
+        api,
+        id_header: HeaderName::from_static(id_header),
+        metrics: Arc::clone(&metrics),
+        access_log: config.log.access_log,
+    };
+    let s3 = s3_router(Arc::clone(&engine), Arc::clone(&auth), config)
+        .layer(middleware::from_fn_with_state(observer("s3", "x-amz-request-id"), observe));
+    let admin = crate::admin::router(engine, auth, Arc::clone(&metrics))
+        .layer(middleware::from_fn_with_state(observer("admin", "x-request-id"), observe));
+    Routers { s3, admin }
 }
 
 fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Router {

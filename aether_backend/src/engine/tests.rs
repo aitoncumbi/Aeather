@@ -901,3 +901,63 @@ async fn schema_migration_rebuilds_usage() {
     assert_eq!(engine.bucket_usage("bkt").await.unwrap().1, BucketUsage { objects: 2, bytes: 30 });
     assert_eq!(engine.bucket_usage("empty").await.unwrap().1, BucketUsage::default());
 }
+
+// ---- scrubbing and timeouts ----
+
+#[tokio::test]
+async fn scrub_finds_damaged_and_missing_blocks() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    put(&engine, "bkt", "good", &pattern(2500)).await;
+    let bad = put(&engine, "bkt", "bad", &pattern(1500)).await;
+    let gone = put(&engine, "bkt", "gone", &pattern(1500)).await;
+    put(&engine, "bkt", "small", b"inline").await;
+
+    // Flip one byte of a block, and lose another block entirely.
+    let damaged = engine.blocks.block_path(&bad.data.blocks()[1].id);
+    let mut bytes = std::fs::read(&damaged).unwrap();
+    bytes[10] ^= 0xFF;
+    std::fs::write(&damaged, bytes).unwrap();
+    std::fs::remove_file(engine.blocks.block_path(&gone.data.blocks()[0].id)).unwrap();
+
+    let report = engine.scrub().await.unwrap();
+    assert_eq!(report.objects_checked, 3, "inline objects have no blocks");
+    assert_eq!(report.blocks_checked, 3 + 2 + 2);
+    assert!(report.finished_at.is_some());
+    let mut found: Vec<_> = report.corrupt.iter().map(|c| (c.key.as_str(), c.problem.as_str())).collect();
+    found.sort();
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].0, "bad");
+    assert!(found[0].1.contains("checksum mismatch"), "{}", found[0].1);
+    assert_eq!(found[1], ("gone", "block file is missing"));
+    assert!(report.corrupt.iter().all(|c| c.bucket == "bkt"));
+
+    let stats = engine.stats();
+    assert_eq!(stats.scrub_corrupt_blocks.load(std::sync::atomic::Ordering::Relaxed), 2);
+    assert_eq!(engine.scrub_report().unwrap().blocks_checked, 7);
+}
+
+#[tokio::test]
+async fn stalled_uploads_time_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        body_timeout: Duration::from_millis(50),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(config).await.unwrap();
+    let first = stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"some data"))]);
+    let stalled = first.chain(stream::pending());
+    assert!(matches!(engine.stage(Box::pin(stalled)).await, Err(Error::BodyTimeout)));
+}
+
+#[tokio::test]
+async fn traffic_is_counted() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let record = put(&engine, "bkt", "k", &pattern(1500)).await;
+    read_all(&engine, &record, 0..1000).await;
+    let stats = engine.stats();
+    assert_eq!(stats.bytes_received.load(std::sync::atomic::Ordering::Relaxed), 1500);
+    assert_eq!(stats.bytes_sent.load(std::sync::atomic::Ordering::Relaxed), 1000);
+}

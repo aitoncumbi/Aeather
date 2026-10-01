@@ -42,6 +42,17 @@ enum Command {
         #[command(flatten)]
         client: ClientArgs,
     },
+    /// Verify every stored block now (normally runs on a schedule)
+    Scrub {
+        #[command(flatten)]
+        client: ClientArgs,
+    },
+    /// Exit successfully if the server is ready (for container health checks)
+    Health {
+        /// S3 endpoint [default: from s3.listen in the config file]
+        #[arg(long)]
+        url: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -53,6 +64,16 @@ async fn main() -> ExitCode {
         Some(Command::Key { client, command }) => (cli::Request::Key(command), client),
         Some(Command::Bucket { client, command }) => (cli::Request::Bucket(command), client),
         Some(Command::Status { client }) => (cli::Request::Status, client),
+        Some(Command::Scrub { client }) => (cli::Request::Scrub, client),
+        Some(Command::Health { url }) => {
+            return match cli::health(url.as_deref(), config_path).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("aether: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
     };
     match cli::run(request, &client, config_path).await {
         Ok(()) => ExitCode::SUCCESS,

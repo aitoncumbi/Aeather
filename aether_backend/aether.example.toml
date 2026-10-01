@@ -27,6 +27,28 @@ max_object_size = 5368709120
 enabled = true
 listen = "127.0.0.1:9001"
 
+[tls]
+# HTTPS: set both files (PEM) to serve the S3 API over TLS. Renewed files are
+# picked up without a restart. The certificate must be a server (end-entity)
+# certificate, not a CA: for a self-signed one, add
+#   -addext "basicConstraints=critical,CA:FALSE"
+# to `openssl req -x509`.
+# cert_file = "/etc/aether/tls.crt"
+# key_file = "/etc/aether/tls.key"
+# Also serve the admin API over TLS with the same certificate.
+admin = false
+# How often to check the files for changes, in seconds. 0 disables reloading.
+reload_secs = 60
+
+[http]
+# Time allowed to send request headers (protects against slow clients).
+header_timeout_secs = 30
+handshake_timeout_secs = 10
+# An upload that sends no data for this long is aborted with RequestTimeout.
+body_timeout_secs = 60
+# On shutdown (SIGTERM), how long in-flight requests may take to finish.
+shutdown_timeout_secs = 30
+
 [gc]
 # Blocks of deleted or overwritten objects are kept this long so downloads
 # already in progress can finish.
@@ -39,8 +61,18 @@ sweep_interval_secs = 3600
 # deleted. 0 keeps them forever.
 abandoned_upload_secs = 604800   # 7 days
 
+[scrub]
+# Re-read every block and verify its checksum this often. 0 disables.
+interval_secs = 604800   # 7 days
+# Read rate limit while scrubbing, in bytes per second. 0: unlimited.
+bytes_per_sec = 67108864 # 64 MiB/s
+
 [log]
 # Filter directive; RUST_LOG overrides it.
 level = "info"
 # "text" or "json"
 format = "text"
+# One line per request (target "aether::access"): method, path, status,
+# operation, access key, peer, duration and request id. Query strings are
+# never logged.
+access_log = true

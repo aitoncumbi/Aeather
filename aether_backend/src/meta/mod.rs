@@ -699,6 +699,51 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// Objects stored in blocks, after the raw `objects` key `after`, for the
+    /// scrubber. Returns (raw key, record) pairs; inline objects are skipped.
+    pub fn objects_with_blocks(&self, after: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, ObjectRecord)>> {
+        let txn = self.db.begin_read()?;
+        let objects = txn.open_table(OBJECTS)?;
+        let start = match after {
+            Some(after) => Bound::Excluded(after),
+            None => Bound::Unbounded,
+        };
+        let mut out = Vec::new();
+        for entry in objects.range::<&[u8]>((start, Bound::Unbounded))? {
+            let (k, v) = entry?;
+            let record: ObjectRecord = codec::decode(v.value())?;
+            if matches!(record.data, ObjectData::Blocks(_)) {
+                out.push((k.value().to_vec(), record));
+                if out.len() == limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The object stored under a raw `objects` key.
+    pub fn object_at(&self, raw_key: &[u8]) -> Result<Option<ObjectRecord>> {
+        let txn = self.db.begin_read()?;
+        let objects = txn.open_table(OBJECTS)?;
+        objects.get(raw_key)?.map(|v| codec::decode(v.value())).transpose()
+    }
+
+    /// A node-local value in the `system` table. These are not commands: they
+    /// describe this node (e.g. when it last scrubbed), not the shared state.
+    pub fn system_value(&self, name: &str) -> Result<Option<i64>> {
+        let txn = self.db.begin_read()?;
+        let system = txn.open_table(SYSTEM)?;
+        system.get(name)?.map(|v| codec::decode(v.value())).transpose()
+    }
+
+    pub fn set_system_value(&self, name: &str, value: i64) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.open_table(SYSTEM)?.insert(name, codec::encode(&value).as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// GC queue entries due at or before `now`, oldest first.
     pub fn due_gc(&self, now: Millis, limit: usize) -> Result<Vec<(Millis, Uuid)>> {
         let txn = self.db.begin_read()?;
