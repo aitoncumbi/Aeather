@@ -44,14 +44,14 @@ anything from a 1 KB document to a 100 GB file.
 
 ### M5. Operations
 - [x] TOML config with environment overrides
-- [ ] Native TLS (rustls)
-- [ ] Prometheus metrics: requests, latency, bytes, errors, GC, disk usage
-- [x] JSON logs option
-- [ ] Request ids in logs and responses
-- [x] Graceful shutdown (finish in-flight requests)
-- [ ] Request timeouts and body limits
-- [ ] Docker image and example compose file
-- [ ] Background scrubber that verifies block CRC32Cs
+- [x] Native TLS (rustls), with certificate reload on renewal
+- [x] Prometheus metrics: requests, latency, bytes, usage, GC, scrubbing, disk space
+- [x] JSON logs option, access log
+- [x] Request ids in logs and responses
+- [x] Graceful shutdown with a deadline for in-flight requests
+- [x] Header, TLS handshake and upload stall timeouts
+- [x] Docker image (distroless, non-root, health check) and compose file
+- [x] Background scrubber that verifies block CRC32Cs
 
 ### M6. Compatibility
 - [ ] CI runs the AWS CLI, boto3 and rclone against a live server

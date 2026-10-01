@@ -3,10 +3,11 @@
 S3-compatible object storage written in Rust, for teams that run their own
 servers or containers and need object storage for internal applications.
 
-> **Status: early development.** Single-node object storage, including multipart
-> uploads, server-side copies and per-application access keys, works with the AWS
-> SDKs, the AWS CLI and boto3 using their default settings. Operations work (TLS,
-> metrics, Docker image) is next. See the [roadmap](docs/ROADMAP.md).
+> **Status: early development.** Single-node object storage works with the AWS
+> SDKs, the AWS CLI and boto3 using their default settings: multipart uploads,
+> server-side copies, per-application access keys, HTTPS, Prometheus metrics and
+> a Docker image. Compatibility testing in CI is next. See the
+> [roadmap](docs/ROADMAP.md).
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
 "AWS" below only refers to standard S3 client tools.
@@ -15,6 +16,21 @@ No AWS account or cloud service is involved: Aether runs on your servers, and
 - [Roadmap](docs/ROADMAP.md): what is done and what comes next
 
 ## Run it
+
+### With Docker
+
+```sh
+cp .env.example .env      # set the root access key and a long random secret
+docker compose up -d
+```
+
+[`compose.yaml`](compose.yaml) builds the image, keeps data in a named volume,
+publishes the S3 API on port 9000 and the admin API and metrics on the host's
+loopback interface only (127.0.0.1:9001). The image runs as a non-root user,
+has a health check, and shuts down cleanly on `docker stop`. Run the CLI inside
+the container: `docker compose exec aether aether status`.
+
+### From source
 
 Requires Rust 1.96 or newer.
 
@@ -32,12 +48,23 @@ The S3 API listens on port 9000 and the admin API on `127.0.0.1:9001`. The root
 key set here can do everything; give each application its own key (below). All
 settings are listed in
 [`aether.example.toml`](aether_backend/aether.example.toml); copy it to
-`aether.toml` or pass `--config <file>`.
+`aether.toml` or pass `--config <file>`. Every setting can also be given as an
+environment variable: `AETHER_<SECTION>__<KEY>`, e.g. `AETHER_TLS__CERT_FILE`.
 
-Health checks for load balancers and orchestrators:
+### HTTPS
 
-- `GET /_aether/health/live`: the process is up
-- `GET /_aether/health/ready`: the metadata store is answering
+Set `tls.cert_file` and `tls.key_file` (PEM) to serve the S3 API over HTTPS;
+`tls.admin = true` does the same for the admin API. Renewed certificate files
+are picked up within a minute, without a restart. For a self-signed test
+certificate:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
+  -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+  -addext "basicConstraints=critical,CA:FALSE" -keyout tls.key -out tls.crt
+```
+
+Clients then need to trust it: `aws --ca-bundle tls.crt`, `aether --ca-cert tls.crt`.
 
 ## Give each application its own key
 
@@ -97,8 +124,26 @@ Current limitations:
 
 - **Only Signature Version 4 is accepted.** AWS CLI v1 creates SigV2 presigned
   URLs by default; set `s3.signature_version = s3v4` in its config.
-- No TLS yet: put a TLS-terminating proxy in front for anything beyond a trusted
-  network (native TLS is planned, see the roadmap).
+- One node only: no replication yet, so back up the data directory (see the
+  roadmap for clustering).
+
+## Monitor it
+
+- **Health:** `GET /_aether/health/live` (the process is up) and
+  `GET /_aether/health/ready` (the metadata store answers) on the S3 port, for
+  load balancers and orchestrators. `aether health` does the same check for
+  container health checks.
+- **Metrics:** Prometheus format at `GET /metrics` on the admin port, without
+  credentials: requests by operation and status, latency, bytes in and out,
+  per-bucket objects and bytes, disk space, garbage collection and scrubbing.
+- **Logs:** one access log line per request (method, path, status, S3
+  operation, access key, duration), as text or JSON (`log.format = "json"`).
+  Every response carries a request id (`x-amz-request-id`, which SDKs include in
+  error messages) that also appears on every log line of that request.
+- **Data integrity:** every block is re-read and checked against its checksum
+  once a week by default (rate-limited). `aether status` shows the last result;
+  `aether scrub` runs one now. Damaged blocks are logged as errors and counted in
+  `aether_scrub_corrupt_blocks_total`.
 
 ## Develop
 

@@ -251,6 +251,56 @@ its metadata commit, and every read uses the latest committed snapshot. Concurre
 PUTs to the same key: the last commit wins. Conditional writes let applications opt
 into compare-and-swap.
 
+### HTTP layer
+
+Both listeners run on a small accept loop over hyper-util rather than a
+framework server, to control connection behaviour:
+
+- **TLS** with rustls (`ring` backend, so no C toolchain is needed to build).
+  Certificates are reloaded when their files change; a broken renewal is logged
+  and the previous certificate stays in use. HTTP/2 is negotiated with ALPN.
+- **Timeouts.** Request headers must arrive within `http.header_timeout_secs`
+  (slow-loris protection) and TLS handshakes within
+  `http.handshake_timeout_secs`. There is no total request timeout, since
+  multi-gigabyte transfers legitimately take long; instead an upload that sends
+  nothing for `http.body_timeout_secs` fails with `RequestTimeout`.
+- **Shutdown.** On SIGTERM the listeners stop accepting, in-flight requests get
+  `http.shutdown_timeout_secs` to finish, then the remaining connections close.
+- **Request ids.** Each request gets a 16-hex-digit id, returned as
+  `x-amz-request-id` (S3) or `x-request-id` (admin) and attached to every log
+  line of the request through a tracing span. The S3 permission check records
+  the operation and access key for the access log and metrics.
+
+### Observability
+
+Prometheus metrics are served at `/metrics` on the admin listener (loopback by
+default), without credentials. Request counters and latency histograms are
+recorded as responses are sent; usage, disk space and background-work counters
+are read from the engine at scrape time.
+
+| Metric | Labels |
+|---|---|
+| `aether_http_requests_total` | `api`, `operation`, `status` |
+| `aether_http_request_duration_seconds` | `api`, `operation` |
+| `aether_received_bytes_total`, `aether_sent_bytes_total` | |
+| `aether_bucket_objects`, `aether_bucket_bytes` | `bucket` |
+| `aether_buckets`, `aether_blocks`, `aether_access_keys` | |
+| `aether_disk_available_bytes`, `aether_disk_total_bytes` | |
+| `aether_gc_deleted_blocks_total`, `aether_orphan_removed_blocks_total`, `aether_aborted_uploads_total` | |
+| `aether_scrub_checked_blocks_total`, `aether_scrub_checked_bytes_total`, `aether_scrub_corrupt_blocks_total`, `aether_scrub_last_finished_timestamp_seconds` | |
+| `aether_build_info`, `aether_uptime_seconds` | `version` |
+
+### Scrubbing
+
+A background pass re-reads every block of every object and compares its length
+and CRC32C with the values recorded at write time, every `scrub.interval_secs`
+(default 7 days) at up to `scrub.bytes_per_sec` (default 64 MiB/s). The time of
+the last finished pass is stored node-locally, so restarts do not trigger
+rescans. Before reporting a block, the scrubber re-reads the object record, so
+objects deleted or overwritten during the pass are not reported. On a single
+node damage can only be reported (error log, metric, `aether status`); with
+replication (v3) the same pass will repair from a healthy copy.
+
 ## Security
 
 - Every S3 request must be signed with SigV4 (anonymous access arrives with
@@ -280,7 +330,8 @@ into compare-and-swap.
 - SigV4 needs the plaintext secret to verify signatures, so secrets cannot be hashed.
   In v1 they are protected by file permissions on the data directory. With
   encryption at rest (v2), they are encrypted under the master key.
-- TLS is supported natively (rustls) or can be terminated by a reverse proxy.
+- TLS is supported natively (rustls) or can be terminated by a reverse proxy. The
+  admin API listens on loopback by default; exposing it without TLS logs a warning.
 - `s3s` is not a full security boundary: we set body and object size limits,
   timeouts and listing limits ourselves.
 

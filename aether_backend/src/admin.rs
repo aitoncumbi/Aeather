@@ -25,6 +25,7 @@ use crate::engine::{Engine, NewKey, ScrubReport};
 use crate::error::Error;
 use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, KeyUpdate, Millis};
 use crate::metrics::{self, Metrics};
+use crate::observe::RequestFacts;
 
 #[derive(Clone)]
 struct AdminState {
@@ -309,6 +310,9 @@ async fn require_admin(State(s): State<AdminState>, req: Request, next: Next) ->
     let Some((id, secret)) = basic_credentials(req.headers()) else {
         return ApiError::unauthorized().into_response();
     };
+    if let Some(facts) = req.extensions().get::<RequestFacts>() {
+        facts.record_access_key(&id);
+    }
     match s.auth.authenticate(&id, &secret) {
         Some(identity) if identity.is_admin() => next.run(req).await,
         Some(_) => {

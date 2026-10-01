@@ -32,6 +32,11 @@ impl RequestFacts {
         facts.access_key = Some(access_key.to_owned());
     }
 
+    /// Records only the caller (admin API requests keep their route label).
+    pub fn record_access_key(&self, access_key: &str) {
+        self.0.lock().expect("request facts lock poisoned").access_key = Some(access_key.to_owned());
+    }
+
     fn take(&self) -> Facts {
         std::mem::take(&mut self.0.lock().expect("request facts lock poisoned"))
     }
