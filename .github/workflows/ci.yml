@@ -105,6 +105,8 @@ jobs:
           # Record every request, so a failure's server log shows what arrived.
           COMPAT_LOG_LEVEL: info
           COMPAT_ACCESS_LOG: "true"
+          # Each client takes well under a minute; three limits fit in the job's.
+          CLIENT_TIMEOUT: "300"
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
