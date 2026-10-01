@@ -195,6 +195,16 @@ pub struct Report {
     pub current: Current,
     pub day: Day,
     pub objects_change: Option<ObjectsChange>,
+    /// Objects stored over the range, at most [`MAX_OBJECT_POINTS`] readings.
+    pub objects: Vec<ObjectsPoint>,
+}
+
+const MAX_OBJECT_POINTS: usize = 60;
+
+#[derive(Debug, Serialize)]
+pub struct ObjectsPoint {
+    pub t: Millis,
+    pub objects: u64,
 }
 
 /// Requests per second by kind, and latency percentiles, over one interval.
@@ -356,6 +366,16 @@ impl History {
             .zip(state.objects.back())
             .map(|(&(since, from), &(_, to))| ObjectsChange { since, from, to });
 
+        let in_range: Vec<&(Millis, u64)> = state.objects.iter().filter(|(t, _)| *t >= start).collect();
+        let step = in_range.len().div_ceil(MAX_OBJECT_POINTS).max(1);
+        let mut objects: Vec<ObjectsPoint> =
+            in_range.iter().step_by(step).map(|&&(t, objects)| ObjectsPoint { t, objects }).collect();
+        if let Some(&&(t, n)) = in_range.last()
+            && objects.last().is_none_or(|p| p.t != t)
+        {
+            objects.push(ObjectsPoint { t, objects: n });
+        }
+
         Report {
             range: range.label(),
             now,
@@ -368,6 +388,7 @@ impl History {
             current,
             day,
             objects_change,
+            objects,
         }
     }
 }
@@ -471,6 +492,8 @@ mod tests {
         assert_eq!(day.day.requests, 360);
         let change = day.objects_change.unwrap();
         assert_eq!((change.from, change.to, change.since), (10, 25, t0));
+        let series: Vec<u64> = day.objects.iter().map(|p| p.objects).collect();
+        assert_eq!(series, [10, 25]);
     }
 
     #[tokio::test]

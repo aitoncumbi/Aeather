@@ -36,7 +36,10 @@ pub async fn serve(method: Method, uri: Uri) -> Response {
     if !embedded() {
         return page(StatusCode::OK, "text/html; charset=utf-8", NOT_BUILT.as_bytes(), false);
     }
-    let path = uri.path().trim_start_matches('/');
+    let Some(decoded) = percent_decode(uri.path()) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let path = decoded.trim_start_matches('/');
     // Pages are exported as `name/index.html` (trailingSlash), so `/keys`,
     // `/keys/` and `/keys/index.html` all work.
     let candidates = [
@@ -60,6 +63,27 @@ pub async fn serve(method: Method, uri: Uri) -> Response {
         Some(bytes) => page(StatusCode::NOT_FOUND, "text/html; charset=utf-8", bytes, false),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// Decodes `%XX` escapes (the export's file names include characters such
+/// as `!` and `(` that some clients escape). `None` for invalid UTF-8.
+fn percent_decode(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(hex) = path.get(i + 1..i + 3)
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 fn page(status: StatusCode, content_type: &'static str, bytes: &'static [u8], immutable: bool) -> Response {
@@ -101,6 +125,14 @@ mod tests {
     #[test]
     fn assets_are_sorted_for_lookup() {
         assert!(assets::ASSETS.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn paths_are_percent_decoded() {
+        assert_eq!(percent_decode("/a/__next.%21KGN%28x%29.txt").as_deref(), Some("/a/__next.!KGN(x).txt"));
+        assert_eq!(percent_decode("/plain").as_deref(), Some("/plain"));
+        assert_eq!(percent_decode("/bad%zz").as_deref(), Some("/bad%zz"));
+        assert_eq!(percent_decode("/%ff"), None);
     }
 
     #[test]

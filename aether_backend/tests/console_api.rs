@@ -128,6 +128,12 @@ async fn console_sessions() {
     assert!(logout.headers()[SET_COOKIE].to_str().unwrap().contains("Max-Age=0"));
     let (status, _) = s.json(s.console(&cookie, Method::GET, "/api/v1/session")).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A download link followed with an ended session: no Basic challenge,
+    // which would make the browser show its own sign-in dialog.
+    let link =
+        s.http.get(s.url("/api/v1/buckets/real/object/download?key=x")).header(COOKIE, &cookie).send().await.unwrap();
+    assert_eq!(link.status(), StatusCode::UNAUTHORIZED);
+    assert!(!link.headers().contains_key(WWW_AUTHENTICATE));
 
     // The CLI's Basic auth still works, and still gets a Basic challenge.
     let basic = s.http.get(s.url("/api/v1/status")).basic_auth(ROOT_KEY, Some(ROOT_SECRET)).send().await.unwrap();

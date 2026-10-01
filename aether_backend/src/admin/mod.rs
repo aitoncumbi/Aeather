@@ -566,14 +566,18 @@ async fn delete_bucket(State(s): State<AdminState>, Path(name): Path<String>) ->
 /// admin key. Cookie-authenticated writes must also carry the console header.
 async fn require_admin(State(s): State<AdminState>, mut req: Request, next: Next) -> Response {
     let console = session::from_console(req.headers());
+    // Requests with a (perhaps expired) session cookie come from the console
+    // even without its header, e.g. download links; they must not get a Basic
+    // challenge either, or the browser shows its own sign-in dialog.
+    let browser = console || session::token(req.headers()).is_some();
     let (id, identity) = if let Some((id, secret)) = basic_credentials(req.headers()) {
         match s.auth.authenticate(&id, &secret) {
             Some(identity) => (id, identity),
-            None => return ApiError::unauthorized(console).into_response(),
+            None => return ApiError::unauthorized(browser).into_response(),
         }
     } else if let Some(token) = session::token(req.headers()) {
         let Some(id) = s.sessions.resolve(&token) else {
-            return ApiError::unauthorized(console).into_response();
+            return ApiError::unauthorized(browser).into_response();
         };
         let safe = matches!(*req.method(), Method::GET | Method::HEAD);
         if !safe && !console {
@@ -584,11 +588,11 @@ async fn require_admin(State(s): State<AdminState>, mut req: Request, next: Next
             None => {
                 // The key was deleted or disabled since signing in.
                 s.sessions.remove(&token);
-                return ApiError::unauthorized(console).into_response();
+                return ApiError::unauthorized(browser).into_response();
             }
         }
     } else {
-        return ApiError::unauthorized(console).into_response();
+        return ApiError::unauthorized(browser).into_response();
     };
     if let Some(facts) = req.extensions().get::<RequestFacts>() {
         facts.record_access_key(&id);
