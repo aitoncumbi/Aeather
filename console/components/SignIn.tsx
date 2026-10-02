@@ -48,11 +48,15 @@ export function SignIn() {
 
   useEffect(() => {
     const saved = storage()?.getItem(REMEMBER);
+    // Browser-only values, read after hydration: the page is prerendered
+    // without them, so reading them during render would mismatch.
+    /* eslint-disable react-hooks/set-state-in-effect */
     if (saved) {
       setKeyId(saved);
       setRemember(true);
     }
     setPlainHttp(window.location.protocol === "http:" && !isLoopback(window.location.hostname));
+    /* eslint-enable react-hooks/set-state-in-effect */
     fetch("/api/v1/health")
       .then((r) => r.json() as Promise<Health>)
       .then(setHealth, () => setHealth({ status: "unavailable", version: "", tls: false }));

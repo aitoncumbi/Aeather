@@ -113,9 +113,11 @@ export function ConfirmDialog({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
+  const [wasOpen, setWasOpen] = useState(open);
+  if (wasOpen !== open) {
+    setWasOpen(open);
     if (open) setError(null);
-  }, [open]);
+  }
   return (
     <Dialog open={open} onClose={onClose} labelledBy="confirm-title">
       <DialogHead id="confirm-title" title={title} onClose={onClose} />

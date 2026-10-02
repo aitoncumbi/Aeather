@@ -1,0 +1,28 @@
+# Weekly update PRs, one per ecosystem, so updates arrive in a few PRs rather than dozens.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /aether_backend
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+  - package-ecosystem: npm
+    directory: /console
+    schedule:
+      interval: weekly
+    groups:
+      npm:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

@@ -137,6 +137,9 @@ export const BACKGROUND_HEADER = { "x-aether-background": "1" };
 export function toSignIn() {
   if (typeof window === "undefined" || window.location.pathname.startsWith("/login")) return;
   const next = window.location.pathname + window.location.search;
+  // Called outside components, where the router is out of reach; a full page
+  // load also drops the signed-in state.
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
   window.location.assign(`/login/?next=${encodeURIComponent(next)}`);
 }
 
