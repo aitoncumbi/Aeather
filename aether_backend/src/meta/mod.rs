@@ -13,7 +13,7 @@ mod usage;
 use std::ops::Bound;
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -213,278 +213,324 @@ impl MetaStore {
     }
 
     pub fn apply(&self, command: Command) -> Result<Outcome> {
-        let txn = self.db.begin_write()?;
-        let outcome = match command {
-            Command::CreateBucket { name, id, created_at, owner } => {
-                let mut buckets = txn.open_table(BUCKETS)?;
-                if buckets.get(name.as_str())?.is_some() {
-                    return Err(Error::BucketAlreadyExists);
-                }
-                let record = BucketRecord { id, name, created_at, cors: Vec::new(), quota: Quota::default() };
-                buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &record, None, None)?;
-                if let Some(owner) = owner {
-                    let mut keys = txn.open_table(ACCESS_KEYS)?;
-                    let mut key = load_key(&keys, &owner)?;
-                    key.buckets.insert(record.name.clone(), BucketGrant::FULL);
-                    keys.insert(owner.as_str(), codec::encode(&key).as_slice())?;
-                }
-                Outcome::Bucket(record)
-            }
-            Command::DeleteBucket { name, gc_due_at } => {
-                let mut buckets = txn.open_table(BUCKETS)?;
-                let bucket: BucketRecord = match buckets.get(name.as_str())? {
-                    Some(v) => codec::decode(v.value())?,
-                    None => return Err(Error::NoSuchBucket),
-                };
-                let objects = txn.open_table(OBJECTS)?;
-                if objects.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?.next().is_some() {
-                    return Err(Error::BucketNotEmpty);
-                }
-                let uploads: Vec<Vec<u8>> = {
-                    let table = txn.open_table(UPLOADS)?;
-                    let range = table.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?;
-                    range.map(|entry| Ok(entry?.0.value().to_vec())).collect::<Result<_>>()?
-                };
-                for ukey in uploads {
-                    let (_, upload_id) = parse_upload_key(&ukey[16..]).ok_or_else(bad_upload_key)?;
-                    remove_upload(&txn, &ukey, &upload_id, &[], gc_due_at)?;
-                }
-                buckets.remove(name.as_str())?;
-                usage::remove(&txn, &bucket.id)?;
-                // Grants are by name: drop them so a future bucket with the same
-                // name does not inherit them.
-                let mut keys = txn.open_table(ACCESS_KEYS)?;
-                let mut changed = Vec::new();
-                for entry in keys.iter()? {
-                    let mut key: AccessKeyRecord = codec::decode(entry?.1.value())?;
-                    if key.buckets.remove(&name).is_some() {
-                        changed.push(key);
-                    }
-                }
-                for key in changed {
-                    keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
-                }
-                Outcome::Done
-            }
-            Command::PutObject { bucket, key, record, condition, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                let mut objects = txn.open_table(OBJECTS)?;
-                let okey = object_key(&bucket.id, key.as_bytes());
-                let previous: Option<ObjectRecord> =
-                    objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                condition.check(previous.as_ref())?;
-                objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &bucket, Some(&record), previous.as_ref())?;
-
-                let mut blocks = txn.open_table(BLOCKS)?;
-                let mut gc = txn.open_table(GC_QUEUE)?;
-                for block in record.data.blocks() {
-                    add_block_ref(&mut blocks, &block.id)?;
-                }
-                if let Some(prev) = &previous {
-                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-                }
-                Outcome::Object(previous)
-            }
-            Command::CreateUpload { bucket, upload } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                let ukey = upload_key(&bucket.id, upload.key.as_bytes(), &upload.upload_id);
-                txn.open_table(UPLOADS)?.insert(ukey.as_slice(), codec::encode(&upload).as_slice())?;
-                Outcome::Done
-            }
-            Command::PutPart { bucket, key, upload_id, part_number, part, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
-                let mut parts = txn.open_table(PARTS)?;
-                let pkey = part_key(&upload_id, part_number);
-                let previous: Option<PartRecord> =
-                    parts.get(pkey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                parts.insert(pkey.as_slice(), codec::encode(&part).as_slice())?;
-
-                let mut blocks = txn.open_table(BLOCKS)?;
-                let mut gc = txn.open_table(GC_QUEUE)?;
-                for block in &part.blocks {
-                    add_block_ref(&mut blocks, &block.id)?;
-                }
-                if let Some(prev) = &previous {
-                    release_blocks(&mut blocks, &mut gc, &prev.blocks, gc_due_at)?;
-                }
-                Outcome::Done
-            }
-            Command::CompleteUpload { bucket, key, upload_id, part_numbers, record, condition, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
-                {
-                    let parts = txn.open_table(PARTS)?;
-                    let mut current = Vec::new();
-                    for number in &part_numbers {
-                        let part: PartRecord = match parts.get(part_key(&upload_id, *number).as_slice())? {
-                            Some(v) => codec::decode(v.value())?,
-                            None => return Err(Error::Conflict(format!("part {number} was removed"))),
-                        };
-                        current.extend(part.blocks);
-                    }
-                    if current != record.data.blocks() {
-                        return Err(Error::Conflict("a part was replaced while the upload was completing".into()));
-                    }
-                }
-
-                let mut objects = txn.open_table(OBJECTS)?;
-                let okey = object_key(&bucket.id, key.as_bytes());
-                let previous: Option<ObjectRecord> =
-                    objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                condition.check(previous.as_ref())?;
-                objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-                drop(objects);
-                usage::adjust(&txn, &bucket, Some(&record), previous.as_ref())?;
-
-                // The object takes over the references held by the parts it uses.
-                let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
-                remove_upload(&txn, &ukey, &upload_id, &part_numbers, gc_due_at)?;
-                if let Some(prev) = &previous {
-                    let mut blocks = txn.open_table(BLOCKS)?;
-                    let mut gc = txn.open_table(GC_QUEUE)?;
-                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-                }
-                Outcome::Object(previous)
-            }
-            Command::AbortUpload { bucket, key, upload_id, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
-                let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
-                remove_upload(&txn, &ukey, &upload_id, &[], gc_due_at)?;
-                Outcome::Done
-            }
-            Command::CopyObject {
-                src_bucket,
-                src_key,
-                src_version,
-                dst_bucket,
-                dst_key,
-                record,
-                condition,
-                gc_due_at,
-            } => {
-                let buckets = txn.open_table(BUCKETS)?;
-                let src_bucket = load_bucket(&buckets, &src_bucket)?;
-                let dst_bucket = load_bucket(&buckets, &dst_bucket)?;
-                let mut objects = txn.open_table(OBJECTS)?;
-                let source: ObjectRecord =
-                    match objects.get(object_key(&src_bucket.id, src_key.as_bytes()).as_slice())? {
-                        Some(v) => codec::decode(v.value())?,
-                        None => return Err(Error::NoSuchKey),
-                    };
-                if source.version_id != src_version || source.data != record.data {
-                    return Err(Error::Conflict("the source object changed during the copy".into()));
-                }
-                let okey = object_key(&dst_bucket.id, dst_key.as_bytes());
-                let previous: Option<ObjectRecord> =
-                    objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-                condition.check(previous.as_ref())?;
-                objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &dst_bucket, Some(&record), previous.as_ref())?;
-
-                // Add references before releasing the previous object: when copying
-                // an object onto itself they are the same blocks.
-                let mut blocks = txn.open_table(BLOCKS)?;
-                let mut gc = txn.open_table(GC_QUEUE)?;
-                for block in record.data.blocks() {
-                    add_block_ref(&mut blocks, &block.id)?;
-                }
-                if let Some(prev) = &previous {
-                    release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-                }
-                Outcome::Object(previous)
-            }
-            Command::DeleteObject { bucket, key, condition, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                Outcome::Object(delete_object(&txn, &bucket, &key, &condition, gc_due_at)?)
-            }
-            Command::DeleteObjects { bucket, objects, gc_due_at } => {
-                let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                let mut failed = Vec::new();
-                for (i, (key, condition)) in objects.iter().enumerate() {
-                    match delete_object(&txn, &bucket, key, condition, gc_due_at) {
-                        Ok(_) => {}
-                        Err(Error::PreconditionFailed) => failed.push(i),
-                        Err(e) => return Err(e),
-                    }
-                }
-                Outcome::Failed(failed)
-            }
-            Command::CreateKey { key } => {
-                let mut keys = txn.open_table(ACCESS_KEYS)?;
-                if keys.get(key.access_key_id.as_str())?.is_some() {
-                    return Err(Error::AccessKeyExists);
-                }
-                let buckets = txn.open_table(BUCKETS)?;
-                for bucket in key.buckets.keys() {
-                    load_bucket(&buckets, bucket)?;
-                }
-                keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
-                Outcome::Key(key)
-            }
-            Command::UpdateKey { access_key_id, update } => {
-                let mut keys = txn.open_table(ACCESS_KEYS)?;
-                let mut key = load_key(&keys, &access_key_id)?;
-                let KeyUpdate { name, admin, can_create_buckets, disabled } = update;
-                key.name = name.unwrap_or(key.name);
-                key.admin = admin.unwrap_or(key.admin);
-                key.can_create_buckets = can_create_buckets.unwrap_or(key.can_create_buckets);
-                key.disabled = disabled.unwrap_or(key.disabled);
-                keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
-                Outcome::Key(key)
-            }
-            Command::DeleteKey { access_key_id } => {
-                if txn.open_table(ACCESS_KEYS)?.remove(access_key_id.as_str())?.is_none() {
-                    return Err(Error::NoSuchAccessKey);
-                }
-                Outcome::Done
-            }
-            Command::SetGrant { access_key_id, bucket, grant } => {
-                let mut keys = txn.open_table(ACCESS_KEYS)?;
-                let mut key = load_key(&keys, &access_key_id)?;
-                load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-                if grant.is_empty() {
-                    key.buckets.remove(&bucket);
-                } else {
-                    key.buckets.insert(bucket, grant);
-                }
-                keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
-                Outcome::Key(key)
-            }
-            Command::SetBucketCors { bucket, rules } => {
-                let mut buckets = txn.open_table(BUCKETS)?;
-                let mut record = load_bucket(&buckets, &bucket)?;
-                record.cors = rules;
-                buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
-                Outcome::Bucket(record)
-            }
-            Command::SetBucketQuota { bucket, quota } => {
-                let mut buckets = txn.open_table(BUCKETS)?;
-                let mut record = load_bucket(&buckets, &bucket)?;
-                record.quota = quota;
-                buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
-                Outcome::Bucket(record)
-            }
-            Command::ForgetBlocks { entries } => {
-                let mut blocks = txn.open_table(BLOCKS)?;
-                let mut gc = txn.open_table(GC_QUEUE)?;
-                for (due_at, id) in entries {
-                    gc.remove(gc_key(due_at, &id).as_slice())?;
-                    let refs = blocks.get(id.as_bytes().as_slice())?.map(|v| v.value());
-                    if refs == Some(0) {
-                        blocks.remove(id.as_bytes().as_slice())?;
-                    }
-                }
-                Outcome::Done
-            }
-        };
-        txn.commit()?;
-        Ok(outcome)
+        self.apply_batch(vec![command]).pop().expect("one result per command")
     }
 
+    /// Applies commands in order in one write transaction, so one commit
+    /// (one fsync) covers them all. Each gets the result it would have had
+    /// applied on its own: a command that fails aborts the transaction, takes
+    /// its error, and the others are applied again without it. Commands carry
+    /// all their inputs, so applying them again is safe.
+    pub fn apply_batch(&self, commands: Vec<Command>) -> Vec<Result<Outcome>> {
+        let mut results: Vec<Option<Result<Outcome>>> = commands.iter().map(|_| None).collect();
+        let mut pending: Vec<usize> = (0..commands.len()).collect();
+        while !pending.is_empty() {
+            let txn = match self.db.begin_write() {
+                Ok(txn) => txn,
+                Err(e) => return fail_all(results, &pending, &e.into()),
+            };
+            let mut done = Vec::with_capacity(pending.len());
+            let mut failed = None;
+            for &i in &pending {
+                match apply_in(&txn, commands[i].clone()) {
+                    Ok(outcome) => done.push((i, outcome)),
+                    Err(e) => {
+                        failed = Some((i, e));
+                        break;
+                    }
+                }
+            }
+            if let Some((i, e)) = failed {
+                // Dropping the transaction rolls back everything applied so far.
+                drop(txn);
+                results[i] = Some(Err(e));
+                pending.retain(|&j| j != i);
+                continue;
+            }
+            if let Err(e) = txn.commit() {
+                return fail_all(results, &pending, &e.into());
+            }
+            for (i, outcome) in done {
+                results[i] = Some(Ok(outcome));
+            }
+            break;
+        }
+        results.into_iter().map(|r| r.expect("every command has a result")).collect()
+    }
+}
+
+/// Applies one command inside `txn`. On error the caller drops `txn`, which
+/// undoes whatever the command had already written.
+fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
+    let outcome = match command {
+        Command::CreateBucket { name, id, created_at, owner } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            if buckets.get(name.as_str())?.is_some() {
+                return Err(Error::BucketAlreadyExists);
+            }
+            let record = BucketRecord { id, name, created_at, cors: Vec::new(), quota: Quota::default() };
+            buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
+            usage::adjust(txn, &record, None, None)?;
+            if let Some(owner) = owner {
+                let mut keys = txn.open_table(ACCESS_KEYS)?;
+                let mut key = load_key(&keys, &owner)?;
+                key.buckets.insert(record.name.clone(), BucketGrant::FULL);
+                keys.insert(owner.as_str(), codec::encode(&key).as_slice())?;
+            }
+            Outcome::Bucket(record)
+        }
+        Command::DeleteBucket { name, gc_due_at } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            let bucket: BucketRecord = match buckets.get(name.as_str())? {
+                Some(v) => codec::decode(v.value())?,
+                None => return Err(Error::NoSuchBucket),
+            };
+            let objects = txn.open_table(OBJECTS)?;
+            if objects.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?.next().is_some() {
+                return Err(Error::BucketNotEmpty);
+            }
+            let uploads: Vec<Vec<u8>> = {
+                let table = txn.open_table(UPLOADS)?;
+                let range = table.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?;
+                range.map(|entry| Ok(entry?.0.value().to_vec())).collect::<Result<_>>()?
+            };
+            for ukey in uploads {
+                let (_, upload_id) = parse_upload_key(&ukey[16..]).ok_or_else(bad_upload_key)?;
+                remove_upload(txn, &ukey, &upload_id, &[], gc_due_at)?;
+            }
+            buckets.remove(name.as_str())?;
+            usage::remove(txn, &bucket.id)?;
+            // Grants are by name: drop them so a future bucket with the same
+            // name does not inherit them.
+            let mut keys = txn.open_table(ACCESS_KEYS)?;
+            let mut changed = Vec::new();
+            for entry in keys.iter()? {
+                let mut key: AccessKeyRecord = codec::decode(entry?.1.value())?;
+                if key.buckets.remove(&name).is_some() {
+                    changed.push(key);
+                }
+            }
+            for key in changed {
+                keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
+            }
+            Outcome::Done
+        }
+        Command::PutObject { bucket, key, record, condition, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            let mut objects = txn.open_table(OBJECTS)?;
+            let okey = object_key(&bucket.id, key.as_bytes());
+            let previous: Option<ObjectRecord> =
+                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+            condition.check(previous.as_ref())?;
+            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+            usage::adjust(txn, &bucket, Some(&record), previous.as_ref())?;
+
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut gc = txn.open_table(GC_QUEUE)?;
+            for block in record.data.blocks() {
+                add_block_ref(&mut blocks, &block.id)?;
+            }
+            if let Some(prev) = &previous {
+                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+            }
+            Outcome::Object(previous)
+        }
+        Command::CreateUpload { bucket, upload } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            let ukey = upload_key(&bucket.id, upload.key.as_bytes(), &upload.upload_id);
+            txn.open_table(UPLOADS)?.insert(ukey.as_slice(), codec::encode(&upload).as_slice())?;
+            Outcome::Done
+        }
+        Command::PutPart { bucket, key, upload_id, part_number, part, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+            let mut parts = txn.open_table(PARTS)?;
+            let pkey = part_key(&upload_id, part_number);
+            let previous: Option<PartRecord> =
+                parts.get(pkey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+            parts.insert(pkey.as_slice(), codec::encode(&part).as_slice())?;
+
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut gc = txn.open_table(GC_QUEUE)?;
+            for block in &part.blocks {
+                add_block_ref(&mut blocks, &block.id)?;
+            }
+            if let Some(prev) = &previous {
+                release_blocks(&mut blocks, &mut gc, &prev.blocks, gc_due_at)?;
+            }
+            Outcome::Done
+        }
+        Command::CompleteUpload { bucket, key, upload_id, part_numbers, record, condition, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+            {
+                let parts = txn.open_table(PARTS)?;
+                let mut current = Vec::new();
+                for number in &part_numbers {
+                    let part: PartRecord = match parts.get(part_key(&upload_id, *number).as_slice())? {
+                        Some(v) => codec::decode(v.value())?,
+                        None => return Err(Error::Conflict(format!("part {number} was removed"))),
+                    };
+                    current.extend(part.blocks);
+                }
+                if current != record.data.blocks() {
+                    return Err(Error::Conflict("a part was replaced while the upload was completing".into()));
+                }
+            }
+
+            let mut objects = txn.open_table(OBJECTS)?;
+            let okey = object_key(&bucket.id, key.as_bytes());
+            let previous: Option<ObjectRecord> =
+                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+            condition.check(previous.as_ref())?;
+            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+            drop(objects);
+            usage::adjust(txn, &bucket, Some(&record), previous.as_ref())?;
+
+            // The object takes over the references held by the parts it uses.
+            let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
+            remove_upload(txn, &ukey, &upload_id, &part_numbers, gc_due_at)?;
+            if let Some(prev) = &previous {
+                let mut blocks = txn.open_table(BLOCKS)?;
+                let mut gc = txn.open_table(GC_QUEUE)?;
+                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+            }
+            Outcome::Object(previous)
+        }
+        Command::AbortUpload { bucket, key, upload_id, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            load_upload(&txn.open_table(UPLOADS)?, &bucket, &key, &upload_id)?;
+            let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
+            remove_upload(txn, &ukey, &upload_id, &[], gc_due_at)?;
+            Outcome::Done
+        }
+        Command::CopyObject { src_bucket, src_key, src_version, dst_bucket, dst_key, record, condition, gc_due_at } => {
+            let buckets = txn.open_table(BUCKETS)?;
+            let src_bucket = load_bucket(&buckets, &src_bucket)?;
+            let dst_bucket = load_bucket(&buckets, &dst_bucket)?;
+            let mut objects = txn.open_table(OBJECTS)?;
+            let source: ObjectRecord = match objects.get(object_key(&src_bucket.id, src_key.as_bytes()).as_slice())? {
+                Some(v) => codec::decode(v.value())?,
+                None => return Err(Error::NoSuchKey),
+            };
+            if source.version_id != src_version || source.data != record.data {
+                return Err(Error::Conflict("the source object changed during the copy".into()));
+            }
+            let okey = object_key(&dst_bucket.id, dst_key.as_bytes());
+            let previous: Option<ObjectRecord> =
+                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
+            condition.check(previous.as_ref())?;
+            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+            usage::adjust(txn, &dst_bucket, Some(&record), previous.as_ref())?;
+
+            // Add references before releasing the previous object: when copying
+            // an object onto itself they are the same blocks.
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut gc = txn.open_table(GC_QUEUE)?;
+            for block in record.data.blocks() {
+                add_block_ref(&mut blocks, &block.id)?;
+            }
+            if let Some(prev) = &previous {
+                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+            }
+            Outcome::Object(previous)
+        }
+        Command::DeleteObject { bucket, key, condition, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            Outcome::Object(delete_object(txn, &bucket, &key, &condition, gc_due_at)?)
+        }
+        Command::DeleteObjects { bucket, objects, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            let mut failed = Vec::new();
+            for (i, (key, condition)) in objects.iter().enumerate() {
+                match delete_object(txn, &bucket, key, condition, gc_due_at) {
+                    Ok(_) => {}
+                    Err(Error::PreconditionFailed) => failed.push(i),
+                    Err(e) => return Err(e),
+                }
+            }
+            Outcome::Failed(failed)
+        }
+        Command::CreateKey { key } => {
+            let mut keys = txn.open_table(ACCESS_KEYS)?;
+            if keys.get(key.access_key_id.as_str())?.is_some() {
+                return Err(Error::AccessKeyExists);
+            }
+            let buckets = txn.open_table(BUCKETS)?;
+            for bucket in key.buckets.keys() {
+                load_bucket(&buckets, bucket)?;
+            }
+            keys.insert(key.access_key_id.as_str(), codec::encode(&key).as_slice())?;
+            Outcome::Key(key)
+        }
+        Command::UpdateKey { access_key_id, update } => {
+            let mut keys = txn.open_table(ACCESS_KEYS)?;
+            let mut key = load_key(&keys, &access_key_id)?;
+            let KeyUpdate { name, admin, can_create_buckets, disabled } = update;
+            key.name = name.unwrap_or(key.name);
+            key.admin = admin.unwrap_or(key.admin);
+            key.can_create_buckets = can_create_buckets.unwrap_or(key.can_create_buckets);
+            key.disabled = disabled.unwrap_or(key.disabled);
+            keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
+            Outcome::Key(key)
+        }
+        Command::DeleteKey { access_key_id } => {
+            if txn.open_table(ACCESS_KEYS)?.remove(access_key_id.as_str())?.is_none() {
+                return Err(Error::NoSuchAccessKey);
+            }
+            Outcome::Done
+        }
+        Command::SetGrant { access_key_id, bucket, grant } => {
+            let mut keys = txn.open_table(ACCESS_KEYS)?;
+            let mut key = load_key(&keys, &access_key_id)?;
+            load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            if grant.is_empty() {
+                key.buckets.remove(&bucket);
+            } else {
+                key.buckets.insert(bucket, grant);
+            }
+            keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
+            Outcome::Key(key)
+        }
+        Command::SetBucketCors { bucket, rules } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            let mut record = load_bucket(&buckets, &bucket)?;
+            record.cors = rules;
+            buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+            Outcome::Bucket(record)
+        }
+        Command::SetBucketQuota { bucket, quota } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            let mut record = load_bucket(&buckets, &bucket)?;
+            record.quota = quota;
+            buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+            Outcome::Bucket(record)
+        }
+        Command::ForgetBlocks { entries } => {
+            let mut blocks = txn.open_table(BLOCKS)?;
+            let mut gc = txn.open_table(GC_QUEUE)?;
+            for (due_at, id) in entries {
+                gc.remove(gc_key(due_at, &id).as_slice())?;
+                let refs = blocks.get(id.as_bytes().as_slice())?.map(|v| v.value());
+                if refs == Some(0) {
+                    blocks.remove(id.as_bytes().as_slice())?;
+                }
+            }
+            Outcome::Done
+        }
+    };
+    Ok(outcome)
+}
+
+/// Gives every still-pending command the batch's error.
+fn fail_all(mut results: Vec<Option<Result<Outcome>>>, pending: &[usize], error: &Error) -> Vec<Result<Outcome>> {
+    for &i in pending {
+        results[i] = Some(Err(Error::Io(std::io::Error::other(error.to_string()))));
+    }
+    results.into_iter().map(|r| r.expect("every command has a result")).collect()
+}
+
+impl MetaStore {
     pub fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
         let txn = self.db.begin_read()?;
         let buckets = txn.open_table(BUCKETS)?;

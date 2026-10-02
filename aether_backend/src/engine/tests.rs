@@ -1016,3 +1016,93 @@ async fn quotas_limit_growth_but_not_shrinking() {
     engine.set_bucket_quota("bkt", Quota::default()).await.unwrap();
     put_result("d", 5000).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_batch_gives_each_command_its_own_result() {
+    let (engine, _dir) = test_engine().await;
+    let create =
+        |name: &str| Command::CreateBucket { name: name.into(), id: Uuid::new_v4(), created_at: 1, owner: None };
+    let results = engine.meta.apply_batch(vec![
+        create("a"),
+        create("a"),
+        create("b"),
+        Command::DeleteBucket { name: "missing".into(), gc_due_at: 0 },
+        Command::SetBucketQuota { bucket: "b".into(), quota: Quota { max_bytes: Some(10), max_objects: None } },
+    ]);
+    let summary: Vec<_> = results.iter().map(|r| r.as_ref().map(|_| ()).map_err(|e| e.to_string())).collect();
+    assert!(summary[0].is_ok() && summary[2].is_ok() && summary[4].is_ok(), "{summary:?}");
+    assert!(matches!(results[1], Err(Error::BucketAlreadyExists)));
+    assert!(matches!(results[3], Err(Error::NoSuchBucket)));
+    // The state is what applying them one by one would have left.
+    let names: Vec<_> = engine.list_buckets().await.unwrap().into_iter().map(|b| (b.name, b.quota.max_bytes)).collect();
+    assert_eq!(names, [("a".to_string(), None), ("b".to_string(), Some(10))]);
+}
+
+#[tokio::test]
+async fn concurrent_writes_are_committed_together_and_correctly() {
+    let (engine, _dir) = test_engine().await;
+    let engine = Arc::new(engine);
+    engine.create_bucket("bkt").await.unwrap();
+    let put = |key: String, condition: WriteCondition| {
+        let engine = Arc::clone(&engine);
+        tokio::spawn(async move {
+            engine.put_object("bkt", &key, body(b"data", 4), ObjectAttrs::default(), condition).await
+        })
+    };
+
+    // Many writers at once: all land, in fewer commits than writes, and
+    // usage counts every one.
+    let commits = engine.stats.meta_commits.load(Ordering::Relaxed);
+    let tasks: Vec<_> = (0..64).map(|i| put(format!("k{i}"), WriteCondition::None)).collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let commits = engine.stats.meta_commits.load(Ordering::Relaxed) - commits;
+    assert!(commits < 64, "{commits} commits for 64 concurrent writes");
+    let (_, usage) = engine.bucket_usage("bkt").await.unwrap();
+    assert_eq!((usage.objects, usage.bytes), (64, 256));
+
+    // Racing create-only writes to one key, likely in one batch: exactly one wins.
+    let tasks: Vec<_> = (0..32).map(|_| put("once".into(), WriteCondition::IfNoneMatchAny)).collect();
+    let mut won = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => won += 1,
+            Err(Error::PreconditionFailed) => {}
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+    assert_eq!(won, 1);
+
+    // A quota holds under concurrency, and refused uploads leave no blocks.
+    engine.create_bucket("small").await.unwrap();
+    engine.set_bucket_quota("small", Quota { max_bytes: None, max_objects: Some(10) }).await.unwrap();
+    let tasks: Vec<_> = (0..40)
+        .map(|i| {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move {
+                let data = pattern(2500);
+                engine
+                    .put_object(
+                        "small",
+                        &format!("k{i}"),
+                        body(&data, 1000),
+                        ObjectAttrs::default(),
+                        WriteCondition::None,
+                    )
+                    .await
+            })
+        })
+        .collect();
+    let mut stored = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => stored += 1,
+            Err(Error::QuotaExceeded(_)) => {}
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+    assert_eq!(stored, 10);
+    assert_eq!(engine.bucket_usage("small").await.unwrap().1.objects, 10);
+    wait_for_block_files(&engine, 10 * 3).await;
+}

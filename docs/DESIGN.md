@@ -215,11 +215,19 @@ Notes:
   take an ETag, last-modified time and size to match (`DeleteObject`, and per key
   in `DeleteObjects`); deleting a key that does not exist succeeds whatever the
   condition, as in S3.
-- redb allows one writer at a time with concurrent MVCC readers. Each commit is one
-  fsync. redb is synchronous, so the engine calls it from `spawn_blocking`. One
-  fsync'd commit per write caps small PUTs at roughly 1,500 per second on the
-  benchmark machine ([BENCHMARKS.md](BENCHMARKS.md)); group commit, several
-  waiting commands in one transaction, is the planned remedy.
+- redb allows one writer at a time with concurrent MVCC readers, and each commit
+  is one fsync. **Group commit:** one writer thread applies every write. It
+  takes all commands waiting in its queue (up to 256) and applies them in order
+  in one transaction, so one fsync covers the batch; reads run concurrently on
+  snapshots. Each command still gets the result it would have had alone: if one
+  fails (a precondition, a quota), the transaction is dropped, that command gets
+  its error, and the rest are applied again without it, which is safe because
+  commands carry all their inputs. (redb's savepoints cannot be taken once a
+  transaction has opened a table, so they cannot isolate commands in a batch.)
+  Staged blocks travel with their command and the writer marks them committed,
+  so a client that disconnects mid-commit cannot get committed blocks deleted.
+  With 32 clients, small PUTs went from 166 to about 1,900 per second on a disk
+  with slow fsyncs ([BENCHMARKS.md](BENCHMARKS.md)).
 
 `ObjectRecord` holds: version id, size, ETag, last-modified, content headers
 (type, encoding, disposition, language, cache-control, expires), user metadata,
@@ -374,6 +382,7 @@ are read from the engine at scrape time.
 | `aether_disk_available_bytes`, `aether_disk_total_bytes` | |
 | `aether_gc_deleted_blocks_total`, `aether_orphan_removed_blocks_total`, `aether_aborted_uploads_total` | |
 | `aether_scrub_checked_blocks_total`, `aether_scrub_checked_bytes_total`, `aether_scrub_corrupt_blocks_total`, `aether_scrub_last_finished_timestamp_seconds` | |
+| `aether_metadata_commits_total`, `aether_metadata_writes_total` (writes ÷ commits = average group-commit batch) | |
 | `aether_build_info`, `aether_uptime_seconds` | `version` |
 
 ### Scrubbing

@@ -97,6 +97,7 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     meta: Arc<MetaStore>,
+    writer: writer::Writer,
     blocks: Arc<BlockStore>,
     keys: Arc<KeyCache>,
     stats: Arc<EngineStats>,
@@ -117,6 +118,9 @@ pub struct EngineStats {
     pub scrub_blocks_checked: AtomicU64,
     pub scrub_bytes_checked: AtomicU64,
     pub scrub_corrupt_blocks: AtomicU64,
+    /// Metadata write transactions committed; each carries one or more writes.
+    pub meta_commits: AtomicU64,
+    pub meta_writes: AtomicU64,
 }
 
 fn count(counter: &AtomicU64, n: u64) {
@@ -134,11 +138,14 @@ impl Engine {
         let blocks = BlockStore::open(&config.data_dir).await?;
         let keys = KeyCache::default();
         KeyCache::load(&meta, &keys)?;
+        let meta = Arc::new(meta);
+        let stats = Arc::new(EngineStats::default());
         Ok(Self {
-            meta: Arc::new(meta),
+            writer: writer::Writer::start(Arc::clone(&meta), Arc::clone(&stats)),
+            meta,
             blocks: Arc::new(blocks),
             keys: Arc::new(keys),
-            stats: Arc::default(),
+            stats,
             scrub: scrub::ScrubState::default(),
             config,
         })
@@ -789,9 +796,10 @@ impl Engine {
 
     // ---- helpers ----
 
+    /// Every metadata write goes through the writer, which commits waiting
+    /// writes together (group commit).
     async fn apply(&self, command: Command) -> Result<Outcome> {
-        let meta = Arc::clone(&self.meta);
-        tokio::task::spawn_blocking(move || meta.apply(command)).await?
+        self.writer.apply(command, None).await
     }
 
     /// Applies a command that references a staged body's blocks. The staged
@@ -799,14 +807,7 @@ impl Engine {
     /// this future is cancelled (the client disconnects); otherwise a cancelled
     /// request could delete the blocks of a committed object.
     async fn commit_staged(&self, staged: StagedObject, command: Command) -> Result<Outcome> {
-        let meta = Arc::clone(&self.meta);
-        tokio::task::spawn_blocking(move || {
-            let mut staged = staged;
-            let result = meta.apply(command);
-            staged.committed = result.is_ok();
-            result
-        })
-        .await?
+        self.writer.apply(command, Some(staged)).await
     }
 
     async fn read<T, F>(&self, f: F) -> Result<T>
@@ -1050,6 +1051,7 @@ pub fn validate_part_number(part_number: u32) -> Result<()> {
 
 mod keys;
 mod scrub;
+mod writer;
 
 pub use self::scrub::{CorruptBlock, ScrubReport};
 
