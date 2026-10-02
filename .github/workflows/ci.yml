@@ -29,7 +29,7 @@ jobs:
     name: fmt, clippy, tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -44,7 +44,7 @@ jobs:
     name: dependency audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
@@ -58,8 +58,8 @@ jobs:
     name: minimum Rust version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.96
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.120
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: aether_backend
@@ -69,8 +69,8 @@ jobs:
     name: release build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -88,7 +88,7 @@ jobs:
       - run: cargo build --release --locked --bin aether
         env:
           AETHER_CONSOLE_DIR: ${{ github.workspace }}/console/out
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: aether
           path: aether_backend/target/release/aether
@@ -103,8 +103,8 @@ jobs:
       run:
         working-directory: console
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -112,7 +112,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
       - run: npm run lint -- --max-warnings 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: aether
           path: aether_backend/target/release
@@ -123,7 +123,7 @@ jobs:
         env:
           KEEP_LOG: ${{ runner.temp }}/console-server.log
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: console-e2e
           path: |
@@ -141,13 +141,13 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: aether
           path: aether_backend/target/release
       - run: chmod +x aether_backend/target/release/aether
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # The latest boto3 on purpose: new client defaults (like 2025's
@@ -173,7 +173,7 @@ jobs:
           # Each client takes well under a minute; three limits fit in the job's.
           CLIENT_TIMEOUT: "300"
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: clients-server-log
           path: ${{ runner.temp }}/clients-server.log
@@ -186,18 +186,18 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
         with:
           repository: ceph/s3-tests
           ref: ${{ env.S3_TESTS_REF }}
           path: s3-tests
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: aether
           path: aether_backend/target/release
       - run: chmod +x aether_backend/target/release/aether
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - run: pip install -r s3-tests/requirements.txt pytest-timeout
@@ -207,7 +207,7 @@ jobs:
           JUNIT_OUT: ${{ runner.temp }}/s3-tests.xml
           KEEP_LOG: ${{ runner.temp }}/s3-tests-server.log
       - if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: s3-tests-results
           path: |
@@ -222,7 +222,7 @@ jobs:
       run:
         working-directory: .
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: docker build -t aether:ci .
       - name: Smoke test
         env:
