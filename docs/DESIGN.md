@@ -134,8 +134,11 @@ inside the write's own transaction, so concurrent writers cannot overshoot.
 A write fails with `QuotaExceeded` (HTTP 403, the code Ceph's S3 server
 uses) when it would take usage past a limit; writes that do not grow usage
 pass even when a lowered limit is already exceeded, so space can be freed.
-PUTs that declare their size are refused before the body is read. Multipart
-uploads are checked when completed, since only then is their size known.
+Uploads are refused before any data is read whenever the size is known: PUTs
+by their length, each multipart part by its length plus the parts already
+uploaded (so an upload stops at the first part past the limit), and the
+console's multipart uploads when they start, from the file size it sends.
+Completion remains the authoritative check.
 
 ### Web console
 

@@ -87,6 +87,10 @@ pub struct KeyParam {
 pub struct CreateUploadRequest {
     key: String,
     content_type: Option<String>,
+    /// The whole file's size, if known: checked against the bucket's quota
+    /// before any part is sent.
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -250,6 +254,9 @@ pub async fn put(
 ) -> ApiResult<(StatusCode, Json<ObjectItem>)> {
     let max = s.settings.max_object_size;
     check_length(&headers, max)?;
+    // Refuse before reading the body when the declared size breaks the quota.
+    let size = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
+    s.engine.precheck_put(&bucket, &key, &WriteCondition::None, size).await?;
     let attrs = ObjectAttrs { content_type: content_type(&headers), ..Default::default() };
     let record = s.engine.put_object(&bucket, &key, limited(body, max), attrs, WriteCondition::None).await?;
     Ok((StatusCode::CREATED, Json(item(key, &record))))
@@ -261,7 +268,7 @@ pub async fn create_upload(
     body: Result<Json<CreateUploadRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<UploadView>)> {
     let Json(req) = body?;
-    s.engine.get_bucket(&bucket).await?;
+    s.engine.precheck_put(&bucket, &req.key, &WriteCondition::None, req.size).await?;
     let attrs = ObjectAttrs { content_type: req.content_type.filter(|t| !t.is_empty()), ..Default::default() };
     let upload = s.engine.create_upload(&bucket, &req.key, attrs, None, None).await?;
     Ok((StatusCode::CREATED, Json(UploadView { upload_id: upload.upload_id.to_string(), key: upload.key })))
@@ -278,7 +285,8 @@ pub async fn upload_part(
     crate::engine::validate_part_number(part_number)?;
     let max = s.settings.max_object_size;
     check_length(&headers, max)?;
-    s.engine.get_upload(&bucket, &key, upload_id).await?;
+    let size = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
+    s.engine.precheck_part(&bucket, &key, upload_id, part_number, size).await?;
     let staged = s.engine.stage_part(limited(body, max)).await?;
     let part = s.engine.commit_part(&bucket, &key, upload_id, part_number, staged, BTreeMap::new()).await?;
     Ok(Json(PartView { part_number, etag: part.etag, size: part.size }))

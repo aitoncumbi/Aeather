@@ -66,8 +66,11 @@ impl AetherS3 {
         let S3Request { input, headers, trailing_headers, .. } = req;
         let upload_id = parse_upload_id(&input.upload_id)?;
         let number = part_number(input.part_number)?;
-        // Fail before reading the body if the upload does not exist.
+        // Fail before reading the body if the upload does not exist, or if the
+        // object could no longer fit the bucket's quota.
         let upload = self.engine.get_upload(&input.bucket, &input.key, upload_id).await.map_err(s3_error)?;
+        let size = input.content_length.and_then(|n| u64::try_from(n).ok());
+        self.engine.precheck_part(&input.bucket, &input.key, upload_id, number, size).await.map_err(s3_error)?;
 
         let (bucket, key, body) = (input.bucket.clone(), input.key.clone(), input.body);
         let (algorithm, content_md5) = (input.checksum_algorithm.clone(), input.content_md5.clone());

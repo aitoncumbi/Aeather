@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { expect, signIn, test } from "./fixtures";
+import { expect, signIn, test, unique } from "./fixtures";
 
 test.beforeEach(async ({ page }) => {
   await signIn(page);
@@ -51,4 +51,32 @@ test("uploads small and multipart files, downloads and deletes them", async ({ p
   await page.getByRole("dialog").getByRole("button", { name: "Delete object" }).click();
   await expect(page.getByText("Deleted hello.txt.")).toBeVisible();
   await expect(page.getByRole("button", { name: /^hello\.txt/ })).toHaveCount(0);
+});
+
+test("refuses uploads past the bucket's quota before sending them", async ({ page }) => {
+  const name = unique("capped");
+  const headers = { "x-aether-console": "1" };
+  expect((await page.request.post("/api/v1/buckets", { headers, data: { name } })).status()).toBe(201);
+  const quota = await page.request.put(`/api/v1/buckets/${name}/quota`, { headers, data: { max_bytes: 5_000_000 } });
+  expect(quota.status()).toBe(200);
+  const sent: string[] = [];
+  page.on("requestfinished", async (req) => {
+    const timing = req.timing();
+    sent.push(`${req.method()} ${new URL(req.url()).pathname} ${Math.round(timing.responseEnd)}ms`);
+  });
+
+  await page.goto(`/objects/?bucket=${name}`);
+  // Playwright passes at most 50 MB per call, so one file at a time.
+  const input = page.locator('input[type="file"]');
+  const message = page.getByText(/quota of 5000000 bytes would be exceeded/);
+  await input.setInputFiles({ name: "parts.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(40 * 1024 * 1024, 2) });
+  await expect(message).toHaveCount(1);
+  await input.setInputFiles({ name: "single.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(20 * 1024 * 1024, 1) });
+  await expect(message).toHaveCount(2);
+  console.log(sent.filter((r) => r.includes("/uploads") || r.includes("/object")).join("\n"));
+
+  // The multipart upload stopped at its first request: no part was sent.
+  expect(sent.some((r) => r.includes("/parts/"))).toBe(false);
+  const bucket = await (await page.request.get(`/api/v1/buckets/${name}`, { headers })).json();
+  expect(bucket.objects).toBe(0);
 });
