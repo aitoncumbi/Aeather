@@ -9,6 +9,7 @@ mod copy;
 pub mod cors;
 pub mod host;
 mod multipart;
+mod tags;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -254,9 +255,6 @@ impl S3 for AetherS3 {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let S3Request { input, headers, trailing_headers, .. } = req;
 
-        if input.tagging.is_some() {
-            return Err(s3_error!(NotImplemented, "object tagging is not supported yet"));
-        }
         if input.sse_customer_key.is_some() || input.server_side_encryption.is_some() {
             return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
         }
@@ -343,6 +341,7 @@ impl S3 for AetherS3 {
             expires: headers.expires,
             metadata: headers.metadata,
             checksum_type: headers.checksum_type,
+            tag_count: tags::count(&record.attrs.tags),
             ..Default::default()
         };
         set_checksums!(output, headers.checksum);
@@ -390,7 +389,12 @@ impl S3 for AetherS3 {
             ..Default::default()
         };
         set_checksums!(output, headers.checksum);
-        Ok(S3Response::new(output))
+        let mut response = S3Response::new(output);
+        // Not in S3's HeadObject model, but sent by Ceph's S3 server and read by some clients.
+        if let Some(count) = tags::count(&record.attrs.tags) {
+            response.headers.insert("x-amz-tagging-count", count.into());
+        }
+        Ok(response)
     }
 
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
@@ -635,8 +639,29 @@ impl S3 for AetherS3 {
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let input = req.input;
         check_version_id(input.version_id.as_deref())?;
-        self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
-        Ok(S3Response::new(GetObjectTaggingOutput { tag_set: Vec::new(), version_id: None }))
+        let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
+        Ok(S3Response::new(GetObjectTaggingOutput { tag_set: tags::to_tag_set(&record.attrs.tags), version_id: None }))
+    }
+
+    async fn put_object_tagging(
+        &self,
+        req: S3Request<PutObjectTaggingInput>,
+    ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        let input = req.input;
+        check_version_id(input.version_id.as_deref())?;
+        let tags = tags::from_tag_set(input.tagging.tag_set)?;
+        self.engine.set_object_tags(&input.bucket, &input.key, tags).await.map_err(s3_error)?;
+        Ok(S3Response::new(PutObjectTaggingOutput::default()))
+    }
+
+    async fn delete_object_tagging(
+        &self,
+        req: S3Request<DeleteObjectTaggingInput>,
+    ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        let input = req.input;
+        check_version_id(input.version_id.as_deref())?;
+        self.engine.set_object_tags(&input.bucket, &input.key, Default::default()).await.map_err(s3_error)?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
     }
 
     /// No bucket has tags; S3 answers NoSuchTagSet for an untagged bucket.

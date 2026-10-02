@@ -69,6 +69,8 @@ pub struct ObjectDetail {
     pub cache_control: Option<String>,
     pub expires: Option<String>,
     pub user_metadata: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
     pub checksums: BTreeMap<String, String>,
     /// Number of parts for objects made by a multipart upload, else 0.
     pub parts: usize,
@@ -188,6 +190,7 @@ pub async fn head(
         cache_control: attrs.cache_control.clone(),
         expires: attrs.expires.clone(),
         user_metadata: attrs.user_metadata.clone(),
+        tags: attrs.tags.clone(),
         checksums: attrs.checksums.clone(),
         parts: record.part_sizes.len(),
         storage,

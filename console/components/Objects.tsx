@@ -516,6 +516,7 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
     for (const [name, value] of all) if (value) headers.push([name, value]);
   }
   const metadata = o ? Object.entries(o.user_metadata) : [];
+  const tags = o ? Object.entries(o.tags ?? {}) : [];
 
   return (
     <section aria-label="Object details" className="panel" style={{ gap: 18 }}>
@@ -592,6 +593,19 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
         </dl>
       )}
 
+      {tags.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <span className="section-label">Tags</span>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {tags.map(([k, v]) => (
+              <div key={k} className="meta-row">
+                <span className="muted">{k}</span>
+                <span className="right wrap-any">{v}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       {(metadata.length > 0 || headers.length > 0) && (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <span className="section-label">Metadata</span>

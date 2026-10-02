@@ -79,7 +79,7 @@ anything from a 1 KB document to a 100 GB file.
 - [ ] Encryption at rest: SSE-S3 (master key from config), then SSE-C
 - [ ] Encrypt stored access-key secrets under the master key
 - [ ] Lifecycle rules: expire objects, expire noncurrent versions, abort incomplete uploads
-- [ ] Object tagging
+- [x] Object tagging
 
 ## v3: clustering
 - [ ] Raft-replicated metadata (openraft) using the existing command model

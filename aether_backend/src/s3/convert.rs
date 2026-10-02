@@ -267,6 +267,7 @@ macro_rules! object_attrs {
             user_metadata: $input.metadata.map(std::collections::BTreeMap::from_iter).unwrap_or_default(),
             checksums: std::collections::BTreeMap::new(),
             checksum_type: None,
+            tags: $crate::s3::tags::from_header($input.tagging.as_deref())?,
         }
     };
 }

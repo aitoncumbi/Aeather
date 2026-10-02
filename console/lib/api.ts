@@ -98,6 +98,7 @@ export type ObjectDetail = ObjectItem & {
   cache_control: string | null;
   expires: string | null;
   user_metadata: Record<string, string>;
+  tags: Record<string, string>;
   checksums: Record<string, string>;
   parts: number;
   storage: "inline" | "blocks";

@@ -10,6 +10,7 @@ mod keys;
 mod types;
 mod usage;
 
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
 
@@ -149,6 +150,12 @@ pub enum Command {
         access_key_id: String,
         bucket: String,
         grant: BucketGrant,
+    },
+    /// Replaces an object's tags. Fails with `NoSuchKey`.
+    SetObjectTags {
+        bucket: String,
+        key: String,
+        tags: BTreeMap<String, String>,
     },
     /// Replaces a bucket's CORS rules; no rules removes the configuration.
     SetBucketCors {
@@ -498,6 +505,18 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             record.cors = rules;
             buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
             Outcome::Bucket(record)
+        }
+        Command::SetObjectTags { bucket, key, tags } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            let mut objects = txn.open_table(OBJECTS)?;
+            let okey = object_key(&bucket.id, key.as_bytes());
+            let mut record: ObjectRecord = match objects.get(okey.as_slice())? {
+                Some(v) => codec::decode(v.value())?,
+                None => return Err(Error::NoSuchKey),
+            };
+            record.attrs.tags = tags;
+            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+            Outcome::Object(Some(record))
         }
         Command::SetBucketQuota { bucket, quota } => {
             let mut buckets = txn.open_table(BUCKETS)?;

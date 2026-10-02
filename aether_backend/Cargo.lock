@@ -16,6 +16,7 @@ dependencies = [
  "crc-fast",
  "crc32c",
  "figment",
+ "form_urlencoded",
  "futures",
  "getrandom 0.4.3",
  "hex",

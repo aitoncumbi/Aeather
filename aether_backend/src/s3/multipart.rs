@@ -29,9 +29,6 @@ impl AetherS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        if input.tagging.is_some() {
-            return Err(s3_error!(NotImplemented, "object tagging is not supported yet"));
-        }
         if input.server_side_encryption.is_some() || input.sse_customer_key.is_some() {
             return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
         }
