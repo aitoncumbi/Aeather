@@ -149,6 +149,11 @@ pub enum Command {
         bucket: String,
         grant: BucketGrant,
     },
+    /// Replaces a bucket's CORS rules; no rules removes the configuration.
+    SetBucketCors {
+        bucket: String,
+        rules: Vec<CorsRule>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -209,7 +214,7 @@ impl MetaStore {
                 if buckets.get(name.as_str())?.is_some() {
                     return Err(Error::BucketAlreadyExists);
                 }
-                let record = BucketRecord { id, name, created_at };
+                let record = BucketRecord { id, name, created_at, cors: Vec::new() };
                 buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
                 usage::adjust(&txn, &record.id, None, None)?;
                 if let Some(owner) = owner {
@@ -442,6 +447,13 @@ impl MetaStore {
                 }
                 keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
                 Outcome::Key(key)
+            }
+            Command::SetBucketCors { bucket, rules } => {
+                let mut buckets = txn.open_table(BUCKETS)?;
+                let mut record = load_bucket(&buckets, &bucket)?;
+                record.cors = rules;
+                buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+                Outcome::Bucket(record)
             }
             Command::ForgetBlocks { entries } => {
                 let mut blocks = txn.open_table(BLOCKS)?;

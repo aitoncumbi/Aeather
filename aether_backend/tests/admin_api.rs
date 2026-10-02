@@ -205,6 +205,13 @@ async fn buckets_and_usage() {
     let (_, detail) = s.call(Method::GET, "/api/v1/buckets/media", None).await;
     assert_eq!(detail["keys"][0]["access_key_id"], viewer["access_key_id"]);
     assert_eq!(detail["keys"][0]["read"], true);
+    assert_eq!(detail["cors"], json!([]));
+    let rule = aws_sdk_s3::types::CorsRule::builder().allowed_origins("https://app.example.com").allowed_methods("PUT");
+    let config = aws_sdk_s3::types::CorsConfiguration::builder().cors_rules(rule.build().unwrap()).build().unwrap();
+    root.put_bucket_cors().bucket("media").cors_configuration(config).send().await.unwrap();
+    let (_, detail) = s.call(Method::GET, "/api/v1/buckets/media", None).await;
+    assert_eq!(detail["cors"][0]["allowed_origins"], json!(["https://app.example.com"]));
+    assert_eq!(detail["cors"][0]["allowed_methods"], json!(["PUT"]));
 
     let (_, status_view) = s.call(Method::GET, "/api/v1/status", None).await;
     assert_eq!((status_view["buckets"].as_u64(), status_view["objects"].as_u64()), (Some(1), Some(2)));

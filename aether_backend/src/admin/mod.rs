@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::engine::{Engine, NewKey, ScrubReport, now_millis};
 use crate::error::Error;
 use crate::history::{self, History};
-use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, KeyUpdate, Millis};
+use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, CorsRule, KeyUpdate, Millis};
 use crate::metrics::{self, Metrics};
 use crate::observe::RequestFacts;
 
@@ -207,6 +207,9 @@ pub struct BucketView {
     /// Keys with explicit permissions; only in single-bucket responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<BucketKeyView>>,
+    /// CORS rules (set through the S3 API); only in single-bucket responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cors: Option<Vec<CorsRule>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -299,6 +302,7 @@ fn bucket_view(bucket: BucketRecord, usage: BucketUsage, keys: &[AccessKeyRecord
         bytes: usage.bytes,
         key_count,
         keys: None,
+        cors: None,
     }
 }
 
@@ -543,6 +547,7 @@ async fn create_bucket(
 
 async fn get_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> ApiResult<Json<BucketView>> {
     let (bucket, usage) = s.engine.bucket_usage(&name).await?;
+    let cors = bucket.cors.clone();
     let all_keys = s.engine.access_keys();
     let keys = all_keys
         .iter()
@@ -552,7 +557,7 @@ async fn get_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> Ap
             Some(BucketKeyView { access_key_id: key.access_key_id.clone(), name: key.name.clone(), grant })
         })
         .collect();
-    Ok(Json(BucketView { keys: Some(keys), ..bucket_view(bucket, usage, &all_keys) }))
+    Ok(Json(BucketView { keys: Some(keys), cors: Some(cors), ..bucket_view(bucket, usage, &all_keys) }))
 }
 
 async fn delete_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> ApiResult<StatusCode> {

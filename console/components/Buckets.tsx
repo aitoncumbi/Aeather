@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useState, type FormEvent } from "react";
 
-import { api, ApiError, paths, type Bucket } from "@/lib/api";
+import { api, ApiError, paths, type Bucket, type CorsRule } from "@/lib/api";
 import { bytes, count, date, percent } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import { BucketIcon, ChevronRightIcon, PlusIcon, SearchIcon, TrashIcon } from "./icons";
@@ -243,7 +243,7 @@ function BucketDetail({
         <span className="section-label">Settings</span>
         <div className="ruled-list">
           <PlannedSetting title="Quota" hint="No limit" when="v1.1" />
-          <PlannedSetting title="CORS" hint="No rules: browsers cannot upload with presigned URLs" when="v1.1" />
+          <CorsSetting rules={b?.cors} />
           <PlannedSetting title="Versioning" hint="Not available until v2" when="v2" />
         </div>
       </div>
@@ -278,6 +278,34 @@ function BucketDetail({
         }}
       />
     </section>
+  );
+}
+
+/** Read-only: rules are set with the S3 API (PutBucketCors). */
+function CorsSetting({ rules }: { rules: CorsRule[] | undefined }) {
+  const origins = [...new Set(rules?.flatMap((r) => r.allowed_origins) ?? [])];
+  return (
+    <div className="row">
+      <div className="row-text">
+        <span className="row-title">CORS</span>
+        <span className="row-hint">
+          {!rules ? (
+            " "
+          ) : origins.length === 0 ? (
+            <>
+              No rules: browsers cannot call this bucket. Set rules with <code>aws s3api put-bucket-cors</code>.
+            </>
+          ) : (
+            `Browsers at ${origins.join(", ")}`
+          )}
+        </span>
+      </div>
+      {rules && rules.length > 0 && (
+        <span className="chip">
+          {rules.length} rule{rules.length === 1 ? "" : "s"}
+        </span>
+      )}
+    </div>
   );
 }
 

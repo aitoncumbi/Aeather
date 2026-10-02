@@ -33,6 +33,11 @@ impl RequestFacts {
         facts.access_key = Some(access_key.to_owned());
     }
 
+    /// Records only the operation, for requests that carry no access key.
+    pub fn record_operation(&self, operation: &str) {
+        self.0.lock().expect("request facts lock poisoned").operation = Some(operation.to_owned());
+    }
+
     /// Records only the caller (admin API requests keep their route label).
     pub fn record_access_key(&self, access_key: &str) {
         self.0.lock().expect("request facts lock poisoned").access_key = Some(access_key.to_owned());

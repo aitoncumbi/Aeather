@@ -80,6 +80,16 @@ the metadata store. Authorization (which key can do what on which bucket) is an
 caller with a valid key that addresses a bucket that does not exist gets
 `NoSuchBucket` rather than `AccessDenied`, as in S3.
 
+**CORS** is per bucket, as in S3: `PutBucketCors`, `GetBucketCors` and
+`DeleteBucketCors` store up to 100 rules on the bucket record (owners only).
+`s3s` does not handle the browser side, so a layer in front of it answers
+`OPTIONS` preflights from those rules and adds `Access-Control-*` headers to
+responses whose `Origin` a rule allows, errors included. The first rule
+matching the origin, method and requested headers wins; origins and headers
+may hold one `*`. Preflights need no signature, as in S3. CORS only lets a
+browser read responses: every other request still needs a valid signature,
+so a page uploads with presigned URLs its own server hands out.
+
 Health endpoints live under `/_aether/` on the S3 port. A leading underscore is
 not valid in a bucket name, so they cannot collide with path-style requests.
 
@@ -152,7 +162,7 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 
 | Table | Key | Value |
 |---|---|---|
-| `buckets` | bucket name | `BucketRecord` (id, created_at, settings) |
+| `buckets` | bucket name | `BucketRecord` (id, created_at, CORS rules) |
 | `objects` | bucket_id (16 B) ‖ object key bytes | `ObjectRecord` |
 | `blocks` | block_id (16 B) | reference count |
 | `gc_queue` | due_at (u64 BE) ‖ block_id | – |
