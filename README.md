@@ -80,8 +80,9 @@ The admin port listens on loopback by default. From another machine, use an SSH
 tunnel (`ssh -L 9001:127.0.0.1:9001 server`, then open `http://127.0.0.1:9001/`)
 or serve the admin API over HTTPS (`tls.admin = true`) on a reachable address.
 
-- Sign-in sessions end on sign-out, after 12 hours idle or 7 days, when the
-  server restarts, and immediately when the key is disabled or deleted.
+- Sign-in sessions end on sign-out, after 15 minutes idle (automatic page
+  refreshes do not count) or 7 days, when the server restarts, and immediately
+  when the key is disabled or deleted.
 - Share links are presigned S3 URLs: whoever has one can download the object
   until it expires, from the S3 port. They use the host name the console was
   opened with; when clients reach the S3 API at another address (a load

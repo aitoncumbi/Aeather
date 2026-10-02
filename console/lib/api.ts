@@ -130,6 +130,8 @@ export class ApiError extends Error {
 }
 
 export const CONSOLE_HEADER = { "x-aether-console": "1" };
+/** Marks timed refreshes, which do not count as use of the session. */
+export const BACKGROUND_HEADER = { "x-aether-background": "1" };
 
 /** Signed out (or the session expired): back to the sign-in page. */
 export function toSignIn() {

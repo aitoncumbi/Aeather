@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { api, ApiError } from "./api";
+import { api, ApiError, BACKGROUND_HEADER } from "./api";
 
 type Loaded<T> = { path: string; data: T };
 
 /**
  * Loads `path` from the admin API, optionally polling it. Polling keeps the
- * previous data on screen (no loading flash) and pauses in hidden tabs.
+ * previous data on screen (no loading flash) and pauses in hidden tabs. Timed
+ * refreshes are marked as background so they do not keep the session alive.
  * `null` skips the request.
  */
 export function useApi<T>(path: string | null, refreshMs?: number) {
@@ -19,9 +20,9 @@ export function useApi<T>(path: string | null, refreshMs?: number) {
   useEffect(() => {
     if (!path) return;
     let cancelled = false;
-    const load = () => {
+    const load = (background = false) => {
       if (document.visibilityState === "hidden") return;
-      api<T>(path).then(
+      api<T>(path, background ? { headers: BACKGROUND_HEADER } : {}).then(
         (data) => {
           if (cancelled) return;
           setLoaded({ path, data });
@@ -34,8 +35,8 @@ export function useApi<T>(path: string | null, refreshMs?: number) {
       );
     };
     load();
-    const timer = refreshMs ? window.setInterval(load, refreshMs) : undefined;
-    const onVisible = () => document.visibilityState === "visible" && refreshMs && load();
+    const timer = refreshMs ? window.setInterval(() => load(true), refreshMs) : undefined;
+    const onVisible = () => document.visibilityState === "visible" && refreshMs && load(true);
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
