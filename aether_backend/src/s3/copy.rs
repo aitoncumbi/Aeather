@@ -47,10 +47,12 @@ impl AetherS3 {
         req: S3Request<CopyObjectInput>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let input = req.input;
-        let replaces_tags = input.tagging_directive.as_ref().is_some_and(|d| d.as_str() == TaggingDirective::REPLACE);
-        if input.tagging.is_some() || replaces_tags {
-            return Err(s3_error!(NotImplemented, "object tagging is not supported yet"));
-        }
+        // Tags follow their own directive: copied from the source unless REPLACE.
+        let new_tags = match input.tagging_directive.as_ref().map(|d| d.as_str()) {
+            None | Some(TaggingDirective::COPY) => None,
+            Some(TaggingDirective::REPLACE) => Some(super::tags::from_header(input.tagging.as_deref())?),
+            Some(other) => return Err(s3_error!(InvalidArgument, "unknown tagging directive {other}")),
+        };
         if input.server_side_encryption.is_some()
             || input.sse_customer_key.is_some()
             || input.copy_source_sse_customer_key.is_some()
@@ -91,7 +93,7 @@ impl AetherS3 {
             let source = self.engine.get_object(&src_bucket, &src_key).await.map_err(s3_error)?;
             conditions.check(&source)?;
             // The data does not change, so neither do its checksums.
-            let attrs = match &new_attrs {
+            let mut attrs = match &new_attrs {
                 Some(attrs) => ObjectAttrs {
                     checksums: source.attrs.checksums.clone(),
                     checksum_type: source.attrs.checksum_type.clone(),
@@ -99,6 +101,7 @@ impl AetherS3 {
                 },
                 None => source.attrs.clone(),
             };
+            attrs.tags = new_tags.clone().unwrap_or_else(|| source.attrs.tags.clone());
             let copied = self
                 .engine
                 .copy_object(&src_bucket, &src_key, &source, &dst_bucket, &dst_key, attrs, condition.clone())

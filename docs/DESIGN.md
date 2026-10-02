@@ -74,9 +74,15 @@ storage-specific:
 - Answering the calls that clients and tools make on every bucket, for features
   that do not exist yet, the way S3 answers for a bucket that does not use
   them: `ListObjectVersions` lists every object as version `null`,
-  `GetBucketVersioning` reports versioning never enabled, `GetObjectTagging`
-  returns an empty tag set (the AWS CLI reads it when copying) and
-  `GetBucketTagging` returns `NoSuchTagSet`. Requests that would *set* such
+  `GetBucketVersioning` reports versioning never enabled and
+  `GetBucketTagging` returns `NoSuchTagSet`.
+- Object tags: up to 10 per object (S3's limits on count, key and value
+  length, no `aws:` keys), set on PUT, CopyObject (copied from the source unless
+  `x-amz-tagging-directive: REPLACE`) and CreateMultipartUpload, and with
+  Put/Get/DeleteObjectTagging. They live in the object's attributes, so changing
+  them rewrites only the metadata record. GET reports `x-amz-tagging-count`, as
+  does HEAD (as Ceph's S3 server does). Readers may read tags; changing them
+  needs write. Requests that would *set* such
   features fail with `NotImplemented`.
 
 Authentication uses `s3s`'s SigV4 verification, backed by access keys stored in

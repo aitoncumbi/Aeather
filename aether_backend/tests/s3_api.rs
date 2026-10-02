@@ -1303,3 +1303,81 @@ async fn multipart_uploads_stop_at_the_first_part_past_the_quota() {
     let parts = s.client.list_parts().bucket("capped").key("big").upload_id(id).send().await.unwrap();
     assert_eq!(parts.parts().len(), 1);
 }
+
+#[tokio::test]
+async fn object_tags_are_stored_copied_and_permission_checked() {
+    use aws_sdk_s3::types::{Tag, Tagging, TaggingDirective};
+    let s = start().await;
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+    let tags_of = |key: &'static str| {
+        let client = s.client.clone();
+        async move {
+            let out = client.get_object_tagging().bucket("bkt").key(key).send().await.unwrap();
+            let mut tags: Vec<_> = out.tag_set().iter().map(|t| format!("{}={}", t.key(), t.value())).collect();
+            tags.sort();
+            tags
+        }
+    };
+
+    // On PUT, from the URL-encoded header.
+    s.client
+        .put_object()
+        .bucket("bkt")
+        .key("a")
+        .tagging("project=aether&team=storage%20ops")
+        .body(ByteStream::from_static(b"a"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tags_of("a").await, ["project=aether", "team=storage ops"]);
+    let got = s.client.get_object().bucket("bkt").key("a").send().await.unwrap();
+    assert_eq!(got.tag_count(), Some(2));
+
+    // Replaced and removed with the tagging calls.
+    let tagging =
+        Tagging::builder().tag_set(Tag::builder().key("stage").value("final").build().unwrap()).build().unwrap();
+    s.client.put_object_tagging().bucket("bkt").key("a").tagging(tagging).send().await.unwrap();
+    assert_eq!(tags_of("a").await, ["stage=final"]);
+
+    // Copies keep the source's tags unless told to replace them.
+    let copy = |dst: &'static str| s.client.copy_object().bucket("bkt").key(dst).copy_source("bkt/a");
+    copy("kept").send().await.unwrap();
+    assert_eq!(tags_of("kept").await, ["stage=final"]);
+    copy("replaced").tagging_directive(TaggingDirective::Replace).tagging("x=1").send().await.unwrap();
+    assert_eq!(tags_of("replaced").await, ["x=1"]);
+
+    // Multipart uploads take their tags at creation.
+    let up = s.client.create_multipart_upload().bucket("bkt").key("mp").tagging("kind=video").send().await.unwrap();
+    let id = up.upload_id().unwrap();
+    let part = s.client.upload_part().bucket("bkt").key("mp").upload_id(id).part_number(1);
+    let part = part.body(ByteStream::from_static(b"data")).send().await.unwrap();
+    s.client
+        .complete_multipart_upload()
+        .bucket("bkt")
+        .key("mp")
+        .upload_id(id)
+        .multipart_upload(completed(&[(1, part.e_tag().unwrap().to_owned())]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tags_of("mp").await, ["kind=video"]);
+
+    s.client.delete_object_tagging().bucket("bkt").key("a").send().await.unwrap();
+    assert!(tags_of("a").await.is_empty());
+    assert_eq!(s.client.get_object().bucket("bkt").key("a").send().await.unwrap().tag_count(), None);
+
+    // Limits and missing objects.
+    let eleven = (0..11).map(|i| format!("k{i}=v")).collect::<Vec<_>>().join("&");
+    let err = s.client.put_object().bucket("bkt").key("b").tagging(eleven).send().await.unwrap_err();
+    assert_eq!(code(err), "InvalidTag");
+    let err = s.client.get_object_tagging().bucket("bkt").key("missing").send().await.unwrap_err();
+    assert_eq!(code(err), "NoSuchKey");
+
+    // Readers read tags, writers change them.
+    let (reader, _) = key_client(&s, &[("bkt", READ)], |_| {}).await;
+    reader.get_object_tagging().bucket("bkt").key("mp").send().await.unwrap();
+    let err = reader.delete_object_tagging().bucket("bkt").key("mp").send().await.unwrap_err();
+    assert_eq!(code(err), "AccessDenied");
+    let (writer, _) = key_client(&s, &[("bkt", WRITE)], |_| {}).await;
+    writer.delete_object_tagging().bucket("bkt").key("mp").send().await.unwrap();
+}

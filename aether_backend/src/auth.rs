@@ -136,6 +136,8 @@ fn required(operation: &str) -> Required {
         }
         "ListMultipartUploads" | "ListParts" => Required::ReadOrWrite,
         "PutObject"
+        | "PutObjectTagging"
+        | "DeleteObjectTagging"
         | "DeleteObject"
         | "DeleteObjects"
         | "CopyObject"

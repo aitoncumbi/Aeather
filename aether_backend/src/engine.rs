@@ -218,6 +218,13 @@ impl Engine {
         }
     }
 
+    /// Replaces an object's tags; an empty map removes them.
+    pub async fn set_object_tags(&self, bucket: &str, key: &str, tags: BTreeMap<String, String>) -> Result<()> {
+        let command = Command::SetObjectTags { bucket: bucket.to_owned(), key: key.to_owned(), tags };
+        self.apply(command).await?;
+        Ok(())
+    }
+
     /// Replaces the bucket's CORS rules; an empty list removes them.
     pub async fn set_bucket_cors(&self, name: &str, rules: Vec<CorsRule>) -> Result<()> {
         self.apply(Command::SetBucketCors { bucket: name.to_owned(), rules }).await?;

@@ -117,6 +117,9 @@ pub struct ObjectAttrs {
     /// `COMPOSITE` or `FULL_OBJECT` for multipart checksums; `None` otherwise.
     #[serde(default)]
     pub checksum_type: Option<String>,
+    /// Object tags (S3 allows up to 10).
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
