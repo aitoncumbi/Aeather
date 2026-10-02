@@ -84,7 +84,7 @@ export function SignIn() {
             <h1 style={{ fontSize: 24, fontWeight: 600, letterSpacing: "-0.02em" }}>Sign in to Aether</h1>
             <p className="muted">
               Use the root key or an admin key. The secret is checked once; this browser keeps only a session, which
-              ends when you sign out or after 12 hours without use.
+              ends when you sign out or after 15 minutes without use.
             </p>
           </div>
         </div>

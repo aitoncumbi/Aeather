@@ -576,7 +576,7 @@ async fn require_admin(State(s): State<AdminState>, mut req: Request, next: Next
             None => return ApiError::unauthorized(browser).into_response(),
         }
     } else if let Some(token) = session::token(req.headers()) {
-        let Some(id) = s.sessions.resolve(&token) else {
+        let Some(id) = s.sessions.resolve(&token, !session::is_background(req.headers())) else {
             return ApiError::unauthorized(browser).into_response();
         };
         let safe = matches!(*req.method(), Method::GET | Method::HEAD);

@@ -19,9 +19,12 @@ pub const COOKIE: &str = "aether_session";
 /// cookie-authenticated writes rules out cross-site request forgery even
 /// where SameSite cookies are not enforced.
 pub const CONSOLE_HEADER: &str = "x-aether-console";
+/// The console marks its timed refreshes with this header. They do not count
+/// as use, so an open but unattended tab still signs out after `IDLE`.
+pub const BACKGROUND_HEADER: &str = "x-aether-background";
 
-/// A session ends after this long without a request...
-const IDLE: Duration = Duration::from_secs(12 * 60 * 60);
+/// A session ends after this long without use (PCI DSS 8.2.8 asks for 15 minutes)...
+const IDLE: Duration = Duration::from_secs(15 * 60);
 /// ...and this long after sign-in in any case.
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Old sessions are dropped first once this many exist.
@@ -64,8 +67,8 @@ impl Sessions {
         Ok(token)
     }
 
-    /// The access key a live session belongs to; also marks it as used.
-    pub fn resolve(&self, token: &str) -> Option<String> {
+    /// The access key a live session belongs to; `touch` also marks it as used.
+    pub fn resolve(&self, token: &str, touch: bool) -> Option<String> {
         let now = Instant::now();
         let mut sessions = self.by_token.lock().expect("sessions lock poisoned");
         let session = sessions.get_mut(token)?;
@@ -73,7 +76,9 @@ impl Sessions {
             sessions.remove(token);
             return None;
         }
-        session.last_used = now;
+        if touch {
+            session.last_used = now;
+        }
         Some(session.access_key_id.clone())
     }
 
@@ -108,6 +113,10 @@ pub fn from_console(headers: &HeaderMap) -> bool {
     headers.contains_key(CONSOLE_HEADER)
 }
 
+pub fn is_background(headers: &HeaderMap) -> bool {
+    headers.contains_key(BACKGROUND_HEADER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,11 +126,11 @@ mod tests {
         let sessions = Sessions::default();
         let token = sessions.create("AK1").unwrap();
         assert_eq!(token.len(), 43);
-        assert_eq!(sessions.resolve(&token).as_deref(), Some("AK1"));
+        assert_eq!(sessions.resolve(&token, true).as_deref(), Some("AK1"));
         assert_ne!(sessions.create("AK1").unwrap(), token);
         sessions.remove(&token);
-        assert_eq!(sessions.resolve(&token), None);
-        assert_eq!(sessions.resolve("made-up"), None);
+        assert_eq!(sessions.resolve(&token, true), None);
+        assert_eq!(sessions.resolve("made-up", true), None);
     }
 
     #[test]
@@ -132,6 +141,19 @@ mod tests {
         assert!(session.expired(now + IDLE + Duration::from_secs(1)));
         let busy = Session { last_used: now + MAX_AGE, ..session };
         assert!(busy.expired(now + MAX_AGE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn background_requests_do_not_keep_a_session_alive() {
+        let sessions = Sessions::default();
+        let token = sessions.create("AK1").unwrap();
+        let used = |s: &Sessions| s.by_token.lock().unwrap()[&token].last_used;
+        let before = used(&sessions);
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(sessions.resolve(&token, false).as_deref(), Some("AK1"));
+        assert_eq!(used(&sessions), before);
+        assert_eq!(sessions.resolve(&token, true).as_deref(), Some("AK1"));
+        assert!(used(&sessions) > before);
     }
 
     #[test]

@@ -123,9 +123,9 @@ explaining how to build it; `admin.console = false` turns it off.
 
 - **Sign-in.** Any admin key signs in. `POST /api/v1/login` checks the secret
   and sets a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` with admin
-  TLS). Sessions live in memory: they end on sign-out, after 12 hours idle,
-  after 7 days, on restart, or as soon as the key is disabled, deleted or loses
-  admin. Browsers keep no secret.
+  TLS). Sessions live in memory: they end on sign-out, after 15 minutes idle
+  (timed console refreshes do not count), after 7 days, on restart, or as soon
+  as the key is disabled, deleted or loses admin. Browsers keep no secret.
 - **Objects go through the admin API**, not the S3 port: the console works
   wherever the admin port is reachable (including an SSH tunnel), needs no CORS
   rules on buckets, and signs nothing in the browser. Files up to 32 MiB are
