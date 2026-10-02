@@ -15,6 +15,14 @@ updates:
     groups:
       npm:
         patterns: ["*"]
+    ignore:
+      # typescript-eslint (in eslint-config-next) does not support TypeScript 7
+      # yet, and eslint-config-next's React plugin crashes on ESLint 10. Lift
+      # these when they do.
+      - dependency-name: typescript
+        versions: [">=6"]
+      - dependency-name: eslint
+        versions: [">=10"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
