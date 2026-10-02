@@ -118,6 +118,30 @@ code,
   overflow-wrap: anywhere;
 }
 
+/* ---- motion: quick hover fades and a press on buttons, off for reduced motion ---- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .btn,
+  .link-btn,
+  .nav a,
+  .trow,
+  .crumb,
+  .menu button,
+  .segmented button,
+  .perm,
+  .role,
+  .top-row {
+    transition:
+      background-color 120ms ease-out,
+      color 120ms ease-out,
+      transform 80ms ease-out;
+  }
+  .btn:active:not(:disabled),
+  .perm:active {
+    transform: translateY(1px);
+  }
+}
+
 /* ---- buttons ---- */
 
 .btn {
