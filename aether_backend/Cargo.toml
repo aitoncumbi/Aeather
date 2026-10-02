@@ -51,7 +51,8 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "jso
 uuid = { version = "1.26", features = ["serde", "v4", "v7"] }
 
 [dev-dependencies]
-aws-sdk-s3 = "1"
+# Without the "rustls" feature, which is the legacy client on rustls 0.21.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["query"] }
 sha1 = "0.11"
 rcgen = "0.14"

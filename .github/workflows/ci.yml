@@ -40,6 +40,20 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # RustSec advisories for every crate in Cargo.lock.
+      - run: cargo audit
+      # npm advisories for what the console ships (the lockfile is enough).
+      - run: npm audit --omit=dev
+        working-directory: console
+
   msrv:
     name: minimum Rust version
     runs-on: ubuntu-latest
@@ -81,7 +95,7 @@ jobs:
           retention-days: 7
 
   console:
-    name: web console (typecheck, end-to-end)
+    name: web console (typecheck, lint, end-to-end)
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -97,6 +111,7 @@ jobs:
           cache-dependency-path: console/package-lock.json
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
+      - run: npm run lint -- --max-warnings 0
       - uses: actions/download-artifact@v4
         with:
           name: aether

@@ -32,7 +32,11 @@ export function Shell({ children }: { children: ReactNode }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const pathname = usePathname();
 
-  useEffect(() => setMenuOpen(false), [pathname]);
+  const [menuPath, setMenuPath] = useState(pathname);
+  if (menuPath !== pathname) {
+    setMenuPath(pathname);
+    setMenuOpen(false);
+  }
   useEffect(() => {
     if (!menuOpen) return;
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
@@ -182,6 +186,8 @@ async function signOut() {
   try {
     await api("/logout", { method: "POST", headers: CONSOLE_HEADER });
   } finally {
+    // A full page load, so nothing of the signed-in state survives.
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination
     window.location.assign("/login/");
   }
 }

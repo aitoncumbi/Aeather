@@ -30,6 +30,8 @@ type Transfer = {
   key: string;
   progress: Progress;
   started: number;
+  /** When `progress` last changed. */
+  updated: number;
   state: "running" | "done" | "failed";
   error?: string;
   handle: UploadHandle;
@@ -111,12 +113,21 @@ function Browser({
     const timer = window.setTimeout(() => setQuery(filter), 250);
     return () => window.clearTimeout(timer);
   }, [filter]);
-  useEffect(() => setFilter(""), [prefix]);
+  // Reset during render when the folder changes (not in an effect, which would render twice).
+  const [filterPrefix, setFilterPrefix] = useState(prefix);
+  if (filterPrefix !== prefix) {
+    setFilterPrefix(prefix);
+    setFilter("");
+  }
 
   const first = useApi<ObjectList>(paths.objects(bucket, prefix + query));
   const [more, setMore] = useState<ObjectList[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
-  useEffect(() => setMore([]), [first.data]);
+  const [moreFor, setMoreFor] = useState(first.data);
+  if (moreFor !== first.data) {
+    setMoreFor(first.data);
+    setMore([]);
+  }
   const pages = first.data ? [first.data, ...more] : [];
   const prefixes = pages.flatMap((p) => p.prefixes);
   const objects = pages.flatMap((p) => p.objects);
@@ -147,10 +158,10 @@ function Browser({
       const id = (nextId.current += 1);
       const key = prefix + file.name;
       const update = (patch: Partial<Transfer>) => setTransfers((all) => all.map((t) => (t.id === id ? { ...t, ...patch } : t)));
-      const handle = upload(bucket, key, file, (progress) => update({ progress }));
+      const handle = upload(bucket, key, file, (progress) => update({ progress, updated: Date.now() }));
       setTransfers((all) => [
         ...all,
-        { id, name: file.name, key, progress: { sent: 0, total: file.size }, started: Date.now(), state: "running", handle },
+        { id, name: file.name, key, progress: { sent: 0, total: file.size }, started: Date.now(), updated: Date.now(), state: "running", handle },
       ]);
       handle.done.then(
         () => {
@@ -407,7 +418,7 @@ function BucketSwitcher({ bucket, buckets, onPick }: { bucket: string; buckets: 
 
 function TransferRow({ transfer, onDismiss }: { transfer: Transfer; onDismiss: () => void }) {
   const { progress, state } = transfer;
-  const secs = Math.max(0.5, (Date.now() - transfer.started) / 1000);
+  const secs = Math.max(0.5, (transfer.updated - transfer.started) / 1000);
   const speed = progress.sent / secs;
   const pct = progress.total ? (progress.sent / progress.total) * 100 : 100;
   return (
