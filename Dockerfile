@@ -9,7 +9,7 @@
 # is on the admin port (9001).
 
 # The console is a static export that the server binary embeds.
-FROM node:22-bookworm-slim AS console
+FROM node:26-bookworm-slim AS console
 ENV NEXT_TELEMETRY_DISABLED=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 WORKDIR /console
 COPY console/package.json console/package-lock.json ./
