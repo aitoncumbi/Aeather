@@ -167,7 +167,7 @@ function StoragePanel({ status }: { status: Status | undefined }) {
         <h2 id="disk-title" className="panel-title">
           Storage
         </h2>
-        <span className="panel-sub">
+        <span className="panel-sub wrap-any">
           Data directory <span className="mono">{status?.data_dir ?? "…"}</span>
         </span>
       </div>
