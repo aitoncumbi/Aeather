@@ -1106,3 +1106,28 @@ async fn concurrent_writes_are_committed_together_and_correctly() {
     assert_eq!(engine.bucket_usage("small").await.unwrap().1.objects, 10);
     wait_for_block_files(&engine, 10 * 3).await;
 }
+
+#[tokio::test]
+async fn multipart_parts_are_checked_against_the_quota_as_they_arrive() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    put(&engine, "bkt", "existing", &pattern(1000)).await;
+    engine.set_bucket_quota("bkt", Quota { max_bytes: Some(5000), max_objects: None }).await.unwrap();
+    let id = engine.create_upload("bkt", "mp", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let check = |number: u32, size: u64| engine.precheck_part("bkt", "mp", id, number, Some(size));
+
+    check(1, 2000).await.unwrap();
+    upload_part(&engine, "mp", id, 1, &pattern(2000)).await;
+    // 1000 stored + 2000 uploaded + 2500 more is past 5000: refused before the body is read.
+    assert!(matches!(check(2, 2500).await, Err(Error::QuotaExceeded(_))));
+    check(2, 2000).await.unwrap();
+    // Re-sending part 1 replaces it rather than adding to it.
+    check(1, 3500).await.unwrap();
+    assert!(matches!(check(1, 4500).await, Err(Error::QuotaExceeded(_))));
+    // Overwriting an existing object counts only the difference.
+    let over = engine.create_upload("bkt", "existing", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    engine.precheck_part("bkt", "existing", over, 1, Some(3000)).await.unwrap();
+    // Without a quota, nothing is checked.
+    engine.set_bucket_quota("bkt", Quota::default()).await.unwrap();
+    check(2, 1 << 40).await.unwrap();
+}

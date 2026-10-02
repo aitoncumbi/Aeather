@@ -658,6 +658,21 @@ impl MetaStore {
         load_upload(&txn.open_table(UPLOADS)?, &bucket, key, upload_id)
     }
 
+    /// Total size of an upload's parts, leaving out part `except`.
+    pub fn upload_bytes(&self, upload_id: &Uuid, except: u32) -> Result<u64> {
+        let txn = self.db.begin_read()?;
+        let parts = txn.open_table(PARTS)?;
+        let (start, end) = (part_key(upload_id, 0), part_key(upload_id, u32::MAX));
+        let mut total = 0;
+        for entry in parts.range::<&[u8]>(start.as_slice()..=end.as_slice())? {
+            let (k, v) = entry?;
+            if parse_part_number(k.value()) != Some(except) {
+                total += codec::decode::<PartRecord>(v.value())?.size;
+            }
+        }
+        Ok(total)
+    }
+
     /// Parts with numbers greater than `after`, in order, up to `max`.
     pub fn list_parts(&self, bucket: &str, key: &str, upload_id: &Uuid, after: u32, max: usize) -> Result<PartsPage> {
         let txn = self.db.begin_read()?;

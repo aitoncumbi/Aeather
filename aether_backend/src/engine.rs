@@ -254,6 +254,36 @@ impl Engine {
         .await
     }
 
+    /// Early quota check for one part of a multipart upload: would the object,
+    /// with this part and the parts already uploaded, fit? Refuses an upload
+    /// that cannot fit at the first part past the limit, not at completion,
+    /// which stays the authoritative check.
+    pub async fn precheck_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: Uuid,
+        part_number: u32,
+        size: Option<u64>,
+    ) -> Result<()> {
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        self.read(move |meta| {
+            let (record, used) = meta.bucket_usage(&bucket)?;
+            meta.get_upload(&bucket, &key, &upload_id)?;
+            if record.quota == Quota::default() {
+                return Ok(());
+            }
+            let existing = match meta.get_object(&bucket, &key) {
+                Ok(object) => Some(object.size),
+                Err(Error::NoSuchKey) => None,
+                Err(e) => return Err(e),
+            };
+            let total = meta.upload_bytes(&upload_id, part_number)? + size.unwrap_or(0);
+            record.quota.check(used, usage_after(used, Some(total), existing))
+        })
+        .await
+    }
+
     /// Streams a body into durable blocks (or an inline buffer) without
     /// committing it. Dropping the result deletes the blocks.
     pub async fn stage<S, E>(&self, body: S) -> Result<StagedObject>

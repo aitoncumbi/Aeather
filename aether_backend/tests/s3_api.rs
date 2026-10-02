@@ -1278,3 +1278,28 @@ async fn virtual_hosted_style_requests_address_buckets() {
     assert_eq!(res.status(), 200);
     assert_eq!(res.headers()["access-control-allow-origin"], "https://app.example.com");
 }
+
+#[tokio::test]
+async fn multipart_uploads_stop_at_the_first_part_past_the_quota() {
+    let s = start().await;
+    s.client.create_bucket().bucket("capped").send().await.unwrap();
+    let quota = aether_backend::meta::Quota { max_bytes: Some(8 * 1024 * 1024), max_objects: None };
+    s.engine.set_bucket_quota("capped", quota).await.unwrap();
+    let upload = s.client.create_multipart_upload().bucket("capped").key("big").send().await.unwrap();
+    let id = upload.upload_id().unwrap();
+    let part = |n: i32| {
+        s.client
+            .upload_part()
+            .bucket("capped")
+            .key("big")
+            .upload_id(id)
+            .part_number(n)
+            .body(ByteStream::from(pattern(5 * 1024 * 1024)))
+            .send()
+    };
+    part(1).await.unwrap();
+    let err = part(2).await.unwrap_err();
+    assert_eq!(code(err), "QuotaExceeded");
+    let parts = s.client.list_parts().bucket("capped").key("big").upload_id(id).send().await.unwrap();
+    assert_eq!(parts.parts().len(), 1);
+}

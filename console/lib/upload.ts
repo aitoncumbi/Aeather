@@ -71,7 +71,8 @@ export function upload(bucket: string, key: string, file: File, onProgress: (p: 
     const count = Math.ceil(file.size / size);
     const created = await api<{ upload_id: string }>(paths.uploads(bucket), {
       method: "POST",
-      json: { key, content_type: contentType },
+      // The size lets the server refuse a file that breaks the quota before any part is sent.
+      json: { key, content_type: contentType, size: file.size },
     });
     uploadId = created.upload_id;
     if (cancelled) throw new ApiError(0, "Cancelled", "Cancelled");
