@@ -64,8 +64,13 @@ storage-specific:
   (current AWS SDKs send CRC32 checksums in aws-chunked trailers by default).
 - Mapping engine errors to S3 error codes. Error bodies carry the request id
   (`<RequestId>`), as SDKs expect.
-- Path-style addressing (`/bucket/key`). Virtual-hosted style
-  (`bucket.s3.example.com`, with a configured base domain) is planned for v1.1.
+- Path-style (`/bucket/key`) and virtual-hosted-style addressing
+  (`bucket.s3.example.com/key`). With base domains in `s3.domains`, a host
+  that is a subdomain of one names the bucket; every other host (the domain
+  itself, an IP address, `localhost`) is path-style. Unlike `s3s`'s own host
+  parsers, ours never takes an unknown host for a bucket (CNAME style) and
+  never rejects one, so adding a domain cannot break clients that reach the
+  server another way. The CORS layer finds the bucket the same way.
 - Answering the calls that clients and tools make on every bucket, for features
   that do not exist yet, the way S3 answers for a bucket that does not use
   them: `ListObjectVersions` lists every object as version `null`,

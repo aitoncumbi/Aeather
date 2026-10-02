@@ -16,9 +16,16 @@ use axum::response::Response;
 use s3s::dto::{CORSConfiguration, CORSRule};
 use s3s::{S3Result, s3_error};
 
+use super::host::Domains;
 use crate::engine::Engine;
 use crate::meta::CorsRule;
 use crate::observe::RequestFacts;
+
+#[derive(Clone)]
+pub struct CorsState {
+    pub engine: Arc<Engine>,
+    pub domains: Domains,
+}
 
 /// S3's limit on rules per bucket.
 const MAX_RULES: usize = 100;
@@ -103,22 +110,17 @@ fn matching<'a>(rules: &'a [CorsRule], origin: &str, method: &str, headers: &[St
     })
 }
 
-/// The bucket a path-style request addresses, if any.
-fn bucket_of(path: &str) -> Option<&str> {
-    let name = path.strip_prefix('/')?.split('/').next()?;
-    // Empty: the service root. `_`: the health endpoints, not a bucket.
-    (!name.is_empty() && !name.starts_with('_')).then_some(name)
-}
-
-pub async fn layer(State(engine): State<Arc<Engine>>, req: Request, next: Next) -> Response {
-    let Some(bucket) = bucket_of(req.uri().path()).map(str::to_owned) else {
+pub async fn layer(State(state): State<CorsState>, req: Request, next: Next) -> Response {
+    let engine = &state.engine;
+    let host = header_str(req.headers(), header::HOST).or_else(|| req.uri().host());
+    let Some(bucket) = state.domains.bucket_of(host, req.uri().path()) else {
         return next.run(req).await;
     };
     if req.method() == Method::OPTIONS {
         if let Some(facts) = req.extensions().get::<RequestFacts>() {
             facts.record_operation("CorsPreflight");
         }
-        return preflight(&engine, &bucket, req.headers()).await;
+        return preflight(engine, &bucket, req.headers()).await;
     }
     let Some(origin) = header_str(req.headers(), header::ORIGIN).map(str::to_owned) else {
         return next.run(req).await;
@@ -242,14 +244,6 @@ mod tests {
         assert_eq!(matching(&rules, "https://app.example.com", "GET", &headers(&["authorization"])), None);
         assert_eq!(matching(&rules, "https://app.example.com", "DELETE", &[]), None);
         assert_eq!(matching(&rules, "https://other.net", "GET", &[]), None);
-    }
-
-    #[test]
-    fn requests_are_mapped_to_buckets() {
-        assert_eq!(bucket_of("/photos/2026/a.jpg"), Some("photos"));
-        assert_eq!(bucket_of("/photos"), Some("photos"));
-        assert_eq!(bucket_of("/"), None);
-        assert_eq!(bucket_of("/_aether/health/live"), None);
     }
 
     #[test]

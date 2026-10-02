@@ -1207,3 +1207,74 @@ async fn bucket_cors_lets_browsers_upload_with_presigned_urls() {
     let res = http.request(reqwest::Method::OPTIONS, url("/web/k")).send().await.unwrap();
     assert_eq!(res.status(), 400);
 }
+
+#[tokio::test]
+async fn virtual_hosted_style_requests_address_buckets() {
+    aether_backend::http::tls::install_crypto_provider();
+    let s = start_with(|c| c.s3.domains = vec!["s3.test".into()]).await;
+    let port = s.addr.port();
+    // The SDK addresses buckets as subdomains; a resolver override sends them here.
+    let vhost = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .endpoint_url(format!("http://s3.test:{port}"))
+        .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test"))
+        .build();
+    let vhost = Client::from_conf(vhost);
+    let http = reqwest::Client::builder()
+        .resolve("s3.test", s.addr)
+        .resolve("bkt.s3.test", s.addr)
+        .resolve("other.s3.test", s.addr)
+        .build()
+        .unwrap();
+    let presign = || PresigningConfig::expires_in(Duration::from_secs(300)).unwrap();
+
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+    let put = vhost.put_object().bucket("bkt").key("a/b.txt").presigned(presign()).await.unwrap();
+    assert!(put.uri().starts_with(&format!("http://bkt.s3.test:{port}/a/b.txt")), "{}", put.uri());
+    let res = http.put(put.uri()).body("virtual").send().await.unwrap();
+    assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
+
+    // The same object is reachable path-style, by IP and through the base domain.
+    assert_eq!(get_bytes(&s.client, "bkt", "a/b.txt").await, b"virtual");
+    let get = vhost.get_object().bucket("bkt").key("a/b.txt").presigned(presign()).await.unwrap();
+    assert_eq!(http.get(get.uri()).send().await.unwrap().text().await.unwrap(), "virtual");
+    // Path-style through the base domain itself.
+    let base_get = Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .endpoint_url(format!("http://s3.test:{port}"))
+            .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test"))
+            .force_path_style(true)
+            .build(),
+    )
+    .get_object()
+    .bucket("bkt")
+    .key("a/b.txt")
+    .presigned(presign())
+    .await
+    .unwrap();
+    assert_eq!(http.get(base_get.uri()).send().await.unwrap().text().await.unwrap(), "virtual");
+
+    // A missing bucket in the host is NoSuchBucket, as in S3.
+    let missing = vhost.get_object().bucket("other").key("k").presigned(presign()).await.unwrap();
+    let res = http.get(missing.uri()).send().await.unwrap();
+    assert_eq!(res.status(), 404);
+    assert!(res.text().await.unwrap().contains("NoSuchBucket"));
+
+    // CORS finds the bucket in the host too.
+    use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
+    let rule = CorsRule::builder().allowed_origins("https://app.example.com").allowed_methods("PUT").build().unwrap();
+    let config = CorsConfiguration::builder().cors_rules(rule).build().unwrap();
+    s.client.put_bucket_cors().bucket("bkt").cors_configuration(config).send().await.unwrap();
+    let res = http
+        .request(reqwest::Method::OPTIONS, format!("http://bkt.s3.test:{port}/a/b.txt"))
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "PUT")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["access-control-allow-origin"], "https://app.example.com");
+}

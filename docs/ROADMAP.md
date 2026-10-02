@@ -72,7 +72,7 @@ anything from a 1 KB document to a 100 GB file.
   at a time; see [BENCHMARKS.md](BENCHMARKS.md))
 - [x] Per-bucket CORS (needed for browser uploads with presigned URLs)
 - [x] Bucket quotas
-- [ ] Virtual-hosted-style addressing
+- [x] Virtual-hosted-style addressing
 
 ## v2: data protection
 - [ ] Bucket versioning: enable/suspend, version listing, delete markers, GET/DELETE by version
