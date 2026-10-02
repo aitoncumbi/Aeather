@@ -173,6 +173,14 @@ async fn metrics_describe_traffic_and_usage() {
     client.put_object().bucket("bkt").key("k").body(ByteStream::from(vec![7u8; 10_000])).send().await.unwrap();
     client.get_object().bucket("bkt").key("k").send().await.unwrap().body.collect().await.unwrap();
     assert!(client.get_object().bucket("bkt").key("missing").send().await.is_err());
+    let quota = reqwest::Client::new()
+        .put(format!("http://{}/api/v1/buckets/bkt/quota", server.admin))
+        .basic_auth(ROOT_KEY, Some(ROOT_SECRET))
+        .json(&serde_json::json!({ "max_bytes": 50_000 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(quota.status(), 200);
 
     let response = reqwest::get(format!("http://{}/metrics", server.admin)).await.unwrap();
     assert_eq!(response.status(), 200, "no credentials needed");
@@ -184,6 +192,7 @@ async fn metrics_describe_traffic_and_usage() {
         r#"aether_http_request_duration_seconds_count{api="s3",operation="GetObject"} 2"#,
         r#"aether_bucket_objects{bucket="bkt"} 1"#,
         r#"aether_bucket_bytes{bucket="bkt"} 10000"#,
+        r#"aether_bucket_quota_bytes{bucket="bkt"} 50000"#,
         "aether_received_bytes_total 10000",
         "aether_sent_bytes_total 10000",
         "aether_buckets 1",

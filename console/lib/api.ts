@@ -23,9 +23,13 @@ export type Bucket = {
   objects: number;
   bytes: number;
   key_count: number;
+  quota: Quota;
   keys?: BucketKey[];
   cors?: CorsRule[];
 };
+
+/** `null` is no limit. */
+export type Quota = { max_bytes: number | null; max_objects: number | null };
 
 export type CorsRule = {
   id?: string | null;

@@ -242,7 +242,7 @@ function BucketDetail({
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         <span className="section-label">Settings</span>
         <div className="ruled-list">
-          <PlannedSetting title="Quota" hint="No limit" when="v1.1" />
+          <QuotaSetting bucket={b} onChanged={detail.reload} />
           <CorsSetting rules={b?.cors} />
           <PlannedSetting title="Versioning" hint="Not available until v2" when="v2" />
         </div>
@@ -278,6 +278,109 @@ function BucketDetail({
         }}
       />
     </section>
+  );
+}
+
+function QuotaSetting({ bucket, onChanged }: { bucket: Bucket | undefined; onChanged: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const q = bucket?.quota;
+  const limits = [
+    q?.max_bytes != null && `${bytes(bucket!.bytes)} of ${bytes(q.max_bytes)}`,
+    q?.max_objects != null && `${count(bucket!.objects)} of ${count(q.max_objects)} objects`,
+  ].filter(Boolean);
+  return (
+    <div className="row">
+      <div className="row-text">
+        <span className="row-title">Quota</span>
+        <span className="row-hint">{!bucket ? " " : limits.length ? limits.join(" · ") : "No limit"}</span>
+      </div>
+      <button type="button" className="btn btn-sm" disabled={!bucket} onClick={() => setEditing(true)}>
+        Edit
+      </button>
+      {bucket && (
+        <QuotaDialog
+          key={String(editing)}
+          open={editing}
+          bucket={bucket}
+          onClose={() => setEditing(false)}
+          onSaved={onChanged}
+        />
+      )}
+    </div>
+  );
+}
+
+const GB = 1e9;
+
+function QuotaDialog({ open, bucket, onClose, onSaved }: { open: boolean; bucket: Bucket; onClose: () => void; onSaved: () => void }) {
+  const [size, setSize] = useState(bucket.quota.max_bytes == null ? "" : String(bucket.quota.max_bytes / GB));
+  const [objects, setObjects] = useState(bucket.quota.max_objects == null ? "" : String(bucket.quota.max_objects));
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const notify = useToast();
+  const sizeOk = size.trim() === "" || Number(size) > 0;
+  const objectsOk = objects.trim() === "" || (Number.isInteger(Number(objects)) && Number(objects) > 0);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setError(null);
+    try {
+      const quota = {
+        max_bytes: size.trim() === "" ? null : Math.round(Number(size) * GB),
+        max_objects: objects.trim() === "" ? null : Number(objects),
+      };
+      await api(`${paths.bucket(bucket.name)}/quota`, { method: "PUT", json: quota });
+      notify(`Updated the quota of ${bucket.name}.`);
+      onSaved();
+      onClose();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onClose={onClose} labelledBy="quota-title">
+      <form onSubmit={submit}>
+        <DialogHead
+          id="quota-title"
+          title="Bucket quota"
+          sub="Uploads that would go past a limit are refused. Leave a field empty for no limit."
+          onClose={onClose}
+        />
+        <div className="dialog-body">
+          <label className="label">
+            Largest total size, in GB
+            <span className="field field-lg">
+              <input inputMode="decimal" value={size} onChange={(e) => setSize(e.target.value)} placeholder="No limit" aria-invalid={!sizeOk} />
+            </span>
+            <span className="hint">Now {bytes(bucket.bytes)}.</span>
+          </label>
+          <label className="label">
+            Most objects
+            <span className="field field-lg">
+              <input inputMode="numeric" value={objects} onChange={(e) => setObjects(e.target.value)} placeholder="No limit" aria-invalid={!objectsOk} />
+            </span>
+            <span className="hint">Now {count(bucket.objects)}.</span>
+          </label>
+          {error && (
+            <p className="error-text" role="alert">
+              {error}
+            </p>
+          )}
+        </div>
+        <div className="dialog-foot">
+          <button type="button" className="btn" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={!sizeOk || !objectsOk || busy}>
+            {busy ? "Saving…" : "Save quota"}
+          </button>
+        </div>
+      </form>
+    </Dialog>
   );
 }
 

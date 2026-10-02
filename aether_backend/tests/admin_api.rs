@@ -206,6 +206,15 @@ async fn buckets_and_usage() {
     assert_eq!(detail["keys"][0]["access_key_id"], viewer["access_key_id"]);
     assert_eq!(detail["keys"][0]["read"], true);
     assert_eq!(detail["cors"], json!([]));
+    assert_eq!(detail["quota"], json!({ "max_bytes": null, "max_objects": null }));
+    let quota = json!({ "max_bytes": 5000, "max_objects": null });
+    let (status, view) = s.call(Method::PUT, "/api/v1/buckets/media/quota", Some(quota.clone())).await;
+    assert_eq!((status, &view["quota"]), (StatusCode::OK, &quota));
+    let (_, buckets) = s.call(Method::GET, "/api/v1/buckets", None).await;
+    assert_eq!(buckets[0]["quota"], quota);
+    let (status, _) = s.call(Method::PUT, "/api/v1/buckets/missing/quota", Some(quota)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    s.call(Method::PUT, "/api/v1/buckets/media/quota", Some(json!({}))).await;
     let rule = aws_sdk_s3::types::CorsRule::builder().allowed_origins("https://app.example.com").allowed_methods("PUT");
     let config = aws_sdk_s3::types::CorsConfiguration::builder().cors_rules(rule.build().unwrap()).build().unwrap();
     root.put_bucket_cors().bucket("media").cors_configuration(config).send().await.unwrap();
@@ -272,6 +281,24 @@ async fn cli_manages_keys_and_buckets() {
     assert!(err.contains("NoSuchBucket"), "{err}");
     let (ok, _, err) = s.cli(&["key", "grant", &id, "reports", "rx"]).await;
     assert!(!ok && err.contains("unknown permission"), "{err}");
+
+    // Quotas: set one limit, then the other (the first is kept), then clear.
+    let (ok, out, err) = s.cli(&["bucket", "quota", "reports", "--max-bytes", "10KiB"]).await;
+    assert!(ok, "{err}");
+    assert!(out.contains("Quota:   10.0 KiB\n"), "{out}");
+    let (ok, out, _) = s.cli(&["bucket", "quota", "reports", "--max-objects", "1"]).await;
+    assert!(ok && out.contains("Quota:   10.0 KiB, 1 objects\n"), "{out}");
+    s.cli(&["key", "enable", &id]).await;
+    s.cli(&["key", "grant", &id, "reports", "rw"]).await;
+    let err = app.put_object().bucket("reports").key("q4.csv").body(ByteStream::from_static(b"c\n")).send().await;
+    let err = err.unwrap_err();
+    assert_eq!(err.raw_response().map(|r| r.status().as_u16()), Some(403));
+    assert_eq!(aws_sdk_s3::error::ProvideErrorMetadata::code(&err), Some("QuotaExceeded"));
+    let (ok, out, _) = s.cli(&["bucket", "quota", "reports", "--clear"]).await;
+    assert!(ok && out.contains("Quota:   none\n"), "{out}");
+    app.put_object().bucket("reports").key("q4.csv").body(ByteStream::from_static(b"c\n")).send().await.unwrap();
+    let (ok, _, err) = s.cli(&["bucket", "quota", "reports", "--max-bytes", "lots"]).await;
+    assert!(!ok && err.contains("invalid limit"), "{err}");
 
     let (ok, out, _) = s.cli(&["key", "delete", &id]).await;
     assert!(ok);

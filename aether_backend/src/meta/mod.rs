@@ -20,6 +20,7 @@ use uuid::Uuid;
 pub use self::keys::prefix_successor;
 use self::keys::{gc_key, object_key, parse_gc_key, parse_part_number, parse_upload_key, part_key, upload_key};
 pub use self::types::*;
+pub use self::usage::replaced as usage_after;
 use crate::error::{Error, Result};
 
 /// bucket name → `BucketRecord`
@@ -154,6 +155,11 @@ pub enum Command {
         bucket: String,
         rules: Vec<CorsRule>,
     },
+    /// Replaces a bucket's quota. Usage already over a new limit is kept.
+    SetBucketQuota {
+        bucket: String,
+        quota: Quota,
+    },
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -214,9 +220,9 @@ impl MetaStore {
                 if buckets.get(name.as_str())?.is_some() {
                     return Err(Error::BucketAlreadyExists);
                 }
-                let record = BucketRecord { id, name, created_at, cors: Vec::new() };
+                let record = BucketRecord { id, name, created_at, cors: Vec::new(), quota: Quota::default() };
                 buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &record.id, None, None)?;
+                usage::adjust(&txn, &record, None, None)?;
                 if let Some(owner) = owner {
                     let mut keys = txn.open_table(ACCESS_KEYS)?;
                     let mut key = load_key(&keys, &owner)?;
@@ -269,7 +275,7 @@ impl MetaStore {
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
                 condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
+                usage::adjust(&txn, &bucket, Some(&record), previous.as_ref())?;
 
                 let mut blocks = txn.open_table(BLOCKS)?;
                 let mut gc = txn.open_table(GC_QUEUE)?;
@@ -331,7 +337,7 @@ impl MetaStore {
                 condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
                 drop(objects);
-                usage::adjust(&txn, &bucket.id, Some(&record), previous.as_ref())?;
+                usage::adjust(&txn, &bucket, Some(&record), previous.as_ref())?;
 
                 // The object takes over the references held by the parts it uses.
                 let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
@@ -377,7 +383,7 @@ impl MetaStore {
                     objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
                 condition.check(previous.as_ref())?;
                 objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-                usage::adjust(&txn, &dst_bucket.id, Some(&record), previous.as_ref())?;
+                usage::adjust(&txn, &dst_bucket, Some(&record), previous.as_ref())?;
 
                 // Add references before releasing the previous object: when copying
                 // an object onto itself they are the same blocks.
@@ -452,6 +458,13 @@ impl MetaStore {
                 let mut buckets = txn.open_table(BUCKETS)?;
                 let mut record = load_bucket(&buckets, &bucket)?;
                 record.cors = rules;
+                buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+                Outcome::Bucket(record)
+            }
+            Command::SetBucketQuota { bucket, quota } => {
+                let mut buckets = txn.open_table(BUCKETS)?;
+                let mut record = load_bucket(&buckets, &bucket)?;
+                record.quota = quota;
                 buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
                 Outcome::Bucket(record)
             }
@@ -888,7 +901,7 @@ fn delete_object(
         objects.remove(okey.as_slice())?;
     }
     if let Some(prev) = &previous {
-        usage::adjust(txn, &bucket.id, None, Some(prev))?;
+        usage::adjust(txn, bucket, None, Some(prev))?;
         let mut blocks = txn.open_table(BLOCKS)?;
         let mut gc = txn.open_table(GC_QUEUE)?;
         release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;

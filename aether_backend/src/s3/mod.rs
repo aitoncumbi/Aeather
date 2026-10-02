@@ -270,7 +270,8 @@ impl S3 for AetherS3 {
         // and ignored: access is governed by access keys, not ACLs.
 
         let condition = write_condition(input.if_match.as_ref(), input.if_none_match.as_ref())?;
-        self.engine.precheck_put(&input.bucket, &input.key, &condition).await.map_err(s3_error)?;
+        let size = input.content_length.and_then(|n| u64::try_from(n).ok());
+        self.engine.precheck_put(&input.bucket, &input.key, &condition, size).await.map_err(s3_error)?;
 
         let (bucket, key, body) = (input.bucket.clone(), input.key.clone(), input.body);
         let (algorithm, content_md5) = (input.checksum_algorithm.clone(), input.content_md5.clone());

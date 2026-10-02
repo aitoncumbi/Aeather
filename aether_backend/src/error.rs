@@ -52,6 +52,9 @@ pub enum Error {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
+    #[error("{0}")]
+    QuotaExceeded(String),
+
     #[error("the client sent no data for too long")]
     BodyTimeout,
 

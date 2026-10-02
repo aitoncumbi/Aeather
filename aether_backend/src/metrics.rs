@@ -190,14 +190,25 @@ impl Metrics {
 
         let usage = self.engine.list_bucket_usage().await?;
         let (objects, bytes) = (Family::<BucketLabels, Gauge>::default(), Family::<BucketLabels, Gauge>::default());
+        // Only buckets with that limit, so `bucket_bytes / bucket_quota_bytes` alerts work as is.
+        let (quota_objects, quota_bytes) =
+            (Family::<BucketLabels, Gauge>::default(), Family::<BucketLabels, Gauge>::default());
         for (bucket, used) in &usage {
             let labels = BucketLabels { bucket: bucket.name.clone() };
             objects.get_or_create(&labels).set(clamp(used.objects));
             bytes.get_or_create(&labels).set(clamp(used.bytes));
+            if let Some(max) = bucket.quota.max_objects {
+                quota_objects.get_or_create(&labels).set(clamp(max));
+            }
+            if let Some(max) = bucket.quota.max_bytes {
+                quota_bytes.get_or_create(&labels).set(clamp(max));
+            }
         }
         registry.register("buckets", "Number of buckets", gauge(usage.len() as u64));
         registry.register("bucket_objects", "Objects per bucket", objects);
         registry.register("bucket_bytes", "Stored bytes per bucket (object sizes)", bytes);
+        registry.register("bucket_quota_objects", "Object limit of buckets that have one", quota_objects);
+        registry.register("bucket_quota_bytes", "Size limit in bytes of buckets that have one", quota_bytes);
         registry.register(
             "blocks",
             "Block files referenced or awaiting deletion",

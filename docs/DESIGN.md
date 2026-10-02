@@ -111,7 +111,8 @@ neither has a private backdoor.
 | `GET, PATCH, DELETE /api/v1/keys/{id}` | Show, update (name, admin, can_create_buckets, disabled), delete |
 | `PUT, DELETE /api/v1/keys/{id}/buckets/{bucket}` | Set or remove a key's permissions on a bucket |
 | `GET, POST /api/v1/buckets` | List buckets with usage; create one |
-| `GET, DELETE /api/v1/buckets/{name}` | Usage and the keys with access; delete an empty bucket |
+| `GET, DELETE /api/v1/buckets/{name}` | Usage, quota, CORS rules and the keys with access; delete an empty bucket |
+| `PUT /api/v1/buckets/{name}/quota` | Set the quota: `{"max_bytes": n \| null, "max_objects": n \| null}` |
 | `GET /api/v1/buckets/{name}/objects` | List objects: `prefix`, `delimiter`, `continuation`, `max_keys` |
 | `GET, PUT, DELETE /api/v1/buckets/{name}/object?key=` | Object details (storage, parts, checksums, metadata); upload; delete |
 | `GET /api/v1/buckets/{name}/object/download?key=` | The object's data, as an attachment |
@@ -121,6 +122,15 @@ neither has a private backdoor.
 | `GET /api/v1/health` | Whether the node is ready, without credentials (for the sign-in page) |
 
 Errors are `{"error": {"code": "...", "message": "..."}}` with a matching HTTP status.
+
+**Bucket quotas** limit a bucket's total size and object count (S3 has no
+quota API, so they are set here). They are enforced where usage is counted,
+inside the write's own transaction, so concurrent writers cannot overshoot.
+A write fails with `QuotaExceeded` (HTTP 403, the code Ceph's S3 server
+uses) when it would take usage past a limit; writes that do not grow usage
+pass even when a lowered limit is already exceeded, so space can be freed.
+PUTs that declare their size are refused before the body is read. Multipart
+uploads are checked when completed, since only then is their size known.
 
 ### Web console
 
@@ -162,7 +172,7 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 
 | Table | Key | Value |
 |---|---|---|
-| `buckets` | bucket name | `BucketRecord` (id, created_at, CORS rules) |
+| `buckets` | bucket name | `BucketRecord` (id, created_at, CORS rules, quota) |
 | `objects` | bucket_id (16 B) ‖ object key bytes | `ObjectRecord` |
 | `blocks` | block_id (16 B) | reference count |
 | `gc_queue` | due_at (u64 BE) ‖ block_id | – |
@@ -354,7 +364,7 @@ are read from the engine at scrape time.
 | `aether_http_requests_total` | `api`, `operation`, `status` |
 | `aether_http_request_duration_seconds` | `api`, `operation` |
 | `aether_received_bytes_total`, `aether_sent_bytes_total` | |
-| `aether_bucket_objects`, `aether_bucket_bytes` | `bucket` |
+| `aether_bucket_objects`, `aether_bucket_bytes`, `aether_bucket_quota_objects`, `aether_bucket_quota_bytes` (buckets with that limit) | `bucket` |
 | `aether_buckets`, `aether_blocks`, `aether_access_keys` | |
 | `aether_disk_available_bytes`, `aether_disk_total_bytes` | |
 | `aether_gc_deleted_blocks_total`, `aether_orphan_removed_blocks_total`, `aether_aborted_uploads_total` | |
