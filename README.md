@@ -7,7 +7,7 @@ servers or containers and need object storage for internal applications.
 > node works with the AWS SDKs, the AWS CLI, boto3 and rclone: multipart uploads,
 > server-side copies, per-application access keys, HTTPS, Prometheus metrics, a
 > Docker image and a web console. CI drives those clients against a live server
-> and runs 239 of Ceph's s3-tests. See the [roadmap](docs/ROADMAP.md) for what
+> and runs 247 of Ceph's s3-tests. See the [roadmap](docs/ROADMAP.md) for what
 > comes next.
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
