@@ -582,6 +582,7 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
                 ? "Inline in the metadata record"
                 : `${count(o.blocks)} block${o.blocks === 1 ? "" : "s"} · CRC32C per block`}
               {o.parts > 0 && ` · multipart, ${count(o.parts)} part${o.parts === 1 ? "" : "s"}`}
+              {o.encrypted && " · encrypted at rest (SSE-S3)"}
             </dd>
           </div>
           {Object.entries(o.checksums).map(([alg, value]) => (

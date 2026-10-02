@@ -29,9 +29,7 @@ impl AetherS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        if input.server_side_encryption.is_some() || input.sse_customer_key.is_some() {
-            return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
-        }
+        self.check_sse(input.server_side_encryption.as_ref(), input.sse_customer_key.is_some())?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -51,6 +49,10 @@ impl AetherS3 {
             upload_id: Some(upload_id_string(&upload)),
             checksum_algorithm: upload.checksum_algorithm.as_deref().map(checksum_algorithm),
             checksum_type: upload.checksum_type.clone().map(ChecksumType::from),
+            server_side_encryption: upload
+                .sse
+                .as_ref()
+                .map(|_| ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -79,7 +81,7 @@ impl AetherS3 {
             trailer: headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()),
             trailing_headers,
         };
-        let (staged, checksums) = self.stage_body(body, checks, true).await?;
+        let (staged, checksums) = self.stage_body(body, checks, Some(&upload)).await?;
         let part =
             self.engine.commit_part(&bucket, &key, upload_id, number, staged, checksums).await.map_err(s3_error)?;
 
@@ -373,6 +375,7 @@ fn completed_output(bucket: String, key: String, record: &ObjectRecord) -> Compl
         key: Some(key),
         e_tag: Some(etag(record)),
         checksum_type: stored_checksum_type(&record.attrs),
+        server_side_encryption: sse_of(record),
         ..Default::default()
     };
     set_checksums!(output, checksum_from_map(&record.attrs.checksums));

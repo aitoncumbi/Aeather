@@ -516,6 +516,11 @@ pub fn url_encode(s: &str) -> String {
     out
 }
 
+/// `x-amz-server-side-encryption` for an object encrypted at rest.
+pub fn sse_of(record: &crate::meta::ObjectRecord) -> Option<dto::ServerSideEncryption> {
+    record.sse.as_ref().map(|_| dto::ServerSideEncryption::from_static(dto::ServerSideEncryption::AES256))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

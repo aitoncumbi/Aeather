@@ -25,6 +25,46 @@ pub struct Config {
     pub gc: GcConfig,
     pub scrub: ScrubConfig,
     pub log: LogConfig,
+    pub encryption: EncryptionConfig,
+}
+
+/// Encryption at rest. With a master key, every new object is encrypted.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// 32 random bytes, base64-encoded (`openssl rand -base64 32`). Prefer
+    /// `AETHER_ENCRYPTION__MASTER_KEY` over writing it in the file.
+    pub master_key: Option<Secret>,
+    /// Earlier master keys, still needed to read what they encrypted.
+    pub previous_keys: Vec<Secret>,
+}
+
+impl EncryptionConfig {
+    pub fn keyring(&self) -> Result<Option<crate::crypto::Keyring>, ConfigError> {
+        // Empty counts as unset, as with `AETHER_ENCRYPTION__MASTER_KEY=${KEY:-}` in compose files.
+        let Some(master) = self.master_key.as_ref().filter(|k| !k.expose().trim().is_empty()) else {
+            if self.previous_keys.is_empty() {
+                return Ok(None);
+            }
+            return Err(ConfigError::Invalid("encryption.previous_keys needs encryption.master_key".into()));
+        };
+        let decode = |s: &Secret| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(s.expose().trim())
+                .ok()
+                .filter(|k| k.len() == 32)
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "encryption keys must be 32 bytes, base64-encoded (e.g. `openssl rand -base64 32`)".into(),
+                    )
+                })
+        };
+        let previous = self.previous_keys.iter().map(decode).collect::<Result<Vec<_>, _>>()?;
+        let ring = crate::crypto::Keyring::new(&decode(master)?, &previous)
+            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        Ok(Some(ring))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -289,6 +329,7 @@ impl Config {
         if self.gc.interval_secs == 0 || self.gc.sweep_interval_secs == 0 {
             return invalid("gc.interval_secs and gc.sweep_interval_secs must be positive");
         }
+        self.encryption.keyring()?;
         if self.tls.cert_file.is_some() != self.tls.key_file.is_some() {
             return invalid("tls.cert_file and tls.key_file must be set together");
         }
@@ -326,6 +367,7 @@ impl Config {
             body_timeout: Duration::from_secs(self.http.body_timeout_secs),
             scrub_interval: Duration::from_secs(self.scrub.interval_secs),
             scrub_rate: self.scrub.bytes_per_sec,
+            keyring: self.encryption.keyring().expect("validated when loaded").map(std::sync::Arc::new),
             ..EngineConfig::default()
         }
     }
@@ -394,6 +436,21 @@ mod tests {
                 jail.set_env("AETHER_S3__DOMAINS", bad);
                 assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))), "{bad}");
             }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn encryption_keys_are_validated_and_empty_means_off() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("AETHER_S3__ACCESS_KEY", "admin");
+            jail.set_env("AETHER_S3__SECRET_KEY", "change-me-please");
+            jail.set_env("AETHER_ENCRYPTION__MASTER_KEY", "");
+            assert!(Config::load(None).unwrap().encryption.keyring().unwrap().is_none());
+            jail.set_env("AETHER_ENCRYPTION__MASTER_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
+            assert!(Config::load(None).unwrap().encryption.keyring().unwrap().is_some());
+            jail.set_env("AETHER_ENCRYPTION__MASTER_KEY", "too-short");
+            assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))));
             Ok(())
         });
     }

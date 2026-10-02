@@ -72,6 +72,9 @@ pub struct ObjectDetail {
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     pub checksums: BTreeMap<String, String>,
+    /// Encrypted at rest (SSE-S3).
+    #[serde(default)]
+    pub encrypted: bool,
     /// Number of parts for objects made by a multipart upload, else 0.
     pub parts: usize,
     /// `inline` (stored in the metadata record) or `blocks`.
@@ -192,6 +195,7 @@ pub async fn head(
         user_metadata: attrs.user_metadata.clone(),
         tags: attrs.tags.clone(),
         checksums: attrs.checksums.clone(),
+        encrypted: record.sse.is_some(),
         parts: record.part_sizes.len(),
         storage,
         blocks,
@@ -290,7 +294,8 @@ pub async fn upload_part(
     check_length(&headers, max)?;
     let size = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
     s.engine.precheck_part(&bucket, &key, upload_id, part_number, size).await?;
-    let staged = s.engine.stage_part(limited(body, max)).await?;
+    let upload = s.engine.get_upload(&bucket, &key, upload_id).await?;
+    let staged = s.engine.stage_part(limited(body, max), &upload).await?;
     let part = s.engine.commit_part(&bucket, &key, upload_id, part_number, staged, BTreeMap::new()).await?;
     Ok(Json(PartView { part_number, etag: part.etag, size: part.size }))
 }

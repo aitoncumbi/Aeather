@@ -43,9 +43,10 @@ mod tests {
                 user_metadata: [("k".to_string(), "v".to_string())].into(),
                 ..Default::default()
             },
-            data: ObjectData::Blocks(vec![BlockRef { id: Uuid::new_v4(), len: 3, crc32c: 7 }]),
+            data: ObjectData::Blocks(vec![BlockRef { id: Uuid::new_v4(), len: 3, crc32c: 7, stored_len: None }]),
             part_sizes: vec![3],
             upload_id: Some(Uuid::now_v7()),
+            sse: None,
         };
         let back: ObjectRecord = decode(&encode(&record)).unwrap();
         assert_eq!(back, record);

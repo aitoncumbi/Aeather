@@ -1381,3 +1381,74 @@ async fn object_tags_are_stored_copied_and_permission_checked() {
     let (writer, _) = key_client(&s, &[("bkt", WRITE)], |_| {}).await;
     writer.delete_object_tagging().bucket("bkt").key("mp").send().await.unwrap();
 }
+
+#[tokio::test]
+async fn sse_s3_encrypts_objects_when_a_master_key_is_set() {
+    use aws_sdk_s3::types::ServerSideEncryption;
+    let key = STANDARD.encode([42u8; 32]);
+    let s = start_with(|c| c.encryption.master_key = Some(Secret::from(key.as_str()))).await;
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+
+    // Every object is encrypted, whether or not the client asks.
+    let data = pattern(3 * 1024 * 1024 + 17);
+    let put = s.client.put_object().bucket("bkt").key("big").body(ByteStream::from(data.clone())).send().await.unwrap();
+    assert_eq!(put.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let asked = s
+        .client
+        .put_object()
+        .bucket("bkt")
+        .key("small")
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .body(ByteStream::from_static(b"tiny"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(asked.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    let got = s.client.get_object().bucket("bkt").key("big").range("bytes=1048570-2097160").send().await.unwrap();
+    assert_eq!(got.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(got.body.collect().await.unwrap().into_bytes(), data[1_048_570..=2_097_160]);
+    assert_eq!(get_bytes(&s.client, "bkt", "small").await, b"tiny");
+    let head = s.client.head_object().bucket("bkt").key("big").send().await.unwrap();
+    assert_eq!(head.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+
+    let copy = s.client.copy_object().bucket("bkt").key("copy").copy_source("bkt/big").send().await.unwrap();
+    assert_eq!(copy.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
+    assert_eq!(get_bytes(&s.client, "bkt", "copy").await, data);
+
+    let enc = s.client.get_bucket_encryption().bucket("bkt").send().await.unwrap();
+    let rule = &enc.server_side_encryption_configuration().unwrap().rules()[0];
+    assert_eq!(rule.apply_server_side_encryption_by_default().unwrap().sse_algorithm(), &ServerSideEncryption::Aes256);
+
+    // SSE-KMS and customer keys are refused rather than ignored.
+    let err = s
+        .client
+        .put_object()
+        .bucket("bkt")
+        .key("kms")
+        .server_side_encryption(ServerSideEncryption::AwsKms)
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "NotImplemented");
+
+    // Without a master key, asking for SSE-S3 is refused and nothing is encrypted.
+    let plain = start().await;
+    plain.client.create_bucket().bucket("bkt").send().await.unwrap();
+    let err = plain
+        .client
+        .put_object()
+        .bucket("bkt")
+        .key("k")
+        .server_side_encryption(ServerSideEncryption::Aes256)
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "NotImplemented");
+    let put =
+        plain.client.put_object().bucket("bkt").key("k").body(ByteStream::from_static(b"x")).send().await.unwrap();
+    assert_eq!(put.server_side_encryption(), None);
+    let err = plain.client.get_bucket_encryption().bucket("bkt").send().await.unwrap_err();
+    assert_eq!(code(err), "ServerSideEncryptionConfigurationNotFoundError");
+}
