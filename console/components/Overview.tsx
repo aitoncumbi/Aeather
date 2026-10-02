@@ -15,6 +15,7 @@ import {
   FileIcon,
   RefreshIcon,
   ShieldCheckIcon,
+  ShieldIcon,
   WarningIcon,
 } from "./icons";
 import { DiskMeter, diskShares } from "./Shell";
@@ -359,6 +360,23 @@ function Health({ status, onScrub }: { status: Status | undefined; onScrub: () =
               </span>
               <span className="row-hint">
                 Deleted after a {Math.round(status.gc_grace_secs / 60)} min grace period, so running downloads can finish
+              </span>
+            </div>
+          </div>
+          <div className="health-row">
+            <ShieldIcon size={18} color={status.encryption_key ? "var(--ok)" : "var(--muted)"} />
+            <div className="row-text">
+              <span className="row-title">Encryption at rest: {status.encryption_key ? "on" : "off"}</span>
+              <span className="row-hint">
+                {status.encryption_key ? (
+                  <>
+                    New objects are encrypted (SSE-S3) with master key <span className="mono">{status.encryption_key}</span>.
+                  </>
+                ) : (
+                  <>
+                    Set <span className="mono">encryption.master_key</span> to encrypt new objects.
+                  </>
+                )}
               </span>
             </div>
           </div>

@@ -31,6 +31,7 @@ use uuid::Uuid;
 use self::keys::KeyCache;
 pub use self::keys::NewKey;
 use crate::blocks::{BlockStore, BlockWriter};
+use crate::crypto::{DataKey, FRAME, FrameCipher, Keyring, SealedKey, TAG};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
     BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
@@ -74,6 +75,8 @@ pub struct EngineConfig {
     pub scrub_interval: Duration,
     /// Read rate limit for scrubbing, in bytes per second. Zero means unlimited.
     pub scrub_rate: u64,
+    /// Master keys for encryption at rest. Set: every new object is encrypted.
+    pub keyring: Option<Arc<Keyring>>,
 }
 
 impl Default for EngineConfig {
@@ -91,6 +94,7 @@ impl Default for EngineConfig {
             body_timeout: Duration::from_secs(60),
             scrub_interval: Duration::from_secs(7 * 24 * 60 * 60),
             scrub_rate: 64 * 1024 * 1024,
+            keyring: None,
         }
     }
 }
@@ -136,6 +140,18 @@ impl Engine {
         let meta_path = config.data_dir.join("meta.redb");
         let meta = tokio::task::spawn_blocking(move || MetaStore::open(&meta_path)).await??;
         let blocks = BlockStore::open(&config.data_dir).await?;
+        let missing: Vec<String> = meta
+            .sealing_key_ids()?
+            .into_iter()
+            .filter(|id| !config.keyring.as_ref().is_some_and(|ring| ring.has(id)))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::InvalidArgument(format!(
+                "stored data is encrypted with master key(s) {} (fingerprints), which encryption.master_key and \
+                 encryption.previous_keys do not include; without them it cannot be read",
+                missing.join(", ")
+            )));
+        }
         let keys = KeyCache::default();
         KeyCache::load(&meta, &keys)?;
         let meta = Arc::new(meta);
@@ -298,20 +314,42 @@ impl Engine {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
     {
-        self.stage_with(body, self.config.inline_threshold).await
+        let key = self.new_data_key()?;
+        self.stage_with(body, self.config.inline_threshold, key).await
+    }
+
+    /// A new data key, if encryption at rest is configured.
+    fn new_data_key(&self) -> Result<Option<(DataKey, SealedKey)>> {
+        self.config.keyring.as_ref().map(|ring| ring.new_data_key()).transpose()
+    }
+
+    /// The data key of an encrypted object or upload.
+    fn open_key(&self, sealed: &SealedKey) -> Result<DataKey> {
+        let ring = self.config.keyring.as_ref().ok_or_else(|| {
+            Error::Corrupt(format!("data is encrypted with master key {}, but none is configured", sealed.key_id))
+        })?;
+        ring.open(sealed)
     }
 
     /// Like [`stage`](Self::stage), for a part of a multipart upload. Parts are
     /// never inlined, since the completed object is a sequence of blocks.
-    pub async fn stage_part<S, E>(&self, body: S) -> Result<StagedObject>
+    /// Stages a part of `upload`, encrypted under the upload's data key if it has one.
+    pub async fn stage_part<S, E>(&self, body: S, upload: &UploadRecord) -> Result<StagedObject>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
     {
-        self.stage_with(body, 0).await
+        let key =
+            upload.sse.as_ref().map(|sealed| Ok::<_, Error>((self.open_key(sealed)?, sealed.clone()))).transpose()?;
+        self.stage_with(body, 0, key).await
     }
 
-    async fn stage_with<S, E>(&self, mut body: S, inline_threshold: usize) -> Result<StagedObject>
+    async fn stage_with<S, E>(
+        &self,
+        mut body: S,
+        inline_threshold: usize,
+        key: Option<(DataKey, SealedKey)>,
+    ) -> Result<StagedObject>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
@@ -323,10 +361,12 @@ impl Engine {
             data: ObjectData::Inline(Vec::new()),
             block_ids: Vec::new(),
             committed: false,
+            sse: key.as_ref().map(|(_, sealed)| sealed.clone()),
         };
+        let data_key = key.map(|(data_key, _)| data_key);
         let mut md5 = Md5::new();
         let mut inline = Some(Vec::new());
-        let mut sink = BlockSink { engine: self, writer: None, blocks: Vec::new() };
+        let mut sink = BlockSink { engine: self, writer: None, blocks: Vec::new(), key: data_key.as_ref() };
 
         loop {
             let next = tokio::time::timeout(self.config.body_timeout, body.next()).await;
@@ -348,9 +388,11 @@ impl Engine {
         sink.finish().await?;
 
         staged.md5 = md5.finalize().into();
-        staged.data = match inline {
-            Some(buf) => ObjectData::Inline(buf),
-            None => ObjectData::Blocks(sink.blocks),
+        staged.data = match (inline, &data_key) {
+            // Inline data uses the nil id: the data key is already unique to the object.
+            (Some(buf), Some(data_key)) => ObjectData::Inline(data_key.for_block(&Uuid::nil()).seal_all(&buf)),
+            (Some(buf), None) => ObjectData::Inline(buf),
+            (None, _) => ObjectData::Blocks(sink.blocks),
         };
         Ok(staged)
     }
@@ -375,6 +417,7 @@ impl Engine {
             data: staged.data.clone(),
             part_sizes: Vec::new(),
             upload_id: None,
+            sse: staged.sse.clone(),
         };
         let command = Command::PutObject {
             bucket: bucket.to_owned(),
@@ -475,6 +518,8 @@ impl Engine {
             data: source.data.clone(),
             part_sizes: source.part_sizes.clone(),
             upload_id: None,
+            // The copy shares the source's blocks, so it shares their key too.
+            sse: source.sse.clone(),
         };
         let command = Command::CopyObject {
             src_bucket: src_bucket.to_owned(),
@@ -508,6 +553,7 @@ impl Engine {
             attrs,
             checksum_algorithm,
             checksum_type,
+            sse: self.new_data_key()?.map(|(_, sealed)| sealed),
         };
         self.apply(Command::CreateUpload { bucket: bucket.to_owned(), upload: upload.clone() }).await?;
         Ok(upload)
@@ -628,6 +674,7 @@ impl Engine {
             data: ObjectData::Blocks(completion.parts.iter().flat_map(|(_, p)| p.blocks.iter().copied()).collect()),
             part_sizes: completion.parts.iter().map(|(_, p)| p.size).collect(),
             upload_id: Some(completion.upload.upload_id),
+            sse: completion.upload.sse.clone(),
         };
         let command = Command::CompleteUpload {
             bucket: bucket.to_owned(),
@@ -700,9 +747,20 @@ impl Engine {
 
     /// Streams `range` (already validated against `record.size`) of an object.
     pub fn read_object(&self, record: &ObjectRecord, range: Range<u64>) -> BoxStream<'static, io::Result<Bytes>> {
+        let key = match record.sse.as_ref().map(|sealed| self.open_key(sealed)).transpose() {
+            Ok(key) => key,
+            Err(e) => return stream::once(async move { Err(io::Error::other(e.to_string())) }).boxed(),
+        };
         match &record.data {
             ObjectData::Inline(data) => {
-                let bytes = Bytes::copy_from_slice(&data[range.start as usize..range.end as usize]);
+                let plain = match &key {
+                    Some(key) => match key.for_block(&Uuid::nil()).open_all(data) {
+                        Ok(plain) => plain,
+                        Err(e) => return stream::once(async move { Err(e) }).boxed(),
+                    },
+                    None => data.clone(),
+                };
+                let bytes = Bytes::copy_from_slice(&plain[range.start as usize..range.end as usize]);
                 count(&self.stats.bytes_sent, bytes.len() as u64);
                 stream::once(async move { Ok(bytes) }).boxed()
             }
@@ -711,6 +769,7 @@ impl Engine {
                     store: Arc::clone(&self.blocks),
                     stats: Arc::clone(&self.stats),
                     segments: segments(blocks, range).into_iter(),
+                    key,
                     current: None,
                 };
                 stream::try_unfold(state, ReadState::next).boxed()
@@ -898,6 +957,7 @@ pub struct StagedObject {
     data: ObjectData,
     block_ids: Vec<Uuid>,
     committed: bool,
+    sse: Option<SealedKey>,
 }
 
 impl StagedObject {
@@ -946,6 +1006,7 @@ struct BlockSink<'a> {
     engine: &'a Engine,
     writer: Option<BlockWriter>,
     blocks: Vec<BlockRef>,
+    key: Option<&'a DataKey>,
 }
 
 impl BlockSink<'_> {
@@ -953,7 +1014,7 @@ impl BlockSink<'_> {
         let block_size = self.engine.config.block_size;
         while !data.is_empty() {
             if self.writer.is_none() {
-                let writer = self.engine.blocks.create().await?;
+                let writer = self.engine.blocks.create(self.key).await?;
                 staged.block_ids.push(writer.id());
                 self.writer = Some(writer);
             }
@@ -977,8 +1038,9 @@ impl BlockSink<'_> {
     }
 }
 
-/// `(block id, offset in block, length)` for each block overlapping `range`.
-fn segments(blocks: &[BlockRef], range: Range<u64>) -> Vec<(Uuid, u64, u64)> {
+/// `(block, offset in block, length)` for each block overlapping `range`,
+/// in plaintext bytes.
+fn segments(blocks: &[BlockRef], range: Range<u64>) -> Vec<(BlockRef, u64, u64)> {
     let mut out = Vec::new();
     let mut block_start = 0;
     for block in blocks {
@@ -986,7 +1048,7 @@ fn segments(blocks: &[BlockRef], range: Range<u64>) -> Vec<(Uuid, u64, u64)> {
         if block_end > range.start && block_start < range.end {
             let start = range.start.max(block_start);
             let end = range.end.min(block_end);
-            out.push((block.id, start - block_start, end - start));
+            out.push((*block, start - block_start, end - start));
         }
         if block_end >= range.end {
             break;
@@ -999,34 +1061,90 @@ fn segments(blocks: &[BlockRef], range: Range<u64>) -> Vec<(Uuid, u64, u64)> {
 struct ReadState {
     store: Arc<BlockStore>,
     stats: Arc<EngineStats>,
-    segments: std::vec::IntoIter<(Uuid, u64, u64)>,
-    current: Option<(tokio::io::Take<tokio::fs::File>, u64)>,
+    segments: std::vec::IntoIter<(BlockRef, u64, u64)>,
+    key: Option<DataKey>,
+    current: Option<Segment>,
+}
+
+enum Segment {
+    Plain {
+        file: tokio::io::Take<tokio::fs::File>,
+        remaining: u64,
+    },
+    /// Encrypted: whole frames are read and opened, then trimmed to the range.
+    Sealed {
+        file: tokio::io::Take<tokio::fs::File>,
+        cipher: Box<FrameCipher>,
+        frame: u64,
+        skip: usize,
+        remaining: u64,
+    },
 }
 
 impl ReadState {
+    async fn open(&self, (block, offset, len): (BlockRef, u64, u64)) -> io::Result<Segment> {
+        let Some(key) = &self.key else {
+            return Ok(Segment::Plain { file: self.store.open_range(&block.id, offset, len).await?, remaining: len });
+        };
+        let (first, last) = (offset / FRAME, (offset + len - 1) / FRAME);
+        let start = first * (FRAME + TAG);
+        let end = ((last + 1) * (FRAME + TAG)).min(block.stored_len());
+        Ok(Segment::Sealed {
+            file: self.store.open_range(&block.id, start, end - start).await?,
+            cipher: Box::new(key.for_block(&block.id)),
+            frame: first,
+            skip: (offset % FRAME) as usize,
+            remaining: len,
+        })
+    }
+
     async fn next(mut self) -> io::Result<Option<(Bytes, Self)>> {
         loop {
             if self.current.is_none() {
-                let Some((id, offset, len)) = self.segments.next() else {
+                let Some(segment) = self.segments.next() else {
                     return Ok(None);
                 };
-                self.current = Some((self.store.open_range(&id, offset, len).await?, len));
+                self.current = Some(self.open(segment).await?);
             }
-            let (file, remaining) = self.current.as_mut().expect("set above");
-            if *remaining == 0 {
-                self.current = None;
-                continue;
+            let chunk = match self.current.as_mut().expect("set above") {
+                Segment::Plain { remaining: 0, .. } | Segment::Sealed { remaining: 0, .. } => None,
+                Segment::Plain { file, remaining } => {
+                    let mut buf = BytesMut::with_capacity(READ_CHUNK.min(*remaining) as usize);
+                    let n = file.read_buf(&mut buf).await?;
+                    if n == 0 {
+                        return Err(short_block());
+                    }
+                    *remaining -= n as u64;
+                    Some(buf.freeze())
+                }
+                Segment::Sealed { file, cipher, frame, skip, remaining } => {
+                    let mut buf = Vec::with_capacity((FRAME + TAG) as usize);
+                    file.take(FRAME + TAG).read_to_end(&mut buf).await?;
+                    if buf.len() as u64 <= TAG {
+                        return Err(short_block());
+                    }
+                    let n = cipher.open(*frame, &mut buf)?;
+                    let take = (n - *skip).min(*remaining as usize);
+                    let out = Bytes::copy_from_slice(&buf[*skip..*skip + take]);
+                    *frame += 1;
+                    *skip = 0;
+                    *remaining -= take as u64;
+                    Some(out)
+                }
+            };
+            match chunk {
+                Some(bytes) => {
+                    count(&self.stats.bytes_sent, bytes.len() as u64);
+                    return Ok(Some((bytes, self)));
+                }
+                None => self.current = None,
             }
-            let mut buf = BytesMut::with_capacity(READ_CHUNK.min(*remaining) as usize);
-            let n = file.read_buf(&mut buf).await?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "block file is shorter than its metadata"));
-            }
-            *remaining -= n as u64;
-            count(&self.stats.bytes_sent, n as u64);
-            return Ok(Some((buf.freeze(), self)));
         }
     }
+}
+
+fn short_block() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "block file is shorter than its metadata")
 }
 
 /// Aborts the background tasks when dropped.

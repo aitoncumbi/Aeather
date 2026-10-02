@@ -210,6 +210,10 @@ jobs:
           S3TESTS_DIR: ${{ github.workspace }}/s3-tests
           JUNIT_OUT: ${{ runner.temp }}/s3-tests.xml
           KEEP_LOG: ${{ runner.temp }}/s3-tests-server.log
+      - name: compat/s3-tests/run.sh (encryption at rest)
+        run: AETHER_ENCRYPTION__MASTER_KEY=$(openssl rand -base64 32) compat/s3-tests/run.sh
+        env:
+          S3TESTS_DIR: ${{ github.workspace }}/s3-tests
       - if: always()
         uses: actions/upload-artifact@v7
         with:

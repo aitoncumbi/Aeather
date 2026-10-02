@@ -323,6 +323,7 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             Outcome::Done
         }
         Command::PutObject { bucket, key, record, condition, gc_due_at } => {
+            note_sealing_key(txn, record.sse.as_ref())?;
             let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
             let mut objects = txn.open_table(OBJECTS)?;
             let okey = object_key(&bucket.id, key.as_bytes());
@@ -343,6 +344,7 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             Outcome::Object(previous)
         }
         Command::CreateUpload { bucket, upload } => {
+            note_sealing_key(txn, upload.sse.as_ref())?;
             let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
             let ukey = upload_key(&bucket.id, upload.key.as_bytes(), &upload.upload_id);
             txn.open_table(UPLOADS)?.insert(ukey.as_slice(), codec::encode(&upload).as_slice())?;
@@ -541,6 +543,20 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
     Ok(outcome)
 }
 
+/// Records which master key sealed stored data, so a server started without
+/// it refuses to run instead of failing on every read.
+fn note_sealing_key(txn: &WriteTransaction, sealed: Option<&crate::crypto::SealedKey>) -> Result<()> {
+    let Some(sealed) = sealed else { return Ok(()) };
+    let mut system = txn.open_table(SYSTEM)?;
+    let mut ids: Vec<String> =
+        system.get("sse_key_ids")?.map(|v| codec::decode(v.value())).transpose()?.unwrap_or_default();
+    if !ids.contains(&sealed.key_id) {
+        ids.push(sealed.key_id.clone());
+        system.insert("sse_key_ids", codec::encode(&ids).as_slice())?;
+    }
+    Ok(())
+}
+
 /// Gives every still-pending command the batch's error.
 fn fail_all(mut results: Vec<Option<Result<Outcome>>>, pending: &[usize], error: &Error) -> Vec<Result<Outcome>> {
     for &i in pending {
@@ -550,6 +566,13 @@ fn fail_all(mut results: Vec<Option<Result<Outcome>>>, pending: &[usize], error:
 }
 
 impl MetaStore {
+    /// Fingerprints of every master key that has encrypted stored data.
+    pub fn sealing_key_ids(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_read()?;
+        let system = txn.open_table(SYSTEM)?;
+        Ok(system.get("sse_key_ids")?.map(|v| codec::decode(v.value())).transpose()?.unwrap_or_default())
+    }
+
     pub fn get_bucket(&self, name: &str) -> Result<Option<BucketRecord>> {
         let txn = self.db.begin_read()?;
         let buckets = txn.open_table(BUCKETS)?;

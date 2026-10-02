@@ -14,6 +14,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use uuid::Uuid;
 
+use crate::crypto::{DataKey, FRAME, FrameCipher};
 use crate::meta::BlockRef;
 
 const WRITE_BUFFER: usize = 1 << 20;
@@ -45,8 +46,9 @@ impl BlockStore {
         self.blocks_dir.join(&hex[0..2]).join(&hex[2..4]).join(hex)
     }
 
-    /// Starts a new block. Its id stays marked as staged until [`unstage`](Self::unstage).
-    pub async fn create(self: &Arc<Self>) -> io::Result<BlockWriter> {
+    /// Starts a new block, encrypted under `key` if given. Its id stays marked
+    /// as staged until [`unstage`](Self::unstage).
+    pub async fn create(self: &Arc<Self>, key: Option<&DataKey>) -> io::Result<BlockWriter> {
         let id = Uuid::new_v4();
         self.staged.lock().unwrap().insert(id);
         let tmp_path = self.tmp_dir.join(id.simple().to_string());
@@ -63,7 +65,11 @@ impl BlockStore {
             tmp_path,
             file: BufWriter::with_capacity(WRITE_BUFFER, file),
             len: 0,
+            stored: 0,
             crc32c: 0,
+            cipher: key.map(|k| k.for_block(&id)),
+            frame: Vec::new(),
+            frames: 0,
             finished: false,
         })
     }
@@ -134,8 +140,15 @@ pub struct BlockWriter {
     id: Uuid,
     tmp_path: PathBuf,
     file: BufWriter<File>,
+    /// Plaintext bytes written.
     len: u64,
+    /// Bytes in the file.
+    stored: u64,
     crc32c: u32,
+    /// Encryption: the block's cipher, the frame being filled, frames sealed.
+    cipher: Option<FrameCipher>,
+    frame: Vec<u8>,
+    frames: u64,
     finished: bool,
 }
 
@@ -148,16 +161,44 @@ impl BlockWriter {
         self.len
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> io::Result<()> {
+    pub async fn write(&mut self, mut data: &[u8]) -> io::Result<()> {
+        self.len += data.len() as u64;
+        if self.cipher.is_none() {
+            return self.write_stored(data).await;
+        }
+        while !data.is_empty() {
+            let room = FRAME as usize - self.frame.len();
+            let (now, rest) = data.split_at(room.min(data.len()));
+            self.frame.extend_from_slice(now);
+            data = rest;
+            if self.frame.len() == FRAME as usize {
+                self.seal_frame().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn seal_frame(&mut self) -> io::Result<()> {
+        let cipher = self.cipher.as_ref().expect("only called when encrypting");
+        let sealed = cipher.seal(self.frames, &self.frame);
+        self.frames += 1;
+        self.frame.clear();
+        self.write_stored(&sealed).await
+    }
+
+    async fn write_stored(&mut self, data: &[u8]) -> io::Result<()> {
         self.file.write_all(data).await?;
         self.crc32c = crc32c::crc32c_append(self.crc32c, data);
-        self.len += data.len() as u64;
+        self.stored += data.len() as u64;
         Ok(())
     }
 
     /// Makes the block durable at its final path. The id stays staged; the
     /// caller unstages it once metadata references it (or it is discarded).
     pub async fn finish(mut self) -> io::Result<BlockRef> {
+        if !self.frame.is_empty() {
+            self.seal_frame().await?;
+        }
         self.file.flush().await?;
         self.file.get_ref().sync_all().await?;
         let path = self.store.block_path(&self.id);
@@ -170,7 +211,8 @@ impl BlockWriter {
         fs::rename(&self.tmp_path, &path).await?;
         self.finished = true;
         sync_dir(dir).await?;
-        Ok(BlockRef { id: self.id, len: self.len, crc32c: self.crc32c })
+        let stored_len = self.cipher.is_some().then_some(self.stored);
+        Ok(BlockRef { id: self.id, len: self.len, crc32c: self.crc32c, stored_len })
     }
 }
 
@@ -198,7 +240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).await.unwrap());
 
-        let mut w = store.create().await.unwrap();
+        let mut w = store.create(None).await.unwrap();
         w.write(b"hello ").await.unwrap();
         w.write(b"world").await.unwrap();
         let block = w.finish().await.unwrap();
@@ -223,7 +265,7 @@ mod tests {
     async fn dropped_writer_removes_partial_file() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).await.unwrap());
-        let mut w = store.create().await.unwrap();
+        let mut w = store.create(None).await.unwrap();
         let id = w.id();
         w.write(b"partial").await.unwrap();
         drop(w);
@@ -235,7 +277,7 @@ mod tests {
     async fn open_discards_partial_writes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(BlockStore::open(dir.path()).await.unwrap());
-        let mut w = store.create().await.unwrap();
+        let mut w = store.create(None).await.unwrap();
         w.write(b"partial").await.unwrap();
         w.file.flush().await.unwrap();
         // Simulate a crash: the writer never runs its cleanup.

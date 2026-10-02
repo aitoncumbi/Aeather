@@ -83,6 +83,15 @@ interval_secs = 604800   # 7 days
 # Read rate limit while scrubbing, in bytes per second. 0: unlimited.
 bytes_per_sec = 67108864 # 64 MiB/s
 
+[encryption]
+# Encrypt every new object at rest (SSE-S3): 32 random bytes, base64-encoded,
+# e.g. from `openssl rand -base64 32`. Prefer AETHER_ENCRYPTION__MASTER_KEY.
+# Keep a copy apart from the data: without it, encrypted objects are lost.
+# master_key = ""
+# After replacing the master key, list the old one here so objects it
+# encrypted stay readable.
+# previous_keys = []
+
 [log]
 # Filter directive; RUST_LOG overrides it. The S3 protocol library's own
 # per-request error logs stay off unless named, e.g. "info,s3s=debug".

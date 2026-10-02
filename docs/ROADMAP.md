@@ -76,7 +76,8 @@ anything from a 1 KB document to a 100 GB file.
 
 ## v2: data protection
 - [ ] Bucket versioning: enable/suspend, version listing, delete markers, GET/DELETE by version
-- [ ] Encryption at rest: SSE-S3 (master key from config), then SSE-C
+- [x] Encryption at rest: SSE-S3 (master key from config)
+- [ ] SSE-C (customer-provided keys)
 - [ ] Encrypt stored access-key secrets under the master key
 - [ ] Lifecycle rules: expire objects, expire noncurrent versions, abort incomplete uploads
 - [x] Object tagging

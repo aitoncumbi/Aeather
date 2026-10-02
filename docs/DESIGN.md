@@ -452,6 +452,34 @@ replication (v3) the same pass will repair from a healthy copy.
 - `s3s` is not a full security boundary: we set body and object size limits,
   timeouts and listing limits ourselves.
 
+### Encryption at rest
+
+SSE-S3: with `encryption.master_key` set, every new object is encrypted.
+
+- **Keys.** Each object (or multipart upload) gets a random 256-bit data key,
+  sealed with the master key (AES-256-GCM) and stored in its metadata record
+  with the master key's fingerprint (the first 8 bytes of its SHA-256). Each
+  block's key is derived from the data key and the block id (HKDF-SHA256), and
+  inline objects use the nil id; copies share their source's blocks, so they
+  share its data key.
+- **Frames.** Data is encrypted in 64 KiB frames, each with its own 16-byte tag
+  and the nonce `0 ‖ frame index`, so a range read opens only the frames it
+  covers, and reordered, truncated or altered frames fail authentication.
+  `BlockRef.len` stays the plaintext length; `stored_len` is the file size,
+  and the CRC32C covers the stored bytes, so the scrubber needs no key.
+- **ETag** stays the MD5 of the plaintext; client checksums are of the
+  plaintext too.
+- **Rotation.** A new master key encrypts new objects; listing the old one in
+  `encryption.previous_keys` keeps existing objects readable (they are not
+  re-encrypted).
+- **Safety.** The fingerprints of master keys that have sealed data are kept in
+  the `system` table; the server refuses to start unless all of them are
+  configured, rather than failing on every read.
+- **S3.** Responses for encrypted objects carry
+  `x-amz-server-side-encryption: AES256`; `GetBucketEncryption` reports SSE-S3
+  when a master key is set. Requests for SSE-S3 without a master key, SSE-KMS
+  or SSE-C fail with `NotImplemented`.
+
 ## Planned designs
 
 ### Versioning (v2)
@@ -461,12 +489,10 @@ table keyed by bucket_id ‖ key ‖ inverted version time, plus delete markers.
 `objects` stays the index of latest versions, so plain listings stay fast.
 Unversioned buckets report the version id `null`, as S3 does.
 
-### Encryption at rest (v2)
+### SSE-C (v2)
 
-SSE-S3 style: each object gets a random data key, encrypted with a master key from
-the config (later from an external KMS). Data is encrypted in fixed-size frames
-(e.g. 64 KiB, AES-256-GCM) so a range read decrypts only the frames it needs.
-SSE-C (customer-provided keys) uses the same framing.
+Customer-provided keys will reuse the framing of encryption at rest (below),
+with the client's key in place of a stored data key.
 
 ### Clustering (v3)
 

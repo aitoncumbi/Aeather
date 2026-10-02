@@ -29,6 +29,7 @@ dependencies = [
  "rcgen",
  "redb",
  "reqwest",
+ "ring",
  "rmp-serde",
  "rustix",
  "rustls",

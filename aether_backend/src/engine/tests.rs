@@ -275,13 +275,13 @@ async fn sweeper_removes_only_orphans() {
     let record = put(&engine, "bkt", "k", &pattern(1500)).await;
 
     // A block from an upload that crashed before committing.
-    let mut writer = engine.blocks.create().await.unwrap();
+    let mut writer = engine.blocks.create(None).await.unwrap();
     writer.write(b"orphan").await.unwrap();
     let orphan = writer.finish().await.unwrap();
     engine.blocks.unstage(&[orphan.id]);
 
     // A block from an upload still in progress.
-    let mut writer = engine.blocks.create().await.unwrap();
+    let mut writer = engine.blocks.create(None).await.unwrap();
     writer.write(b"in flight").await.unwrap();
     let in_flight = writer.finish().await.unwrap();
 
@@ -428,7 +428,8 @@ async fn listing_details() {
 // ---- multipart uploads ----
 
 async fn upload_part(engine: &Engine, key: &str, upload_id: Uuid, number: u32, data: &[u8]) -> PartRecord {
-    let staged = engine.stage_part(body(data, 333)).await.unwrap();
+    let upload = engine.get_upload("bkt", key, upload_id).await.unwrap();
+    let staged = engine.stage_part(body(data, 333), &upload).await.unwrap();
     engine.commit_part("bkt", key, upload_id, number, staged, BTreeMap::new()).await.unwrap()
 }
 
@@ -500,7 +501,8 @@ async fn replaced_and_unused_parts_are_released() {
 async fn completion_is_validated() {
     let (engine, _dir) = test_engine().await;
     engine.create_bucket("bkt").await.unwrap();
-    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let upload = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap();
+    let id = upload.upload_id;
     let p1 = upload_part(&engine, "k", id, 1, &pattern(500)).await;
     let p2 = upload_part(&engine, "k", id, 2, &pattern(1500)).await;
     let p3 = upload_part(&engine, "k", id, 3, &pattern(100)).await;
@@ -520,7 +522,7 @@ async fn completion_is_validated() {
     assert_eq!(ok.size(), 1600);
 
     for bad in [0, MAX_PARTS + 1] {
-        let staged = engine.stage_part(body(b"x", 1)).await.unwrap();
+        let staged = engine.stage_part(body(b"x", 1), &upload).await.unwrap();
         let err = engine.commit_part("bkt", "k", id, bad, staged, BTreeMap::new()).await.unwrap_err();
         assert!(matches!(err, Error::InvalidArgument(_)));
     }
@@ -572,7 +574,8 @@ async fn complete_honours_write_conditions() {
 async fn abort_releases_parts() {
     let (engine, _dir) = test_engine().await;
     engine.create_bucket("bkt").await.unwrap();
-    let id = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let upload = engine.create_upload("bkt", "k", ObjectAttrs::default(), None, None).await.unwrap();
+    let id = upload.upload_id;
     upload_part(&engine, "k", id, 1, &pattern(1500)).await;
     upload_part(&engine, "k", id, 2, &pattern(500)).await;
 
@@ -582,7 +585,7 @@ async fn abort_releases_parts() {
     assert!(matches!(engine.abort_upload("bkt", "k", id).await, Err(Error::NoSuchUpload)));
 
     // A part uploaded after the abort is rejected and its blocks removed.
-    let staged = engine.stage_part(body(&pattern(1500), 500)).await.unwrap();
+    let staged = engine.stage_part(body(&pattern(1500), 500), &upload).await.unwrap();
     let err = engine.commit_part("bkt", "k", id, 3, staged, BTreeMap::new()).await.unwrap_err();
     assert!(matches!(err, Error::NoSuchUpload));
     wait_for_block_files(&engine, 0).await;
@@ -1130,4 +1133,90 @@ async fn multipart_parts_are_checked_against_the_quota_as_they_arrive() {
     // Without a quota, nothing is checked.
     engine.set_bucket_quota("bkt", Quota::default()).await.unwrap();
     check(2, 1 << 40).await.unwrap();
+}
+
+async fn engine_with_keys(dir: &std::path::Path, current: u8, previous: &[u8]) -> Engine {
+    let previous: Vec<Vec<u8>> = previous.iter().map(|b| vec![*b; 32]).collect();
+    let config = EngineConfig {
+        data_dir: dir.to_path_buf(),
+        block_size: 150_000,
+        inline_threshold: 100,
+        min_part_size: 1000,
+        keyring: Some(Arc::new(crate::crypto::Keyring::new(&[current; 32], &previous).unwrap())),
+        ..EngineConfig::default()
+    };
+    Engine::open(config).await.unwrap()
+}
+
+/// Every block file's bytes, concatenated.
+async fn stored_bytes(engine: &Engine) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_, _, path) in engine.blocks.scan().await.unwrap() {
+        out.extend(tokio::fs::read(path).await.unwrap());
+    }
+    out
+}
+
+#[tokio::test]
+async fn objects_are_encrypted_at_rest_and_read_back_by_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_with_keys(dir.path(), 1, &[]).await;
+    engine.create_bucket("bkt").await.unwrap();
+    // Recognizable text, so it would show up in the files if stored in the clear.
+    let text = |len: usize| -> Vec<u8> { b"plaintext marker ".iter().copied().cycle().take(len).collect() };
+
+    let small = put(&engine, "bkt", "small", &text(50)).await;
+    assert!(small.sse.is_some());
+    let ObjectData::Inline(stored) = &small.data else { panic!("inline") };
+    assert_eq!(stored.len() as u64, crate::crypto::stored_len(50));
+    assert_eq!(read_all(&engine, &small, 5..40).await, text(50)[5..40]);
+
+    // Three blocks of 150 000 bytes (several frames each) plus a partial one.
+    let data = text(500_000);
+    let big = put(&engine, "bkt", "big", &data).await;
+    assert_eq!(big.etag, hex::encode(Md5::digest(&data)), "ETag is the plaintext MD5");
+    assert_eq!(big.data.blocks().len(), 4);
+    assert!(big.data.blocks().iter().all(|b| b.stored_len == Some(crate::crypto::stored_len(b.len))));
+    assert_eq!(read_all(&engine, &big, 0..500_000).await, data);
+    for range in [0..1, 65_535..65_537, 149_990..150_010, 131_000..400_000, 499_999..500_000] {
+        assert_eq!(read_all(&engine, &big, range.clone()).await, data[range.start as usize..range.end as usize]);
+    }
+    let disk = stored_bytes(&engine).await;
+    assert!(!disk.windows(17).any(|w| w == b"plaintext marker "), "plaintext found on disk");
+
+    // Multipart parts share the upload's key; copies share the source's.
+    let upload = engine.create_upload("bkt", "mp", ObjectAttrs::default(), None, None).await.unwrap();
+    assert!(upload.sse.is_some());
+    let p1 = upload_part(&engine, "mp", upload.upload_id, 1, &text(1500)).await;
+    let p2 = upload_part(&engine, "mp", upload.upload_id, 2, &pattern(700)).await;
+    let mp = complete(&engine, "mp", upload.upload_id, &[(1, &p1), (2, &p2)]).await.unwrap();
+    assert_eq!(mp.sse, upload.sse);
+    assert_eq!(read_all(&engine, &mp, 1400..1600).await, [&text(1500)[1400..], &pattern(700)[..100]].concat());
+    let copy = engine
+        .copy_object("bkt", "big", &big, "bkt", "copy", ObjectAttrs::default(), WriteCondition::None)
+        .await
+        .unwrap();
+    assert_eq!(read_all(&engine, &copy, 0..500_000).await, data);
+
+    // The scrubber checks encrypted blocks as stored.
+    let report = engine.scrub().await.unwrap();
+    assert!(report.corrupt.is_empty(), "{:?}", report.corrupt);
+    drop(engine);
+
+    // After rotation the old key still reads; new objects use the new one.
+    let rotated = engine_with_keys(dir.path(), 2, &[1]).await;
+    let big = rotated.get_object("bkt", "big").await.unwrap();
+    assert_eq!(read_all(&rotated, &big, 0..500_000).await, data);
+    let fresh = put(&rotated, "bkt", "fresh", &text(10)).await;
+    assert_ne!(fresh.sse.unwrap().key_id, big.sse.as_ref().unwrap().key_id);
+    drop(rotated);
+
+    // Without the keys that encrypted stored data, the engine refuses to open.
+    let keyless = EngineConfig { data_dir: dir.path().to_path_buf(), ..EngineConfig::default() };
+    let err = Engine::open(keyless).await.err().expect("refused");
+    assert!(err.to_string().contains(&crate::crypto::fingerprint(&[1u8; 32])), "{err}");
+    let ring = crate::crypto::Keyring::new(&[2u8; 32], &[]).unwrap();
+    let only_new = EngineConfig { keyring: Some(Arc::new(ring)), ..EngineConfig::default() };
+    let only_new = EngineConfig { data_dir: dir.path().to_path_buf(), ..only_new };
+    assert!(Engine::open(only_new).await.is_err());
 }

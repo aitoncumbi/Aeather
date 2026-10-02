@@ -54,6 +54,19 @@ settings are listed in
 `aether.toml` or pass `--config <file>`. Every setting can also be given as an
 environment variable: `AETHER_<SECTION>__<KEY>`, e.g. `AETHER_TLS__CERT_FILE`.
 
+### Encryption at rest
+
+```sh
+openssl rand -base64 32      # store it apart from the data directory
+AETHER_ENCRYPTION__MASTER_KEY=<that value> ./target/release/aether
+```
+
+With a master key, every new object is encrypted (SSE-S3, AES-256-GCM); objects
+written before stay as they were. **Losing the key loses the data**, so back it
+up separately. To rotate, set a new `encryption.master_key` and move the old one
+to `encryption.previous_keys`. The server refuses to start without every key
+that has encrypted stored data.
+
 ### HTTPS
 
 Set `tls.cert_file` and `tls.key_file` (PEM) to serve the S3 API over HTTPS;
@@ -158,7 +171,7 @@ Current limitations:
   virtual-hosted style (`http://bucket.s3.example.com/key`), set
   `s3.domains = ["s3.example.com"]` with wildcard DNS for `*.s3.example.com`
   (and a wildcard certificate with TLS).
-- **Not supported yet:** versioning, server-side encryption, lifecycle rules
+- **Not supported yet:** versioning, SSE-KMS and SSE-C, lifecycle rules
   (v2 on the roadmap); ACLs and bucket policies (per-key bucket permissions
   replace them); object lock; browser POST uploads.
   Requests that need these fail with `NotImplemented` rather than being ignored.

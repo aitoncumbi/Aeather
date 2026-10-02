@@ -5,6 +5,7 @@ pub mod auth;
 pub mod blocks;
 pub mod cli;
 pub mod config;
+pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod history;

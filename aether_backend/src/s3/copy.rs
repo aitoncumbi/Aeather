@@ -53,12 +53,10 @@ impl AetherS3 {
             Some(TaggingDirective::REPLACE) => Some(super::tags::from_header(input.tagging.as_deref())?),
             Some(other) => return Err(s3_error!(InvalidArgument, "unknown tagging directive {other}")),
         };
-        if input.server_side_encryption.is_some()
-            || input.sse_customer_key.is_some()
-            || input.copy_source_sse_customer_key.is_some()
-        {
-            return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
-        }
+        self.check_sse(
+            input.server_side_encryption.as_ref(),
+            input.sse_customer_key.is_some() || input.copy_source_sse_customer_key.is_some(),
+        )?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -120,7 +118,12 @@ impl AetherS3 {
             ..Default::default()
         };
         set_copy_checksums!(result, checksum_from_map(&record.attrs.checksums));
-        Ok(S3Response::new(CopyObjectOutput { copy_object_result: Some(result), ..Default::default() }))
+        let sse = sse_of(&record);
+        Ok(S3Response::new(CopyObjectOutput {
+            copy_object_result: Some(result),
+            server_side_encryption: sse,
+            ..Default::default()
+        }))
     }
 
     pub(super) async fn upload_part_copy_op(
@@ -128,9 +131,7 @@ impl AetherS3 {
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let input = req.input;
-        if input.sse_customer_key.is_some() || input.copy_source_sse_customer_key.is_some() {
-            return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
-        }
+        self.check_sse(None, input.sse_customer_key.is_some() || input.copy_source_sse_customer_key.is_some())?;
         let upload_id = parse_upload_id(&input.upload_id)?;
         let number = part_number(input.part_number)?;
         let upload = self.engine.get_upload(&input.bucket, &input.key, upload_id).await.map_err(s3_error)?;
@@ -155,7 +156,7 @@ impl AetherS3 {
         }
         let data = self.engine.read_object(&source, range).inspect_ok(|chunk| hasher.update(chunk));
         // Failing to read our own source is a server error, not a client one.
-        let staged = self.engine.stage_part(data).await.map_err(|e| match e {
+        let staged = self.engine.stage_part(data, &upload).await.map_err(|e| match e {
             EngineError::Body(source) => s3_error!(InternalError, "reading the copy source failed: {source}"),
             other => s3_error(other),
         })?;

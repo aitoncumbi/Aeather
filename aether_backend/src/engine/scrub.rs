@@ -151,8 +151,8 @@ impl Engine {
                 Err(e) => return Some(format!("cannot read block file: {e}")),
             }
         }
-        if len != block.len {
-            Some(format!("block file has {len} bytes, expected {}", block.len))
+        if len != block.stored_len() {
+            Some(format!("block file has {len} bytes, expected {}", block.stored_len()))
         } else if crc != block.crc32c {
             Some(format!("checksum mismatch: CRC32C {crc:08x}, expected {:08x}", block.crc32c))
         } else {

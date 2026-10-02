@@ -89,6 +89,9 @@ pub struct ObjectRecord {
     /// CompleteMultipartUpload can be answered after the upload is gone.
     #[serde(default)]
     pub upload_id: Option<Uuid>,
+    /// The data key when the object is encrypted at rest (SSE-S3).
+    #[serde(default)]
+    pub sse: Option<crate::crypto::SealedKey>,
 }
 
 /// Attributes supplied by the client when the object was written.
@@ -142,8 +145,19 @@ impl ObjectData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRef {
     pub id: Uuid,
+    /// Plaintext length.
     pub len: u64,
+    /// CRC32C of the file's bytes as stored (ciphertext when encrypted).
     pub crc32c: u32,
+    /// File size when encrypted (`len` plus a tag per frame); absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_len: Option<u64>,
+}
+
+impl BlockRef {
+    pub fn stored_len(&self) -> u64 {
+        self.stored_len.unwrap_or(self.len)
+    }
 }
 
 /// Credentials for one application, and what they may access.
@@ -235,6 +249,9 @@ pub struct UploadRecord {
     pub checksum_algorithm: Option<String>,
     #[serde(default)]
     pub checksum_type: Option<String>,
+    /// Every part is encrypted under this data key; the object inherits it.
+    #[serde(default)]
+    pub sse: Option<crate::crypto::SealedKey>,
 }
 
 /// One uploaded part. Parts are never stored inline.

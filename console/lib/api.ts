@@ -70,6 +70,8 @@ export type Status = {
   s3_endpoint_configured: boolean;
   region: string;
   admin_tls: boolean;
+  /** Fingerprint of the master key new objects are encrypted with; null when off. */
+  encryption_key: string | null;
 };
 
 export type Session = {
@@ -100,6 +102,7 @@ export type ObjectDetail = ObjectItem & {
   user_metadata: Record<string, string>;
   tags: Record<string, string>;
   checksums: Record<string, string>;
+  encrypted: boolean;
   parts: number;
   storage: "inline" | "blocks";
   blocks: number;

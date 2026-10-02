@@ -266,6 +266,10 @@ pub struct StatusView {
     pub region: String,
     #[serde(default)]
     pub admin_tls: bool,
+    /// Fingerprint of the master key new objects are encrypted with; `null`
+    /// when encryption at rest is off.
+    #[serde(default)]
+    pub encryption_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -348,6 +352,7 @@ async fn status(State(s): State<AdminState>, headers: HeaderMap) -> ApiResult<Js
         s3_endpoint_configured: s.settings.s3_public_url.is_some(),
         region: s.settings.region.clone(),
         admin_tls: s.settings.tls,
+        encryption_key: config.keyring.as_ref().map(|ring| ring.current_id().to_owned()),
     }))
 }
 

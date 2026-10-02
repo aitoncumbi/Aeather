@@ -24,7 +24,7 @@ use self::convert::*;
 use crate::auth::Authorizer;
 use crate::engine::{Engine, StagedObject};
 use crate::error::Error as EngineError;
-use crate::meta::{ListPage, ListQuery, ObjectRecord};
+use crate::meta::{ListPage, ListQuery, ObjectRecord, UploadRecord};
 
 /// S3 limit on keys per DeleteObjects request.
 const MAX_DELETE_KEYS: usize = 1000;
@@ -38,6 +38,23 @@ pub struct AetherS3 {
 impl AetherS3 {
     pub fn new(engine: Arc<Engine>, auth: Arc<Authorizer>, region: String) -> Self {
         Self { engine, auth, region }
+    }
+
+    /// Requests may ask for SSE-S3 (`AES256`), which applies to every new
+    /// object once a master key is configured. SSE-KMS and SSE-C are refused.
+    fn check_sse(&self, requested: Option<&ServerSideEncryption>, customer_key: bool) -> S3Result<()> {
+        if customer_key {
+            return Err(s3_error!(NotImplemented, "SSE-C (customer-provided keys) is not supported yet"));
+        }
+        match requested.map(|s| s.as_str()) {
+            None => Ok(()),
+            Some(ServerSideEncryption::AES256) if self.engine.config().keyring.is_some() => Ok(()),
+            Some(ServerSideEncryption::AES256) => Err(s3_error!(
+                NotImplemented,
+                "encryption at rest is off on this server: set encryption.master_key to enable SSE-S3"
+            )),
+            Some(other) => Err(s3_error!(NotImplemented, "only SSE-S3 (AES256) is supported, not {other}")),
+        }
     }
 
     fn owner() -> Owner {
@@ -60,7 +77,7 @@ impl AetherS3 {
         &self,
         body: Option<StreamingBlob>,
         checks: BodyChecks<'_>,
-        part: bool,
+        part_of: Option<&UploadRecord>,
     ) -> S3Result<(StagedObject, BTreeMap<String, String>)> {
         let BodyChecks { mut sent, algorithm, also, content_md5, trailer, trailing_headers } = checks;
         let mut hasher = checksum_hasher(&sent, algorithm, trailer)?;
@@ -69,7 +86,10 @@ impl AetherS3 {
         }
         let body = body.unwrap_or_else(|| StreamingBlob::from(Bytes::new()));
         let stream = body.inspect_ok(|chunk| hasher.update(chunk));
-        let staged = if part { self.engine.stage_part(stream).await } else { self.engine.stage(stream).await };
+        let staged = match part_of {
+            Some(upload) => self.engine.stage_part(stream, upload).await,
+            None => self.engine.stage(stream).await,
+        };
         let staged = staged.map_err(s3_error)?;
 
         verify_content_md5(content_md5, &staged.md5)?;
@@ -255,9 +275,7 @@ impl S3 for AetherS3 {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let S3Request { input, headers, trailing_headers, .. } = req;
 
-        if input.sse_customer_key.is_some() || input.server_side_encryption.is_some() {
-            return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
-        }
+        self.check_sse(input.server_side_encryption.as_ref(), input.sse_customer_key.is_some())?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -282,13 +300,14 @@ impl S3 for AetherS3 {
             trailer: headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()),
             trailing_headers,
         };
-        let (staged, checksums) = self.stage_body(body, checks, false).await?;
+        let (staged, checksums) = self.stage_body(body, checks, None).await?;
 
         let mut attrs = object_attrs!(input);
         attrs.checksums = checksums;
         let record = self.engine.commit_put(&bucket, &key, staged, attrs, condition).await.map_err(s3_error)?;
 
         let mut output = PutObjectOutput {
+            server_side_encryption: sse_of(&record),
             e_tag: Some(etag(&record)),
             checksum_type: stored_checksum_type(&record.attrs),
             ..Default::default()
@@ -299,9 +318,7 @@ impl S3 for AetherS3 {
 
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        if input.sse_customer_key.is_some() {
-            return Err(s3_error!(NotImplemented, "server-side encryption is not supported yet"));
-        }
+        self.check_sse(None, input.sse_customer_key.is_some())?;
         check_version_id(input.version_id.as_deref())?;
         let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
         check_read_conditions(
@@ -326,6 +343,7 @@ impl S3 for AetherS3 {
 
         let body = SyncStream::new(self.engine.read_object(&record, range.clone()));
         let mut output = GetObjectOutput {
+            server_side_encryption: sse_of(&record),
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some((range.end - range.start) as i64),
             content_range,
@@ -372,6 +390,7 @@ impl S3 for AetherS3 {
             input.response_expires,
         );
         let mut output = HeadObjectOutput {
+            server_side_encryption: sse_of(&record),
             content_length: Some((range.end - range.start) as i64),
             content_range,
             parts_count,
@@ -686,6 +705,26 @@ impl S3 for AetherS3 {
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
         self.engine.set_bucket_cors(&req.input.bucket, Vec::new()).await.map_err(s3_error)?;
         Ok(S3Response::new(DeleteBucketCorsOutput::default()))
+    }
+
+    /// With a master key, every bucket encrypts new objects with SSE-S3.
+    async fn get_bucket_encryption(
+        &self,
+        req: S3Request<GetBucketEncryptionInput>,
+    ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
+        self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        if self.engine.config().keyring.is_none() {
+            return Err(s3_error!(ServerSideEncryptionConfigurationNotFoundError));
+        }
+        let rule = ServerSideEncryptionRule {
+            apply_server_side_encryption_by_default: Some(ServerSideEncryptionByDefault {
+                sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+                kms_master_key_id: None,
+            }),
+            ..Default::default()
+        };
+        let config = ServerSideEncryptionConfiguration { rules: vec![rule] };
+        Ok(S3Response::new(GetBucketEncryptionOutput { server_side_encryption_configuration: Some(config) }))
     }
 
     async fn get_bucket_tagging(
