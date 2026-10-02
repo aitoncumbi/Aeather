@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
 description = "S3-compatible object storage"
+license = "MIT"
 
 [[bin]]
 name = "aether"

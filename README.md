@@ -213,3 +213,7 @@ The s3-tests runner needs a [ceph/s3-tests](https://github.com/ceph/s3-tests)
 checkout with its requirements and `pytest-timeout` installed; the revision CI
 uses is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Benchmarks:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+## License
+
+[MIT](LICENSE)
