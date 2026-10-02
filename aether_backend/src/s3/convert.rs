@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::ops::Range;
 
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use s3s::checksum::ChecksumHasher;
@@ -26,6 +26,12 @@ pub fn s3_error(e: Error) -> S3Error {
             S3Error::with_message(S3ErrorCode::InvalidBucketName, format!("invalid bucket name: {name}"))
         }
         Error::InvalidArgument(msg) => S3Error::with_message(S3ErrorCode::InvalidArgument, msg),
+        // Not an AWS error (S3 has no quotas); the code Ceph's S3 server uses.
+        Error::QuotaExceeded(msg) => {
+            let mut e = S3Error::with_message(S3ErrorCode::Custom("QuotaExceeded".into()), msg);
+            e.set_status_code(StatusCode::FORBIDDEN);
+            e
+        }
         Error::NoSuchUpload => S3Error::new(S3ErrorCode::NoSuchUpload),
         Error::InvalidPart(msg) => S3Error::with_message(S3ErrorCode::InvalidPart, msg),
         Error::InvalidPartOrder => S3Error::new(S3ErrorCode::InvalidPartOrder),

@@ -71,7 +71,7 @@ anything from a 1 KB document to a 100 GB file.
 - [ ] Group commit for metadata writes (small PUTs are capped by one fsync'd transaction
   at a time; see [BENCHMARKS.md](BENCHMARKS.md))
 - [x] Per-bucket CORS (needed for browser uploads with presigned URLs)
-- [ ] Bucket quotas
+- [x] Bucket quotas
 - [ ] Virtual-hosted-style addressing
 
 ## v2: data protection

@@ -97,6 +97,19 @@ pub enum BucketCommand {
     Show { name: String },
     /// Delete an empty bucket
     Delete { name: String },
+    /// Limit a bucket's size and object count. Unset limits stay as they are
+    Quota {
+        name: String,
+        /// Largest total size, e.g. 50GiB or 10GB, or `none` for no limit
+        #[arg(long)]
+        max_bytes: Option<String>,
+        /// Most objects, or `none` for no limit
+        #[arg(long)]
+        max_objects: Option<String>,
+        /// Remove both limits
+        #[arg(long, conflicts_with_all = ["max_bytes", "max_objects"])]
+        clear: bool,
+    },
 }
 
 pub enum Request {
@@ -193,6 +206,20 @@ async fn bucket(client: &Client, command: BucketCommand, json: bool) -> anyhow::
         BucketCommand::Delete { name } => {
             client.call(Method::DELETE, &path(&name), None).await?;
             format!("Deleted bucket {name}.\n")
+        }
+        BucketCommand::Quota { name, max_bytes, max_objects, clear } => {
+            let mut quota = client.call(Method::GET, &path(&name), None).await?["quota"].clone();
+            if clear {
+                quota = json!({ "max_bytes": null, "max_objects": null });
+            }
+            if let Some(value) = max_bytes {
+                quota["max_bytes"] = json!(limit(&value, parse_size)?);
+            }
+            if let Some(value) = max_objects {
+                quota["max_objects"] = json!(limit(&value, |v| v.parse().ok())?);
+            }
+            let bucket = client.call(Method::PUT, &format!("{}/quota", path(&name)), Some(quota)).await?;
+            if json { pretty(&bucket) } else { format_bucket(&bucket) }
         }
     })
 }
@@ -332,6 +359,35 @@ fn text(value: &Value) -> String {
     }
 }
 
+/// `none`, or a value `parse` accepts.
+fn limit(value: &str, parse: impl Fn(&str) -> Option<u64>) -> anyhow::Result<Option<u64>> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    parse(value).map(Some).ok_or_else(|| anyhow::anyhow!("invalid limit {value:?}: use a number, e.g. 50GiB, or none"))
+}
+
+/// A byte count with an optional unit: KB, MB, GB, TB (powers of 1000) or
+/// KiB, MiB, GiB, TiB (powers of 1024).
+fn parse_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    let split = value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len());
+    let (number, unit) = value.split_at(split);
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1000,
+        "mb" => 1000u64.pow(2),
+        "gb" => 1000u64.pow(3),
+        "tb" => 1000u64.pow(4),
+        "kib" => 1 << 10,
+        "mib" => 1 << 20,
+        "gib" => 1 << 30,
+        "tib" => 1 << 40,
+        _ => return None,
+    };
+    number.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
 fn bytes(n: u64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut size = n as f64;
@@ -432,6 +488,13 @@ fn format_bucket(bucket: &Value) -> String {
     let _ = writeln!(out, "Created: {}", text(&bucket["created_at"]));
     let _ = writeln!(out, "Objects: {}", text(&bucket["objects"]));
     let _ = writeln!(out, "Size:    {}", bytes(bucket["bytes"].as_u64().unwrap_or(0)));
+    let quota = &bucket["quota"];
+    let limits: Vec<String> =
+        [quota["max_bytes"].as_u64().map(bytes), quota["max_objects"].as_u64().map(|n| format!("{n} objects"))]
+            .into_iter()
+            .flatten()
+            .collect();
+    let _ = writeln!(out, "Quota:   {}", if limits.is_empty() { "none".into() } else { limits.join(", ") });
     let keys: Vec<Vec<String>> = bucket["keys"]
         .as_array()
         .map(|keys| keys.iter().map(|k| vec![text(&k["access_key_id"]), text(&k["name"]), perms(k)]).collect())
@@ -508,6 +571,17 @@ mod tests {
         assert_eq!(reachable("0.0.0.0:9001".parse().unwrap()), "127.0.0.1:9001".parse().unwrap());
         assert_eq!(reachable("10.0.0.5:9001".parse().unwrap()), "10.0.0.5:9001".parse().unwrap());
         assert_eq!(encode("a b/c"), "a%20b%2Fc");
+    }
+
+    #[test]
+    fn quota_limits_parse() {
+        assert_eq!(parse_size("50GiB"), Some(50 << 30));
+        assert_eq!(parse_size("10 GB"), Some(10_000_000_000));
+        assert_eq!(parse_size("2048"), Some(2048));
+        assert_eq!(parse_size("1.5GB"), None);
+        assert_eq!(parse_size("99999999999TB"), None);
+        assert_eq!(limit("none", parse_size).unwrap(), None);
+        assert!(limit("lots", parse_size).is_err());
     }
 
     #[test]

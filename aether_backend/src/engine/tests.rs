@@ -964,3 +964,55 @@ async fn traffic_is_counted() {
     assert_eq!(stats.bytes_received.load(std::sync::atomic::Ordering::Relaxed), 1500);
     assert_eq!(stats.bytes_sent.load(std::sync::atomic::Ordering::Relaxed), 1000);
 }
+
+#[tokio::test]
+async fn quotas_limit_growth_but_not_shrinking() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    engine.set_bucket_quota("bkt", Quota { max_bytes: Some(3000), max_objects: Some(2) }).await.unwrap();
+    let put_result = |key: &'static str, len: usize| {
+        let engine = &engine;
+        async move {
+            engine.put_object("bkt", key, body(&pattern(len), 333), ObjectAttrs::default(), WriteCondition::None).await
+        }
+    };
+    let quota_exceeded = |r: Result<ObjectRecord>| matches!(r, Err(Error::QuotaExceeded(_)));
+
+    put_result("a", 1000).await.unwrap();
+    put_result("b", 1500).await.unwrap();
+    // A third object, or more bytes than the limit, is refused...
+    assert!(quota_exceeded(put_result("c", 10).await));
+    assert!(quota_exceeded(put_result("b", 2500).await));
+    // ...and nothing changed: usage and the stored object are as before.
+    let (_, usage) = engine.bucket_usage("bkt").await.unwrap();
+    assert_eq!((usage.objects, usage.bytes), (2, 2500));
+    assert_eq!(engine.get_object("bkt", "b").await.unwrap().size, 1500);
+    // Overwrites that fit are fine, and deleting makes room.
+    put_result("b", 2000).await.unwrap();
+    engine.delete_object("bkt", "a").await.unwrap();
+    put_result("c", 500).await.unwrap();
+
+    // Lowered below current usage: shrinking writes still pass, growth does not.
+    engine.set_bucket_quota("bkt", Quota { max_bytes: Some(500), max_objects: None }).await.unwrap();
+    put_result("b", 100).await.unwrap();
+    assert!(quota_exceeded(put_result("b", 200).await));
+    assert!(quota_exceeded(put_result("d", 1).await));
+    // Early check, before any body is read, with a declared size.
+    let early = engine.precheck_put("bkt", "d", &WriteCondition::None, Some(5000)).await;
+    assert!(matches!(early, Err(Error::QuotaExceeded(_))));
+    engine.precheck_put("bkt", "d", &WriteCondition::None, None).await.unwrap();
+
+    // Copies and completed multipart uploads count too.
+    engine.create_bucket("src").await.unwrap();
+    let big = put(&engine, "src", "big", &pattern(1500)).await;
+    let copy =
+        engine.copy_object("src", "big", &big, "bkt", "copy", ObjectAttrs::default(), WriteCondition::None).await;
+    assert!(quota_exceeded(copy));
+    let upload = engine.create_upload("bkt", "mp", ObjectAttrs::default(), None, None).await.unwrap();
+    let part = upload_part(&engine, "mp", upload.upload_id, 1, &pattern(1500)).await;
+    assert!(quota_exceeded(complete(&engine, "mp", upload.upload_id, &[(1, &part)]).await));
+
+    // No limits: anything goes.
+    engine.set_bucket_quota("bkt", Quota::default()).await.unwrap();
+    put_result("d", 5000).await.unwrap();
+}

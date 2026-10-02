@@ -109,6 +109,7 @@ aether key list
 aether key grant AK64OA2XIS00HEL7LJ95 reports r   # r: read, w: write, o: owner
 aether key disable AK64OA2XIS00HEL7LJ95           # takes effect immediately
 aether bucket show invoices                       # usage and which keys have access
+aether bucket quota invoices --max-bytes 50GiB    # also --max-objects; `none` or --clear removes
 aether status
 ```
 
@@ -169,7 +170,7 @@ Current limitations:
   container health checks.
 - **Metrics:** Prometheus format at `GET /metrics` on the admin port, without
   credentials: requests by operation and status, latency, bytes in and out,
-  per-bucket objects and bytes, disk space, garbage collection and scrubbing.
+  per-bucket objects, bytes and quotas, disk space, garbage collection and scrubbing.
 - **Logs:** one access log line per request (method, path, status, S3
   operation, access key, duration), as text or JSON (`log.format = "json"`).
   Every response carries a request id (`x-amz-request-id`, which SDKs include in

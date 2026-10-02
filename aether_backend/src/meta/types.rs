@@ -18,6 +18,38 @@ pub struct BucketRecord {
     /// Which browser origins may call the S3 API on this bucket. Empty: none.
     #[serde(default)]
     pub cors: Vec<CorsRule>,
+    #[serde(default)]
+    pub quota: Quota,
+}
+
+/// Limits on a bucket's usage. `None` is no limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quota {
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub max_objects: Option<u64>,
+}
+
+impl Quota {
+    /// Fails if a write would take usage from `before` to `after` past a
+    /// limit. Writes that do not grow usage pass even when the bucket is over
+    /// a limit (for example after it was lowered), so they can free space.
+    pub fn check(&self, before: BucketUsage, after: BucketUsage) -> Result<()> {
+        if let Some(max) = self.max_bytes
+            && after.bytes > max
+            && after.bytes > before.bytes
+        {
+            return Err(Error::QuotaExceeded(format!("the bucket's quota of {max} bytes would be exceeded")));
+        }
+        if let Some(max) = self.max_objects
+            && after.objects > max
+            && after.objects > before.objects
+        {
+            return Err(Error::QuotaExceeded(format!("the bucket's quota of {max} objects would be exceeded")));
+        }
+        Ok(())
+    }
 }
 
 /// One rule of a bucket's CORS configuration, as in S3's `PutBucketCors`.

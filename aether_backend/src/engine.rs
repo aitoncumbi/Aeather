@@ -34,8 +34,8 @@ use crate::blocks::{BlockStore, BlockWriter};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
     BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
-    ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord,
-    WriteCondition,
+    ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery, UploadPage,
+    UploadRecord, WriteCondition, usage_after,
 };
 
 /// S3's limit for one ListObjects page.
@@ -202,6 +202,15 @@ impl Engine {
         self.read(|meta| meta.list_buckets()).await
     }
 
+    /// Replaces the bucket's quota. Usage already over a new limit stays;
+    /// only writes that would grow it further are refused.
+    pub async fn set_bucket_quota(&self, name: &str, quota: Quota) -> Result<BucketRecord> {
+        match self.apply(Command::SetBucketQuota { bucket: name.to_owned(), quota }).await? {
+            Outcome::Bucket(bucket) => Ok(bucket),
+            other => unreachable!("SetBucketQuota returned {other:?}"),
+        }
+    }
+
     /// Replaces the bucket's CORS rules; an empty list removes them.
     pub async fn set_bucket_cors(&self, name: &str, rules: Vec<CorsRule>) -> Result<()> {
         self.apply(Command::SetBucketCors { bucket: name.to_owned(), rules }).await?;
@@ -210,21 +219,30 @@ impl Engine {
 
     // ---- writes ----
 
-    /// Cheap early check so a doomed upload is rejected before its body is read.
-    /// The authoritative check happens again inside the commit.
-    pub async fn precheck_put(&self, bucket: &str, key: &str, condition: &WriteCondition) -> Result<()> {
+    /// Cheap early check so a doomed upload is rejected before its body is
+    /// read: the condition, and the quota when the size is known. The
+    /// authoritative checks happen again inside the commit.
+    pub async fn precheck_put(
+        &self,
+        bucket: &str,
+        key: &str,
+        condition: &WriteCondition,
+        size: Option<u64>,
+    ) -> Result<()> {
         validate_key(key)?;
         let (bucket, key, condition) = (bucket.to_owned(), key.to_owned(), condition.clone());
         self.read(move |meta| {
-            if meta.get_bucket(&bucket)?.is_none() {
-                return Err(Error::NoSuchBucket);
-            }
+            let (record, used) = meta.bucket_usage(&bucket)?;
             let existing = match meta.get_object(&bucket, &key) {
                 Ok(record) => Some(record),
                 Err(Error::NoSuchKey) => None,
                 Err(e) => return Err(e),
             };
-            condition.check(existing.as_ref())
+            condition.check(existing.as_ref())?;
+            if let Some(size) = size {
+                record.quota.check(used, usage_after(used, Some(size), existing.map(|r| r.size)))?;
+            }
+            Ok(())
         })
         .await
     }
@@ -338,7 +356,7 @@ impl Engine {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
     {
-        self.precheck_put(bucket, key, &condition).await?;
+        self.precheck_put(bucket, key, &condition, None).await?;
         let staged = self.stage(body).await?;
         self.commit_put(bucket, key, staged, attrs, condition).await
     }

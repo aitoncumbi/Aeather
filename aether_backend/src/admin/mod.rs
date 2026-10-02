@@ -33,7 +33,7 @@ use crate::config::Config;
 use crate::engine::{Engine, NewKey, ScrubReport, now_millis};
 use crate::error::Error;
 use crate::history::{self, History};
-use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, CorsRule, KeyUpdate, Millis};
+use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, CorsRule, KeyUpdate, Millis, Quota};
 use crate::metrics::{self, Metrics};
 use crate::observe::RequestFacts;
 
@@ -123,6 +123,7 @@ pub fn router(
         .route("/keys/{id}/buckets/{bucket}", put(set_grant).delete(revoke_grant))
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{name}", get(get_bucket).delete(delete_bucket))
+        .route("/buckets/{name}/quota", put(set_quota))
         .route("/buckets/{name}/objects", get(objects::list))
         .route("/buckets/{name}/object", get(objects::head).put(objects::put).delete(objects::delete))
         .route("/buckets/{name}/object/download", get(objects::download))
@@ -204,6 +205,8 @@ pub struct BucketView {
     /// and are not counted).
     #[serde(default)]
     pub key_count: usize,
+    #[serde(default)]
+    pub quota: Quota,
     /// Keys with explicit permissions; only in single-bucket responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<BucketKeyView>>,
@@ -301,6 +304,7 @@ fn bucket_view(bucket: BucketRecord, usage: BucketUsage, keys: &[AccessKeyRecord
         objects: usage.objects,
         bytes: usage.bytes,
         key_count,
+        quota: bucket.quota,
         keys: None,
         cors: None,
     }
@@ -560,6 +564,18 @@ async fn get_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> Ap
     Ok(Json(BucketView { keys: Some(keys), cors: Some(cors), ..bucket_view(bucket, usage, &all_keys) }))
 }
 
+/// `{"max_bytes": n | null, "max_objects": n | null}`; null is no limit.
+async fn set_quota(
+    State(s): State<AdminState>,
+    Path(name): Path<String>,
+    body: Result<Json<Quota>, JsonRejection>,
+) -> ApiResult<Json<BucketView>> {
+    let Json(quota) = body?;
+    s.engine.set_bucket_quota(&name, quota).await?;
+    let (bucket, usage) = s.engine.bucket_usage(&name).await?;
+    Ok(Json(bucket_view(bucket, usage, &s.engine.access_keys())))
+}
+
 async fn delete_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> ApiResult<StatusCode> {
     s.engine.delete_bucket(&name).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -705,6 +721,7 @@ impl From<Error> for ApiError {
             Error::Conflict(_) => (StatusCode::CONFLICT, "Conflict"),
             Error::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
             Error::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
+            Error::QuotaExceeded(_) => (StatusCode::FORBIDDEN, "QuotaExceeded"),
             _ => {
                 error!(error = %e, "admin API internal error");
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")

@@ -9,26 +9,34 @@ use super::{BUCKET_USAGE, BUCKETS, OBJECTS, codec};
 use crate::error::{Error, Result};
 use crate::meta::{BucketRecord, BucketUsage, ObjectRecord};
 
-/// Accounts for `added` replacing `removed` (either may be absent).
+/// Accounts for `added` replacing `removed` (either may be absent). Fails
+/// with `QuotaExceeded`, before anything is stored, if the bucket's quota
+/// does not allow the change; the caller's transaction is then dropped.
 pub(super) fn adjust(
     txn: &WriteTransaction,
-    bucket_id: &Uuid,
+    bucket: &BucketRecord,
     added: Option<&ObjectRecord>,
     removed: Option<&ObjectRecord>,
 ) -> Result<()> {
     let mut table = txn.open_table(BUCKET_USAGE)?;
-    let mut usage: BucketUsage =
-        table.get(bucket_id.as_bytes().as_slice())?.map(|v| codec::decode(v.value())).transpose()?.unwrap_or_default();
-    if let Some(record) = added {
-        usage.objects += 1;
-        usage.bytes += record.size;
-    }
-    if let Some(record) = removed {
-        usage.objects = usage.objects.saturating_sub(1);
-        usage.bytes = usage.bytes.saturating_sub(record.size);
-    }
-    table.insert(bucket_id.as_bytes().as_slice(), codec::encode(&usage).as_slice())?;
+    let before = get(&table, &bucket.id)?;
+    let after = replaced(before, added.map(|r| r.size), removed.map(|r| r.size));
+    bucket.quota.check(before, after)?;
+    table.insert(bucket.id.as_bytes().as_slice(), codec::encode(&after).as_slice())?;
     Ok(())
+}
+
+/// Usage after an object of size `added` replaces one of size `removed`.
+pub fn replaced(mut usage: BucketUsage, added: Option<u64>, removed: Option<u64>) -> BucketUsage {
+    if let Some(size) = added {
+        usage.objects += 1;
+        usage.bytes += size;
+    }
+    if let Some(size) = removed {
+        usage.objects = usage.objects.saturating_sub(1);
+        usage.bytes = usage.bytes.saturating_sub(size);
+    }
+    usage
 }
 
 pub(super) fn remove(txn: &WriteTransaction, bucket_id: &Uuid) -> Result<()> {
