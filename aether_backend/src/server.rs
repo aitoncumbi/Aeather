@@ -113,8 +113,9 @@ fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Rou
     Router::new()
         .route("/_aether/health/live", get(|| async { "ok" }))
         .route("/_aether/health/ready", get(ready))
-        .with_state(engine)
+        .with_state(Arc::clone(&engine))
         .fallback_service(s3)
+        .layer(middleware::from_fn_with_state(engine, crate::s3::cors::layer))
 }
 
 /// Ready when the metadata store answers.

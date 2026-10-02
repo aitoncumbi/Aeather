@@ -70,7 +70,7 @@ anything from a 1 KB document to a 100 GB file.
   keys and permissions; sign-in sessions; end-to-end tests in CI
 - [ ] Group commit for metadata writes (small PUTs are capped by one fsync'd transaction
   at a time; see [BENCHMARKS.md](BENCHMARKS.md))
-- [ ] Per-bucket CORS (needed for browser uploads with presigned URLs)
+- [x] Per-bucket CORS (needed for browser uploads with presigned URLs)
 - [ ] Bucket quotas
 - [ ] Virtual-hosted-style addressing
 

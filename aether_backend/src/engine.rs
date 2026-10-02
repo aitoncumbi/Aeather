@@ -33,8 +33,8 @@ pub use self::keys::NewKey;
 use crate::blocks::{BlockStore, BlockWriter};
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
-    BlockRef, BucketRecord, BucketUsage, Command, DeleteCondition, ListPage, ListQuery, MetaStore, Millis, ObjectAttrs,
-    ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord,
+    BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
+    ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, UploadListQuery, UploadPage, UploadRecord,
     WriteCondition,
 };
 
@@ -200,6 +200,12 @@ impl Engine {
 
     pub async fn list_buckets(&self) -> Result<Vec<BucketRecord>> {
         self.read(|meta| meta.list_buckets()).await
+    }
+
+    /// Replaces the bucket's CORS rules; an empty list removes them.
+    pub async fn set_bucket_cors(&self, name: &str, rules: Vec<CorsRule>) -> Result<()> {
+        self.apply(Command::SetBucketCors { bucket: name.to_owned(), rules }).await?;
+        Ok(())
     }
 
     // ---- writes ----

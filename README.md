@@ -155,7 +155,7 @@ Current limitations:
   be changed.
 - **Path-style addressing only** (`http://host:9000/bucket/key`).
 - **Not supported yet:** versioning, server-side encryption, object tagging,
-  lifecycle rules (v2 on the roadmap); CORS (v1.1); ACLs and bucket policies
+  lifecycle rules (v2 on the roadmap); ACLs and bucket policies
   (per-key bucket permissions replace them); object lock; browser POST uploads.
   Requests that need these fail with `NotImplemented` rather than being ignored.
 - One node only: no replication yet, so back up the data directory (see the

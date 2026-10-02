@@ -15,6 +15,28 @@ pub struct BucketRecord {
     pub id: Uuid,
     pub name: String,
     pub created_at: Millis,
+    /// Which browser origins may call the S3 API on this bucket. Empty: none.
+    #[serde(default)]
+    pub cors: Vec<CorsRule>,
+}
+
+/// One rule of a bucket's CORS configuration, as in S3's `PutBucketCors`.
+/// Origins and headers may contain one `*` wildcard.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorsRule {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub allowed_origins: Vec<String>,
+    /// Some of GET, PUT, POST, DELETE and HEAD.
+    pub allowed_methods: Vec<String>,
+    /// Request headers a preflight may ask for; lowercased.
+    #[serde(default)]
+    pub allowed_headers: Vec<String>,
+    /// Response headers scripts may read.
+    #[serde(default)]
+    pub expose_headers: Vec<String>,
+    #[serde(default)]
+    pub max_age_secs: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

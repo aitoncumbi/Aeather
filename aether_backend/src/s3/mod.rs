@@ -6,6 +6,7 @@
 
 pub(crate) mod convert;
 mod copy;
+pub mod cors;
 mod multipart;
 
 use std::collections::BTreeMap;
@@ -637,6 +638,29 @@ impl S3 for AetherS3 {
     }
 
     /// No bucket has tags; S3 answers NoSuchTagSet for an untagged bucket.
+    async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let input = req.input;
+        let rules = cors::rules_from_s3(input.cors_configuration)?;
+        self.engine.set_bucket_cors(&input.bucket, rules).await.map_err(s3_error)?;
+        Ok(S3Response::new(PutBucketCorsOutput::default()))
+    }
+
+    async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
+        let bucket = self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        if bucket.cors.is_empty() {
+            return Err(s3_error!(NoSuchCORSConfiguration));
+        }
+        Ok(S3Response::new(GetBucketCorsOutput { cors_rules: Some(cors::rules_to_s3(bucket.cors)) }))
+    }
+
+    async fn delete_bucket_cors(
+        &self,
+        req: S3Request<DeleteBucketCorsInput>,
+    ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        self.engine.set_bucket_cors(&req.input.bucket, Vec::new()).await.map_err(s3_error)?;
+        Ok(S3Response::new(DeleteBucketCorsOutput::default()))
+    }
+
     async fn get_bucket_tagging(
         &self,
         req: S3Request<GetBucketTaggingInput>,

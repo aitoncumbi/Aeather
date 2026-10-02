@@ -24,6 +24,16 @@ export type Bucket = {
   bytes: number;
   key_count: number;
   keys?: BucketKey[];
+  cors?: CorsRule[];
+};
+
+export type CorsRule = {
+  id?: string | null;
+  allowed_origins: string[];
+  allowed_methods: string[];
+  allowed_headers: string[];
+  expose_headers: string[];
+  max_age_secs?: number | null;
 };
 
 export type ScrubReport = {

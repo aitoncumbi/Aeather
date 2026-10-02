@@ -1095,3 +1095,115 @@ async fn admin_keys_have_full_access() {
     assert_eq!(names, ["admin-made", "root-made"]);
     admin.delete_bucket().bucket("admin-made").send().await.unwrap();
 }
+
+#[tokio::test]
+async fn bucket_cors_lets_browsers_upload_with_presigned_urls() {
+    use aws_sdk_s3::types::{CorsConfiguration, CorsRule};
+
+    aether_backend::http::tls::install_crypto_provider();
+    let s = start().await;
+    s.client.create_bucket().bucket("web").send().await.unwrap();
+    let err = s.client.get_bucket_cors().bucket("web").send().await.unwrap_err();
+    assert_eq!(code(err), "NoSuchCORSConfiguration");
+
+    let http = reqwest::Client::new();
+    let url = |path: &str| format!("http://{}{path}", s.addr);
+    let preflight = |origin: &'static str, method: &'static str, headers: &'static str| {
+        let req = http
+            .request(reqwest::Method::OPTIONS, url("/web/upload.txt"))
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", method);
+        let req = if headers.is_empty() { req } else { req.header("Access-Control-Request-Headers", headers) };
+        req.send()
+    };
+    // No rules yet: browsers are refused.
+    assert_eq!(preflight("https://app.example.com", "PUT", "").await.unwrap().status(), 403);
+
+    let rule = |origins: &[&str], methods: &[&str]| {
+        let mut rule = CorsRule::builder().allowed_headers("Content-Type").expose_headers("ETag").max_age_seconds(600);
+        for o in origins {
+            rule = rule.allowed_origins(*o);
+        }
+        for m in methods {
+            rule = rule.allowed_methods(*m);
+        }
+        rule.build().unwrap()
+    };
+    let config = CorsConfiguration::builder()
+        .cors_rules(rule(&["https://app.example.com"], &["GET", "PUT"]))
+        .cors_rules(rule(&["*"], &["GET"]))
+        .build()
+        .unwrap();
+    s.client.put_bucket_cors().bucket("web").cors_configuration(config).send().await.unwrap();
+    let stored = s.client.get_bucket_cors().bucket("web").send().await.unwrap();
+    assert_eq!(stored.cors_rules().len(), 2);
+    assert_eq!(stored.cors_rules()[0].allowed_methods(), ["GET", "PUT"]);
+    assert_eq!(stored.cors_rules()[0].allowed_headers(), ["content-type"]);
+
+    // The app's origin may upload with Content-Type...
+    let res = preflight("https://app.example.com", "PUT", "content-type").await.unwrap();
+    assert_eq!(res.status(), 200);
+    let h = res.headers();
+    assert_eq!(h["access-control-allow-origin"], "https://app.example.com");
+    assert_eq!(h["access-control-allow-methods"], "GET, PUT");
+    assert_eq!(h["access-control-allow-headers"], "content-type");
+    assert_eq!(h["access-control-max-age"], "600");
+    assert_eq!(h["access-control-allow-credentials"], "true");
+    // ...but not send headers the rule does not list, and others may only read.
+    let res = preflight("https://app.example.com", "PUT", "x-custom").await.unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(preflight("https://evil.example.net", "PUT", "").await.unwrap().status(), 403);
+    let res = preflight("https://evil.example.net", "GET", "").await.unwrap();
+    assert_eq!(res.headers()["access-control-allow-origin"], "*");
+
+    // The browser then sends the presigned PUT; the response carries the CORS
+    // headers so the page can read it, including the exposed ETag.
+    let presigned = s
+        .client
+        .put_object()
+        .bucket("web")
+        .key("upload.txt")
+        .presigned(PresigningConfig::expires_in(Duration::from_secs(300)).unwrap())
+        .await
+        .unwrap();
+    let res = http
+        .put(presigned.uri())
+        .header("Origin", "https://app.example.com")
+        .body("from the browser")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["access-control-allow-origin"], "https://app.example.com");
+    assert_eq!(res.headers()["access-control-expose-headers"], "ETag");
+    assert!(res.headers().get_all("vary").iter().any(|v| v == "Origin"));
+    assert_eq!(get_bytes(&s.client, "web", "upload.txt").await, b"from the browser");
+
+    // CORS never replaces the signature: unsigned requests are still refused,
+    // with headers that let the page see why.
+    let res = http.get(url("/web/upload.txt")).header("Origin", "https://app.example.com").send().await.unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(res.headers()["access-control-allow-origin"], "https://app.example.com");
+
+    // Only owners change the configuration; DeleteBucketCors removes it.
+    let (writer, _) = key_client(&s, &[("web", WRITE)], |_| {}).await;
+    let err = writer.delete_bucket_cors().bucket("web").send().await.unwrap_err();
+    assert_eq!(code(err), "AccessDenied");
+    s.client.delete_bucket_cors().bucket("web").send().await.unwrap();
+    assert_eq!(preflight("https://app.example.com", "PUT", "").await.unwrap().status(), 403);
+
+    // Invalid configurations are refused, and missing buckets refuse preflights.
+    let bad = CorsConfiguration::builder().cors_rules(rule(&["*"], &["PATCH"])).build().unwrap();
+    let err = s.client.put_bucket_cors().bucket("web").cors_configuration(bad).send().await.unwrap_err();
+    assert_eq!(code(err), "InvalidRequest");
+    let res = http
+        .request(reqwest::Method::OPTIONS, url("/missing/k"))
+        .header("Origin", "https://app.example.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    let res = http.request(reqwest::Method::OPTIONS, url("/web/k")).send().await.unwrap();
+    assert_eq!(res.status(), 400);
+}
