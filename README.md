@@ -154,7 +154,10 @@ Current limitations:
   `signature_version="s3v4"` as above (AWS CLI v1: `s3.signature_version = s3v4`
   in its config). `s3.allow_sig_v2 = true` accepts SigV2 for clients that cannot
   be changed.
-- **Path-style addressing only** (`http://host:9000/bucket/key`).
+- **Path-style addressing by default** (`http://host:9000/bucket/key`). For
+  virtual-hosted style (`http://bucket.s3.example.com/key`), set
+  `s3.domains = ["s3.example.com"]` with wildcard DNS for `*.s3.example.com`
+  (and a wildcard certificate with TLS).
 - **Not supported yet:** versioning, server-side encryption, object tagging,
   lifecycle rules (v2 on the roadmap); ACLs and bucket policies
   (per-key bucket permissions replace them); object lock; browser POST uploads.

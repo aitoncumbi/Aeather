@@ -57,6 +57,10 @@ pub struct S3Config {
     /// presigned share links. Unset: the host the console was opened on,
     /// with the S3 port.
     pub public_url: Option<String>,
+    /// Base domains for virtual-hosted-style requests: with `s3.example.com`
+    /// here, `photos.s3.example.com/key` addresses bucket `photos`. Requests
+    /// to any other host stay path-style. Empty: path-style only.
+    pub domains: Vec<String>,
 }
 
 /// The JSON admin API (keys, permissions, buckets, usage).
@@ -192,6 +196,7 @@ impl Default for S3Config {
             max_object_size: 5 * 1024 * 1024 * 1024,
             allow_sig_v2: false,
             public_url: None,
+            domains: Vec::new(),
         }
     }
 }
@@ -290,6 +295,10 @@ impl Config {
         if self.tls.admin && self.tls.files().is_none() {
             return invalid("tls.admin needs tls.cert_file and tls.key_file");
         }
+        let label_ok = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !self.s3.domains.iter().all(|d| d.trim_end_matches('.').split('.').all(label_ok)) {
+            return invalid("s3.domains must be domain names without scheme or port, e.g. [\"s3.example.com\"]");
+        }
         if let Some(url) = &self.s3.public_url {
             let authority = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
             let authority = authority.map(|a| a.trim_end_matches('/'));
@@ -370,6 +379,21 @@ mod tests {
             jail.set_env("AETHER_ADMIN__LISTEN", "0.0.0.0:9001");
             let config = Config::load(None).unwrap();
             assert_eq!(config.admin.listen, "0.0.0.0:9001".parse().unwrap());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn domains_come_from_the_environment_and_are_validated() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("AETHER_S3__ACCESS_KEY", "admin");
+            jail.set_env("AETHER_S3__SECRET_KEY", "change-me-please");
+            jail.set_env("AETHER_S3__DOMAINS", r#"["s3.example.com", "storage.internal"]"#);
+            assert_eq!(Config::load(None).unwrap().s3.domains, ["s3.example.com", "storage.internal"]);
+            for bad in [r#"["https://s3.example.com"]"#, r#"["s3.example.com:9000"]"#, r#"["*.example.com"]"#] {
+                jail.set_env("AETHER_S3__DOMAINS", bad);
+                assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))), "{bad}");
+            }
             Ok(())
         });
     }

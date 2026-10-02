@@ -28,6 +28,11 @@ allow_sig_v2 = false
 # web console and used in its share links. Unset: the host the console was
 # opened on, with the port of `listen`.
 # public_url = "https://s3.internal:9000"
+# Base domains for virtual-hosted-style requests: with "s3.example.com",
+# photos.s3.example.com/key addresses bucket "photos". Needs wildcard DNS
+# (*.s3.example.com) and, with TLS, a wildcard certificate. Requests to any
+# other host, the domain itself included, stay path-style.
+# domains = ["s3.example.com"]
 
 [admin]
 # JSON API for access keys, permissions, buckets, objects and usage, and the

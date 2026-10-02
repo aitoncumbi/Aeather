@@ -24,6 +24,8 @@ use crate::http::{self, Limits};
 use crate::metrics::Metrics;
 use crate::observe::{Observer, observe};
 use crate::s3::AetherS3;
+use crate::s3::cors::CorsState;
+use crate::s3::host::Domains;
 
 /// Opens the engine and serves the S3 and admin APIs until `shutdown` resolves.
 pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'static) -> anyhow::Result<()> {
@@ -104,6 +106,10 @@ fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Rou
     builder.set_auth(S3Credentials(Arc::clone(&auth)));
     builder.set_access(S3Permissions(auth));
     builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
+    let domains = Domains::new(&config.s3.domains);
+    if !domains.is_empty() {
+        builder.set_host(domains.clone());
+    }
     let s3 = HandleError::new(builder.build(), |err: s3s::HttpError| async move {
         error!(error = ?err, "S3 request failed");
         Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(Body::empty()).unwrap()
@@ -115,7 +121,7 @@ fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Rou
         .route("/_aether/health/ready", get(ready))
         .with_state(Arc::clone(&engine))
         .fallback_service(s3)
-        .layer(middleware::from_fn_with_state(engine, crate::s3::cors::layer))
+        .layer(middleware::from_fn_with_state(CorsState { engine, domains }, crate::s3::cors::layer))
 }
 
 /// Ready when the metadata store answers.

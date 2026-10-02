@@ -7,6 +7,7 @@
 pub(crate) mod convert;
 mod copy;
 pub mod cors;
+pub mod host;
 mod multipart;
 
 use std::collections::BTreeMap;
