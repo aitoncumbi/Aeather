@@ -1415,6 +1415,11 @@ async fn sse_s3_encrypts_objects_when_a_master_key_is_set() {
     assert_eq!(copy.server_side_encryption(), Some(&ServerSideEncryption::Aes256));
     assert_eq!(get_bytes(&s.client, "bkt", "copy").await, data);
 
+    // Keys created now have sealed secrets, and still sign requests.
+    let (app, _) = key_client(&s, &[("bkt", READ_WRITE)], |_| {}).await;
+    app.put_object().bucket("bkt").key("by-app").body(ByteStream::from_static(b"ok")).send().await.unwrap();
+    assert_eq!(get_bytes(&app, "bkt", "by-app").await, b"ok");
+
     let enc = s.client.get_bucket_encryption().bucket("bkt").send().await.unwrap();
     let rule = &enc.server_side_encryption_configuration().unwrap().rules()[0];
     assert_eq!(rule.apply_server_side_encryption_by_default().unwrap().sse_algorithm(), &ServerSideEncryption::Aes256);

@@ -153,10 +153,10 @@ impl Engine {
             )));
         }
         let keys = KeyCache::default();
-        KeyCache::load(&meta, &keys)?;
+        KeyCache::load(&meta, &keys, config.keyring.as_deref())?;
         let meta = Arc::new(meta);
         let stats = Arc::new(EngineStats::default());
-        Ok(Self {
+        let engine = Self {
             writer: writer::Writer::start(Arc::clone(&meta), Arc::clone(&stats)),
             meta,
             blocks: Arc::new(blocks),
@@ -164,7 +164,12 @@ impl Engine {
             stats,
             scrub: scrub::ScrubState::default(),
             config,
-        })
+        };
+        let sealed = engine.seal_key_secrets().await?;
+        if sealed > 0 {
+            tracing::info!(keys = sealed, "sealed access key secrets under the current master key");
+        }
+        Ok(engine)
     }
 
     pub fn config(&self) -> &EngineConfig {

@@ -87,19 +87,26 @@ impl Keyring {
     /// A fresh random data key, and the same key sealed for storage.
     pub fn new_data_key(&self) -> Result<(DataKey, SealedKey)> {
         let mut key = [0u8; KEY_LEN];
-        let mut nonce = [0u8; NONCE_LEN];
         self.rng.fill(&mut key).map_err(|_| Error::Io(std::io::Error::other("no randomness")))?;
-        self.rng.fill(&mut nonce).map_err(|_| Error::Io(std::io::Error::other("no randomness")))?;
-        let mut sealed = key.to_vec();
-        self.current
-            .1
-            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(b"aether data key"), &mut sealed)
-            .map_err(|_| Error::Io(std::io::Error::other("sealing a data key failed")))?;
-        let sealed = SealedKey { key_id: self.current.0.clone(), nonce: nonce.to_vec(), sealed };
+        let sealed = self.seal(&key, b"aether data key")?;
         Ok((DataKey(key), sealed))
     }
 
-    pub fn open(&self, sealed: &SealedKey) -> Result<DataKey> {
+    /// Seals a small secret under the current master key. `context` is
+    /// authenticated with it, so the result only opens for the same context.
+    pub fn seal(&self, plaintext: &[u8], context: &[u8]) -> Result<SealedKey> {
+        let mut nonce = [0u8; NONCE_LEN];
+        self.rng.fill(&mut nonce).map_err(|_| Error::Io(std::io::Error::other("no randomness")))?;
+        let mut sealed = plaintext.to_vec();
+        self.current
+            .1
+            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(context), &mut sealed)
+            .map_err(|_| Error::Io(std::io::Error::other("sealing failed")))?;
+        Ok(SealedKey { key_id: self.current.0.clone(), nonce: nonce.to_vec(), sealed })
+    }
+
+    /// Opens what [`seal`](Self::seal) sealed with the same `context`.
+    pub fn unseal(&self, sealed: &SealedKey, context: &[u8]) -> Result<Vec<u8>> {
         let key = std::iter::once(&self.current)
             .chain(&self.previous)
             .find(|(id, _)| *id == sealed.key_id)
@@ -108,11 +115,16 @@ impl Keyring {
                 Error::Corrupt(format!("data sealed with master key {} which is not configured", sealed.key_id))
             })?;
         let nonce =
-            Nonce::try_assume_unique_for_key(&sealed.nonce).map_err(|_| Error::Corrupt("bad data key nonce".into()))?;
+            Nonce::try_assume_unique_for_key(&sealed.nonce).map_err(|_| Error::Corrupt("bad sealed nonce".into()))?;
         let mut buf = sealed.sealed.clone();
         let plain = key
-            .open_in_place(nonce, Aad::from(b"aether data key"), &mut buf)
-            .map_err(|_| Error::Corrupt(format!("data key does not open with master key {}", sealed.key_id)))?;
+            .open_in_place(nonce, Aad::from(context), &mut buf)
+            .map_err(|_| Error::Corrupt(format!("sealed data does not open with master key {}", sealed.key_id)))?;
+        Ok(plain.to_vec())
+    }
+
+    pub fn open(&self, sealed: &SealedKey) -> Result<DataKey> {
+        let plain = self.unseal(sealed, b"aether data key")?;
         Ok(DataKey(plain.try_into().map_err(|_| Error::Corrupt("bad data key length".into()))?))
     }
 }

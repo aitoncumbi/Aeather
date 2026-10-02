@@ -62,7 +62,8 @@ AETHER_ENCRYPTION__MASTER_KEY=<that value> ./target/release/aether
 ```
 
 With a master key, every new object is encrypted (SSE-S3, AES-256-GCM); objects
-written before stay as they were. **Losing the key loses the data**, so back it
+written before stay as they were. Access-key secrets in the metadata are
+encrypted too, so a copy of the database alone does not reveal working keys. **Losing the key loses the data**, so back it
 up separately. To rotate, set a new `encryption.master_key` and move the old one
 to `encryption.previous_keys`. The server refuses to start without every key
 that has encrypted stored data.

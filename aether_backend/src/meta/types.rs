@@ -164,9 +164,13 @@ impl BlockRef {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccessKeyRecord {
     pub access_key_id: String,
-    /// Stored in plaintext: SigV4 verification needs it. Encrypted under the
-    /// master key once encryption at rest exists (v2).
+    /// SigV4 verification needs the plaintext. With encryption at rest it is
+    /// stored empty and kept in `sealed_secret` instead; the engine's key
+    /// cache holds it decrypted.
     pub secret_key: String,
+    /// The secret sealed under the master key, bound to the access key id.
+    #[serde(default)]
+    pub sealed_secret: Option<crate::crypto::SealedKey>,
     /// What the key is for, e.g. the application's name.
     pub name: String,
     pub created_at: Millis,

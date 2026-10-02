@@ -1220,3 +1220,48 @@ async fn objects_are_encrypted_at_rest_and_read_back_by_range() {
     let only_new = EngineConfig { data_dir: dir.path().to_path_buf(), ..only_new };
     assert!(Engine::open(only_new).await.is_err());
 }
+
+#[tokio::test]
+async fn access_key_secrets_are_sealed_under_the_master_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let plain = EngineConfig { data_dir: dir.path().to_path_buf(), ..EngineConfig::default() };
+    let engine = Engine::open(plain).await.unwrap();
+    let new = |name: &str| NewKey { name: name.into(), ..NewKey::default() };
+    let before = engine.create_key(new("before")).await.unwrap();
+    assert!(engine.meta.list_keys().unwrap()[0].sealed_secret.is_none(), "no master key: stored as before");
+    drop(engine);
+
+    // Adding a master key seals existing secrets at startup; new ones are sealed when created.
+    let engine = engine_with_keys(dir.path(), 1, &[]).await;
+    let after = engine.create_key(new("after")).await.unwrap();
+    for stored in engine.meta.list_keys().unwrap() {
+        assert!(stored.secret_key.is_empty(), "{} stored in plaintext", stored.access_key_id);
+        assert_eq!(stored.sealed_secret.unwrap().key_id, crate::crypto::fingerprint(&[1u8; 32]));
+    }
+    assert_eq!(engine.access_key(&before.access_key_id).unwrap().secret_key, before.secret_key);
+    assert_eq!(engine.access_key(&after.access_key_id).unwrap().secret_key, after.secret_key);
+    drop(engine);
+
+    // Rotation re-seals them under the new key.
+    let engine = engine_with_keys(dir.path(), 2, &[1]).await;
+    assert!(
+        engine
+            .meta
+            .list_keys()
+            .unwrap()
+            .iter()
+            .all(|k| k.sealed_secret.as_ref().unwrap().key_id == crate::crypto::fingerprint(&[2u8; 32]))
+    );
+    assert_eq!(engine.access_key(&after.access_key_id).unwrap().secret_key, after.secret_key);
+
+    // A sealed secret is bound to its key id: copied to another key, it does not open.
+    let stored =
+        engine.meta.list_keys().unwrap().into_iter().find(|k| k.access_key_id == before.access_key_id).unwrap();
+    let ring = engine.config.keyring.clone().unwrap();
+    assert!(ring.unseal(stored.sealed_secret.as_ref().unwrap(), after.access_key_id.as_bytes()).is_err());
+    drop(engine);
+
+    // Without the master key, the server does not start.
+    let keyless = EngineConfig { data_dir: dir.path().to_path_buf(), ..EngineConfig::default() };
+    assert!(Engine::open(keyless).await.is_err());
+}
