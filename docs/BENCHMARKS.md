@@ -96,7 +96,24 @@ one write transaction at a time. Small PUTs therefore top out at about 1,400 to
 
 The fix is group commit: let one transaction (and one fsync) carry every write
 that is waiting, with per-write rollback for writes whose preconditions fail.
-It is on the roadmap.
+
+**Group commit (v1.1).** A single writer thread now takes every metadata write
+that is waiting and commits them in one transaction. On a laptop with a slower
+fsync (Intel i5-8250U, 8 threads, 15 GB, NVMe with btrfs, Linux 7.2;
+`examples/bench`, 1 KiB objects, 8 seconds per phase, server and client on the
+same machine):
+
+| | clients | PUT ops/s | p50 ms | p99 ms |
+|---|--:|--:|--:|--:|
+| before | 1 | 146 | 6.4 | 16.1 |
+| after | 1 | 150 | 6.4 | 9.4 |
+| before | 32 | 166 | 190.6 | 254.5 |
+| after | 32 | 1926 | 15.1 | 47.3 |
+
+One client still waits for its own fsync. With many clients, each fsync
+carries a whole batch: about 12 times the throughput at a twelfth of the
+latency. `aether_metadata_writes_total / aether_metadata_commits_total` is the
+average batch size.
 
 **Large writes: hashing and syncing.** A 64 MiB PUT is hashed three times
 (MD5 for the ETag, CRC32C for the block, and the CRC32 that the SDK sends) and

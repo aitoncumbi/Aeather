@@ -183,6 +183,12 @@ impl Metrics {
             ("scrub_checked_blocks", "Blocks verified by the scrubber", &stats.scrub_blocks_checked),
             ("scrub_checked_bytes", "Bytes verified by the scrubber", &stats.scrub_bytes_checked),
             ("scrub_corrupt_blocks", "Damaged or missing blocks found by the scrubber", &stats.scrub_corrupt_blocks),
+            (
+                "metadata_commits",
+                "Metadata write transactions (each one fsync), several writes each under load",
+                &stats.meta_commits,
+            ),
+            ("metadata_writes", "Metadata writes (commands) committed or refused", &stats.meta_writes),
         ];
         for (name, help, value) in counters {
             registry.register(name, help, ConstCounter::new(value.load(Ordering::Relaxed)));
