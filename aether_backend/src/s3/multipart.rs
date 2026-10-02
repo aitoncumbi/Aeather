@@ -376,6 +376,7 @@ fn completed_output(bucket: String, key: String, record: &ObjectRecord) -> Compl
         e_tag: Some(etag(record)),
         checksum_type: stored_checksum_type(&record.attrs),
         server_side_encryption: sse_of(record),
+        version_id: version_id_of(record),
         ..Default::default()
     };
     set_checksums!(output, checksum_from_map(&record.attrs.checksums));

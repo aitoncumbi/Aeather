@@ -97,6 +97,12 @@ pub enum BucketCommand {
     Show { name: String },
     /// Delete an empty bucket
     Delete { name: String },
+    /// Turn on versioning (keep every version), or suspend it
+    Versioning {
+        name: String,
+        #[arg(value_parser = ["enable", "suspend"])]
+        action: String,
+    },
     /// Limit a bucket's size and object count. Unset limits stay as they are
     Quota {
         name: String,
@@ -206,6 +212,12 @@ async fn bucket(client: &Client, command: BucketCommand, json: bool) -> anyhow::
         BucketCommand::Delete { name } => {
             client.call(Method::DELETE, &path(&name), None).await?;
             format!("Deleted bucket {name}.\n")
+        }
+        BucketCommand::Versioning { name, action } => {
+            let status = if action == "enable" { "Enabled" } else { "Suspended" };
+            let body = json!({ "status": status });
+            let bucket = client.call(Method::PUT, &format!("{}/versioning", path(&name)), Some(body)).await?;
+            if json { pretty(&bucket) } else { format_bucket(&bucket) }
         }
         BucketCommand::Quota { name, max_bytes, max_objects, clear } => {
             let mut quota = client.call(Method::GET, &path(&name), None).await?["quota"].clone();
@@ -488,6 +500,11 @@ fn format_bucket(bucket: &Value) -> String {
     let _ = writeln!(out, "Created: {}", text(&bucket["created_at"]));
     let _ = writeln!(out, "Objects: {}", text(&bucket["objects"]));
     let _ = writeln!(out, "Size:    {}", bytes(bucket["bytes"].as_u64().unwrap_or(0)));
+    let _ = writeln!(out, "Versioning: {}", text(&bucket["versioning"]));
+    if let Some(n) = bucket["noncurrent_objects"].as_u64().filter(|n| *n > 0) {
+        let size = bytes(bucket["noncurrent_bytes"].as_u64().unwrap_or(0));
+        let _ = writeln!(out, "Older versions: {n} ({size})");
+    }
     let quota = &bucket["quota"];
     let limits: Vec<String> =
         [quota["max_bytes"].as_u64().map(bytes), quota["max_objects"].as_u64().map(|n| format!("{n} objects"))]

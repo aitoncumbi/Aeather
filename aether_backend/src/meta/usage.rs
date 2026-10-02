@@ -18,10 +18,75 @@ pub(super) fn adjust(
     added: Option<&ObjectRecord>,
     removed: Option<&ObjectRecord>,
 ) -> Result<()> {
+    change(txn, bucket, |u| replaced(u, size_of(added), size_of(removed)))
+}
+
+/// Accounts for versions entering (`added`) or leaving (`removed`) the
+/// noncurrent set. Delete markers take no space and are not counted.
+pub(super) fn adjust_noncurrent(
+    txn: &WriteTransaction,
+    bucket: &BucketRecord,
+    added: Option<&ObjectRecord>,
+    removed: Option<&ObjectRecord>,
+) -> Result<()> {
+    change(txn, bucket, |mut u| {
+        if let Some(size) = size_of(added) {
+            u.noncurrent_objects += 1;
+            u.noncurrent_bytes += size;
+        }
+        if let Some(size) = size_of(removed) {
+            u.noncurrent_objects = u.noncurrent_objects.saturating_sub(1);
+            u.noncurrent_bytes = u.noncurrent_bytes.saturating_sub(size);
+        }
+        u
+    })
+}
+
+/// Moves a version between the current and noncurrent sets. No data is
+/// added, so the quota is not checked: a delete that promotes an older
+/// version must never be refused.
+pub(super) fn shift(
+    txn: &WriteTransaction,
+    bucket: &BucketRecord,
+    record: &ObjectRecord,
+    to_noncurrent: bool,
+) -> Result<()> {
+    let Some(size) = size_of(Some(record)) else { return Ok(()) };
+    change_unchecked(txn, bucket, |mut u| {
+        if to_noncurrent {
+            u = replaced(u, None, Some(size));
+            u.noncurrent_objects += 1;
+            u.noncurrent_bytes += size;
+        } else {
+            u = replaced(u, Some(size), None);
+            u.noncurrent_objects = u.noncurrent_objects.saturating_sub(1);
+            u.noncurrent_bytes = u.noncurrent_bytes.saturating_sub(size);
+        }
+        u
+    })
+}
+
+fn size_of(record: Option<&ObjectRecord>) -> Option<u64> {
+    record.filter(|r| !r.delete_marker).map(|r| r.size)
+}
+
+/// Applies `f` to the bucket's usage, checking the quota before storing.
+fn change(txn: &WriteTransaction, bucket: &BucketRecord, f: impl FnOnce(BucketUsage) -> BucketUsage) -> Result<()> {
     let mut table = txn.open_table(BUCKET_USAGE)?;
     let before = get(&table, &bucket.id)?;
-    let after = replaced(before, added.map(|r| r.size), removed.map(|r| r.size));
+    let after = f(before);
     bucket.quota.check(before, after)?;
+    table.insert(bucket.id.as_bytes().as_slice(), codec::encode(&after).as_slice())?;
+    Ok(())
+}
+
+fn change_unchecked(
+    txn: &WriteTransaction,
+    bucket: &BucketRecord,
+    f: impl FnOnce(BucketUsage) -> BucketUsage,
+) -> Result<()> {
+    let mut table = txn.open_table(BUCKET_USAGE)?;
+    let after = f(get(&table, &bucket.id)?);
     table.insert(bucket.id.as_bytes().as_slice(), codec::encode(&after).as_slice())?;
     Ok(())
 }

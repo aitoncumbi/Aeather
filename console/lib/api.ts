@@ -24,6 +24,9 @@ export type Bucket = {
   bytes: number;
   key_count: number;
   quota: Quota;
+  versioning: "Unversioned" | "Enabled" | "Suspended";
+  noncurrent_objects: number;
+  noncurrent_bytes: number;
   keys?: BucketKey[];
   cors?: CorsRule[];
 };

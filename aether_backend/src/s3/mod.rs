@@ -22,7 +22,7 @@ use sync_wrapper::SyncStream;
 
 use self::convert::*;
 use crate::auth::Authorizer;
-use crate::engine::{Engine, StagedObject};
+use crate::engine::{Engine, StagedObject, VersionRef, Versioning, VersionsQuery};
 use crate::error::Error as EngineError;
 use crate::meta::{ListPage, ListQuery, ObjectRecord, UploadRecord};
 
@@ -307,6 +307,7 @@ impl S3 for AetherS3 {
         let record = self.engine.commit_put(&bucket, &key, staged, attrs, condition).await.map_err(s3_error)?;
 
         let mut output = PutObjectOutput {
+            version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             e_tag: Some(etag(&record)),
             checksum_type: stored_checksum_type(&record.attrs),
@@ -319,8 +320,11 @@ impl S3 for AetherS3 {
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
         self.check_sse(None, input.sse_customer_key.is_some())?;
-        check_version_id(input.version_id.as_deref())?;
-        let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
+        let version = parse_version(input.version_id.as_deref())?;
+        let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
+        if record.delete_marker {
+            return Err(delete_marker_error(&record, version.is_some()));
+        }
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -343,6 +347,7 @@ impl S3 for AetherS3 {
 
         let body = SyncStream::new(self.engine.read_object(&record, range.clone()));
         let mut output = GetObjectOutput {
+            version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             body: Some(StreamingBlob::wrap(body)),
             content_length: Some((range.end - range.start) as i64),
@@ -368,8 +373,11 @@ impl S3 for AetherS3 {
 
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
-        check_version_id(input.version_id.as_deref())?;
-        let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
+        let version = parse_version(input.version_id.as_deref())?;
+        let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
+        if record.delete_marker {
+            return Err(delete_marker_error(&record, version.is_some()));
+        }
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -390,6 +398,7 @@ impl S3 for AetherS3 {
             input.response_expires,
         );
         let mut output = HeadObjectOutput {
+            version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             content_length: Some((range.end - range.start) as i64),
             content_range,
@@ -418,11 +427,16 @@ impl S3 for AetherS3 {
 
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
-        check_version_id(input.version_id.as_deref())?;
+        let version = parse_version(input.version_id.as_deref())?;
         let condition =
             delete_condition(input.if_match.as_ref(), input.if_match_last_modified_time.as_ref(), input.if_match_size)?;
-        self.engine.delete_object_if(&input.bucket, &input.key, condition).await.map_err(s3_error)?;
-        Ok(S3Response::new(DeleteObjectOutput::default()))
+        let deleted =
+            self.engine.delete_object_if(&input.bucket, &input.key, version, condition).await.map_err(s3_error)?;
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: deleted.delete_marker.then_some(true),
+            version_id: deleted.version.map(|v| v.to_string()),
+            ..Default::default()
+        }))
     }
 
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
@@ -441,30 +455,40 @@ impl S3 for AetherS3 {
                 code: Some(code.into()),
                 message: Some(message.into()),
             };
-            if check_version_id(object.version_id.as_deref()).is_err() {
-                errors.push(error("NoSuchVersion", "versioning is not enabled"));
+            let Ok(version) = parse_version(object.version_id.as_deref()) else {
+                errors.push(error("InvalidArgument", "Invalid version id specified"));
                 continue;
-            }
+            };
             let if_match = object.e_tag.clone().map(ETagCondition::ETag);
             match delete_condition(if_match.as_ref(), object.last_modified_time.as_ref(), object.size) {
-                Ok(condition) => targets.push((object.key, condition)),
+                Ok(condition) => targets.push((object.key, version, condition)),
                 Err(e) => errors.push(error("InvalidArgument", e.message().unwrap_or("invalid condition"))),
             }
         }
-        let failed = self.engine.delete_objects_if(&input.bucket, targets.clone()).await.map_err(s3_error)?;
+        let results = self.engine.delete_objects_if(&input.bucket, targets.clone()).await.map_err(s3_error)?;
 
         let mut deleted = Vec::with_capacity(targets.len());
-        for (i, (key, _)) in targets.into_iter().enumerate() {
-            if failed.binary_search(&i).is_ok() {
+        for ((key, version, _), result) in targets.into_iter().zip(results) {
+            let Some(result) = result else {
                 errors.push(Error {
                     key: Some(key),
+                    version_id: version.map(|v| v.to_string()),
                     code: Some("PreconditionFailed".into()),
                     message: Some("At least one of the pre-conditions you specified did not hold".into()),
-                    ..Default::default()
                 });
-            } else {
-                deleted.push(DeletedObject { key: Some(key), ..Default::default() });
-            }
+                continue;
+            };
+            // A version removed is echoed back; a delete marker created is named.
+            let (version_id, marker_version_id) = match version {
+                Some(v) => (Some(v.to_string()), None),
+                None => (None, result.delete_marker.then(|| result.version.map(|v| v.to_string())).flatten()),
+            };
+            deleted.push(DeletedObject {
+                key: Some(key),
+                version_id,
+                delete_marker: result.delete_marker.then_some(true),
+                delete_marker_version_id: marker_version_id,
+            });
         }
         let quiet = input.delete.quiet == Some(true);
         let output =
@@ -581,57 +605,75 @@ impl S3 for AetherS3 {
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
         let input = req.input;
         let url = wants_url_encoding(input.encoding_type.as_ref())?;
-        if input.version_id_marker.as_deref().is_some_and(|m| !m.is_empty() && m != "null") {
-            return Err(s3_error!(InvalidArgument, "invalid version-id-marker"));
-        }
+        let version_marker = match input.version_id_marker.as_deref().filter(|m| !m.is_empty()) {
+            None => None,
+            Some(m) => {
+                Some(VersionRef::parse(m).ok_or_else(|| s3_error!(InvalidArgument, "invalid version-id-marker"))?)
+            }
+        };
         let prefix = input.prefix.unwrap_or_default();
         let delimiter = input.delimiter.filter(|d| !d.is_empty());
-        let start = input
-            .key_marker
-            .as_deref()
-            .filter(|m| !m.is_empty())
-            .map(|m| marker_start(m, &prefix, delimiter.as_deref()));
+        let key_marker = input.key_marker.clone().filter(|m| !m.is_empty());
+        if version_marker.is_some() && key_marker.is_none() {
+            return Err(s3_error!(InvalidArgument, "a version-id-marker needs a key-marker"));
+        }
         let max_keys = max_keys(input.max_keys)?;
-        let query = ListQuery { prefix: prefix.clone(), delimiter: delimiter.clone(), start, max_keys };
-        let page = self.list(&input.bucket, query).await?;
-
-        let truncated = page.next_start.is_some();
-        let last_key = page.objects.last().map(|o| o.key.clone());
-        let last_prefix = page.common_prefixes.last().cloned();
-        let (next_key_marker, next_version_id_marker) = match (truncated, last_key, last_prefix) {
-            (false, _, _) => (None, None),
-            (true, Some(key), Some(prefix)) if prefix > key => (Some(prefix), None),
-            (true, Some(key), _) => (Some(key), Some("null".to_owned())),
-            (true, None, prefix) => (prefix, None),
+        let query = VersionsQuery {
+            prefix: prefix.clone(),
+            delimiter: delimiter.clone(),
+            key_marker,
+            version_marker,
+            max_keys,
         };
+        let mut page = self.engine.list_versions(&input.bucket, query).await.map_err(s3_error)?;
+        // Asking for nothing gets a complete (empty) answer, as in S3.
+        if max_keys == 0 {
+            page.next = None;
+        }
 
         let encode = |s: String| if url { url_encode(&s) } else { s };
-        let versions = page
-            .objects
-            .into_iter()
-            .map(|o| ObjectVersion {
-                key: Some(encode(o.key)),
-                version_id: Some("null".into()),
-                is_latest: Some(true),
-                size: Some(o.size as i64),
-                e_tag: Some(ETag::Strong(o.etag)),
-                last_modified: Some(timestamp(o.last_modified)),
-                storage_class: Some(ObjectVersionStorageClass::from_static(ObjectVersionStorageClass::STANDARD)),
-                owner: Some(Self::owner()),
-                ..Default::default()
-            })
-            .collect();
+        let (mut versions, mut markers) = (Vec::new(), Vec::new());
+        for entry in page.versions {
+            let record = entry.record;
+            if record.delete_marker {
+                markers.push(DeleteMarkerEntry {
+                    key: Some(encode(entry.key)),
+                    version_id: Some(record.version().to_string()),
+                    is_latest: Some(entry.is_latest),
+                    last_modified: Some(timestamp(record.last_modified)),
+                    owner: Some(Self::owner()),
+                });
+            } else {
+                versions.push(ObjectVersion {
+                    key: Some(encode(entry.key)),
+                    version_id: Some(record.version().to_string()),
+                    is_latest: Some(entry.is_latest),
+                    size: Some(record.size as i64),
+                    e_tag: Some(ETag::Strong(record.etag)),
+                    last_modified: Some(timestamp(record.last_modified)),
+                    storage_class: Some(ObjectVersionStorageClass::from_static(ObjectVersionStorageClass::STANDARD)),
+                    owner: Some(Self::owner()),
+                    ..Default::default()
+                });
+            }
+        }
+        let truncated = page.next.is_some();
+        let (next_key_marker, next_version_id_marker) = match page.next {
+            Some((key, version)) => (Some(encode(key)), version.map(|v| v.to_string())),
+            None => (None, None),
+        };
         let output = ListObjectVersionsOutput {
             name: Some(input.bucket),
             prefix: Some(encode(prefix)),
             delimiter: delimiter.map(encode),
             key_marker: input.key_marker.map(encode),
             version_id_marker: input.version_id_marker,
-            next_key_marker: next_key_marker.map(encode),
+            next_key_marker,
             next_version_id_marker,
             max_keys: Some(max_keys as i32),
             is_truncated: Some(truncated),
             versions: Some(versions),
+            delete_markers: Some(markers),
             common_prefixes: Some(
                 page.common_prefixes.into_iter().map(|p| CommonPrefix { prefix: Some(encode(p)) }).collect(),
             ),
@@ -646,8 +688,31 @@ impl S3 for AetherS3 {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
-        Ok(S3Response::new(GetBucketVersioningOutput::default()))
+        let bucket = self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        let status = match bucket.versioning {
+            Versioning::Unversioned => None,
+            Versioning::Enabled => Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+            Versioning::Suspended => Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+        };
+        Ok(S3Response::new(GetBucketVersioningOutput { status, ..Default::default() }))
+    }
+
+    async fn put_bucket_versioning(
+        &self,
+        req: S3Request<PutBucketVersioningInput>,
+    ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let input = req.input;
+        let config = input.versioning_configuration;
+        if config.mfa_delete.as_ref().is_some_and(|m| m.as_str() == MFADelete::ENABLED) {
+            return Err(s3_error!(NotImplemented, "MFA delete is not supported"));
+        }
+        let versioning = match config.status.as_ref().map(|s| s.as_str()) {
+            Some(BucketVersioningStatus::ENABLED) => Versioning::Enabled,
+            Some(BucketVersioningStatus::SUSPENDED) => Versioning::Suspended,
+            _ => return Err(s3_error!(MalformedXML, "the versioning status must be Enabled or Suspended")),
+        };
+        self.engine.set_bucket_versioning(&input.bucket, versioning).await.map_err(s3_error)?;
+        Ok(S3Response::new(PutBucketVersioningOutput::default()))
     }
 
     /// Tags cannot be set yet (such requests are refused), so every object's
@@ -657,9 +722,15 @@ impl S3 for AetherS3 {
         req: S3Request<GetObjectTaggingInput>,
     ) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         let input = req.input;
-        check_version_id(input.version_id.as_deref())?;
-        let record = self.engine.get_object(&input.bucket, &input.key).await.map_err(s3_error)?;
-        Ok(S3Response::new(GetObjectTaggingOutput { tag_set: tags::to_tag_set(&record.attrs.tags), version_id: None }))
+        let version = parse_version(input.version_id.as_deref())?;
+        let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
+        if record.delete_marker {
+            return Err(delete_marker_error(&record, version.is_some()));
+        }
+        Ok(S3Response::new(GetObjectTaggingOutput {
+            tag_set: tags::to_tag_set(&record.attrs.tags),
+            version_id: version_id_of(&record),
+        }))
     }
 
     async fn put_object_tagging(
@@ -667,10 +738,10 @@ impl S3 for AetherS3 {
         req: S3Request<PutObjectTaggingInput>,
     ) -> S3Result<S3Response<PutObjectTaggingOutput>> {
         let input = req.input;
-        check_version_id(input.version_id.as_deref())?;
+        let version = parse_version(input.version_id.as_deref())?;
         let tags = tags::from_tag_set(input.tagging.tag_set)?;
-        self.engine.set_object_tags(&input.bucket, &input.key, tags).await.map_err(s3_error)?;
-        Ok(S3Response::new(PutObjectTaggingOutput::default()))
+        self.engine.set_object_tags(&input.bucket, &input.key, version, tags).await.map_err(s3_error)?;
+        Ok(S3Response::new(PutObjectTaggingOutput { version_id: input.version_id }))
     }
 
     async fn delete_object_tagging(
@@ -678,9 +749,9 @@ impl S3 for AetherS3 {
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
         let input = req.input;
-        check_version_id(input.version_id.as_deref())?;
-        self.engine.set_object_tags(&input.bucket, &input.key, Default::default()).await.map_err(s3_error)?;
-        Ok(S3Response::new(DeleteObjectTaggingOutput::default()))
+        let version = parse_version(input.version_id.as_deref())?;
+        self.engine.set_object_tags(&input.bucket, &input.key, version, Default::default()).await.map_err(s3_error)?;
+        Ok(S3Response::new(DeleteObjectTaggingOutput { version_id: input.version_id }))
     }
 
     /// No bucket has tags; S3 answers NoSuchTagSet for an untagged bucket.

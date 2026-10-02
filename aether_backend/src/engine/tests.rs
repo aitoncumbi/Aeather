@@ -144,14 +144,15 @@ async fn overwrite_and_delete_release_blocks() {
     assert_eq!(engine.meta.block_count().unwrap(), 2);
     assert_eq!(read_all(&engine, &newer, 0..1200).await, pattern(1200));
 
+    // Unversioned: the object is gone, no delete marker.
     let deleted = engine.delete_object("bkt", "k").await.unwrap();
-    assert_eq!(deleted, Some(newer));
+    assert_eq!(deleted, Deleted::default());
     assert!(matches!(engine.get_object("bkt", "k").await, Err(Error::NoSuchKey)));
     assert_eq!(engine.collect_garbage().await.unwrap(), 2);
     assert_eq!(block_files(&engine).await, 0);
     assert_eq!(engine.meta.block_count().unwrap(), 0);
 
-    assert_eq!(engine.delete_object("bkt", "k").await.unwrap(), None);
+    assert_eq!(engine.delete_object("bkt", "k").await.unwrap(), Deleted::default());
     assert!(matches!(engine.delete_object("nope", "k").await, Err(Error::NoSuchBucket)));
 }
 
@@ -866,28 +867,35 @@ async fn usage_tracks_every_write() {
     put(&engine, "bkt", "a", &pattern(100)).await;
     put(&engine, "bkt", "b", &pattern(2500)).await;
     put(&engine, "bkt", "a", &pattern(50)).await;
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 2550 });
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 2550, ..Default::default() });
 
     engine.delete_object("bkt", "b").await.unwrap();
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 50 });
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 50, ..Default::default() });
 
     let a = engine.get_object("bkt", "a").await.unwrap();
     engine.copy_object("bkt", "a", &a, "bkt", "c", ObjectAttrs::default(), WriteCondition::None).await.unwrap();
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 100 });
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 100, ..Default::default() });
 
     let id = engine.create_upload("bkt", "d", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
     let p1 = upload_part(&engine, "d", id, 1, &pattern(1500)).await;
     let p2 = upload_part(&engine, "d", id, 2, &pattern(700)).await;
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 2, bytes: 100 }, "parts do not count until completed");
+    assert_eq!(
+        bkt_usage(&engine).await,
+        BucketUsage { objects: 2, bytes: 100, ..Default::default() },
+        "parts do not count until completed"
+    );
     complete(&engine, "d", id, &[(1, &p1), (2, &p2)]).await.unwrap();
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 3, bytes: 2300 });
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 3, bytes: 2300, ..Default::default() });
 
     engine.delete_objects("bkt", vec!["a".into(), "c".into(), "missing".into()]).await.unwrap();
-    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 2200 });
+    assert_eq!(bkt_usage(&engine).await, BucketUsage { objects: 1, bytes: 2200, ..Default::default() });
 
     let all = engine.list_bucket_usage().await.unwrap();
     assert_eq!(all.len(), 1);
-    assert_eq!((all[0].0.name.as_str(), all[0].1), ("bkt", BucketUsage { objects: 1, bytes: 2200 }));
+    assert_eq!(
+        (all[0].0.name.as_str(), all[0].1),
+        ("bkt", BucketUsage { objects: 1, bytes: 2200, ..Default::default() })
+    );
 }
 
 #[tokio::test]
@@ -904,7 +912,10 @@ async fn schema_migration_rebuilds_usage() {
         assert_eq!(engine.bucket_usage("bkt").await.unwrap().1, BucketUsage::default());
     }
     let engine = Engine::open(config).await.unwrap();
-    assert_eq!(engine.bucket_usage("bkt").await.unwrap().1, BucketUsage { objects: 2, bytes: 30 });
+    assert_eq!(
+        engine.bucket_usage("bkt").await.unwrap().1,
+        BucketUsage { objects: 2, bytes: 30, ..Default::default() }
+    );
     assert_eq!(engine.bucket_usage("empty").await.unwrap().1, BucketUsage::default());
 }
 
@@ -1264,4 +1275,78 @@ async fn access_key_secrets_are_sealed_under_the_master_key() {
     // Without the master key, the server does not start.
     let keyless = EngineConfig { data_dir: dir.path().to_path_buf(), ..EngineConfig::default() };
     assert!(Engine::open(keyless).await.is_err());
+}
+
+async fn listing(engine: &Engine, bucket: &str) -> Vec<(String, String, bool, bool)> {
+    let query = VersionsQuery { max_keys: 1000, ..VersionsQuery::default() };
+    let page = engine.list_versions(bucket, query).await.unwrap();
+    page.versions
+        .into_iter()
+        .map(|e| (e.key, e.record.version().to_string(), e.is_latest, e.record.delete_marker))
+        .collect()
+}
+
+#[tokio::test]
+async fn versioning_keeps_versions_and_delete_markers() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    let old = put(&engine, "bkt", "k", b"null version").await;
+    assert!(!old.versioned);
+    engine.set_bucket_versioning("bkt", Versioning::Enabled).await.unwrap();
+
+    let v1 = put(&engine, "bkt", "k", b"one").await;
+    let v2 = put(&engine, "bkt", "k", &pattern(1500)).await;
+    assert!(v1.versioned && v2.versioned);
+    let list = listing(&engine, "bkt").await;
+    assert_eq!(list.len(), 3, "{list:?}");
+    assert_eq!((list[0].1.clone(), list[0].2), (v2.version().to_string(), true));
+    assert_eq!((list[2].1.as_str(), list[2].2), ("null", false));
+    // Every version reads back.
+    let read = |v: VersionRef| engine.get_version("bkt", "k", Some(v));
+    assert_eq!(read_all(&engine, &read(v1.version()).await.unwrap(), 0..3).await, b"one");
+    assert_eq!(read_all(&engine, &read(VersionRef::Null).await.unwrap(), 0..12).await, b"null version");
+    let (_, usage) = engine.bucket_usage("bkt").await.unwrap();
+    assert_eq!((usage.objects, usage.bytes, usage.noncurrent_objects, usage.noncurrent_bytes), (1, 1500, 2, 15));
+
+    // A plain delete adds a marker: the key disappears, its versions stay.
+    let deleted = engine.delete_object("bkt", "k").await.unwrap();
+    assert!(deleted.delete_marker);
+    assert!(matches!(engine.get_object("bkt", "k").await, Err(Error::NoSuchKey)));
+    assert!(engine.get_version("bkt", "k", None).await.unwrap().delete_marker);
+    assert!(
+        engine
+            .list_objects("bkt", ListQuery { max_keys: 10, ..ListQuery::default() })
+            .await
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+    assert_eq!(listing(&engine, "bkt").await.len(), 4);
+
+    // Removing the marker brings the newest version back.
+    engine.delete_object_if("bkt", "k", deleted.version, DeleteCondition::default()).await.unwrap();
+    assert_eq!(engine.get_object("bkt", "k").await.unwrap().version_id, v2.version_id);
+    // Removing the current version promotes the previous one.
+    engine.delete_object_if("bkt", "k", Some(v2.version()), DeleteCondition::default()).await.unwrap();
+    assert_eq!(engine.get_object("bkt", "k").await.unwrap().version_id, v1.version_id);
+    let list = listing(&engine, "bkt").await;
+    assert_eq!(list.iter().map(|e| e.1.clone()).collect::<Vec<_>>(), [v1.version().to_string(), "null".into()]);
+    assert_eq!(engine.collect_garbage().await.unwrap(), 2, "v2's blocks are freed");
+
+    // Suspended: writes replace the null version, other versions stay.
+    engine.set_bucket_versioning("bkt", Versioning::Suspended).await.unwrap();
+    let s = put(&engine, "bkt", "k", b"suspended").await;
+    assert!(!s.versioned);
+    let list = listing(&engine, "bkt").await;
+    assert_eq!(list.iter().map(|e| e.1.as_str()).collect::<Vec<_>>(), ["null", &v1.version().to_string()]);
+    assert_eq!(read_all(&engine, &read(VersionRef::Null).await.unwrap(), 0..9).await, b"suspended");
+
+    // The bucket cannot be deleted while versions remain.
+    for (_, version, _, _) in listing(&engine, "bkt").await {
+        engine.delete_object_if("bkt", "k", VersionRef::parse(&version), DeleteCondition::default()).await.unwrap();
+    }
+    assert!(listing(&engine, "bkt").await.is_empty());
+    let (_, usage) = engine.bucket_usage("bkt").await.unwrap();
+    assert_eq!(usage, BucketUsage::default());
+    engine.delete_bucket("bkt").await.unwrap();
 }
