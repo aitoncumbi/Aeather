@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aether console · not built</title>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:48px 16px;box-sizing:border-box;background:#09090B;color:#FAFAFA;font:14px/1.5 ui-sans-serif,system-ui,sans-serif}
+main{max-width:560px;display:flex;flex-direction:column;gap:16px}
+h1{margin:0;font-size:22px;font-weight:600;letter-spacing:-0.02em}
+p{margin:0;color:#A1A1AA}
+pre{margin:0;padding:12px 14px;background:#1A1A1E;color:#D4D4D8;font:12px/1.7 ui-monospace,monospace;white-space:pre-wrap}
+a{color:#FAFAFA}
+</style>
+</head>
+<body>
+<main>
+<h1>The web console is not part of this build</h1>
+<p>This <code>aether</code> binary was compiled without the console. The admin API at <code>/api/v1</code> and the <code>aether</code> CLI work as usual.</p>
+<p>To include the console, build it and then rebuild the server:</p>
+<pre>npm --prefix console ci
+npm --prefix console run build
+cargo build --release --manifest-path aether_backend/Cargo.toml</pre>
+<p>The Docker image always includes it.</p>
+</main>
+</body>
+</html>

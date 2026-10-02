@@ -1,0 +1,17 @@
+# The image builds from aether_backend/ and console/ only.
+.git/
+.github/
+compat/
+docs/
+**/target/
+**/data/
+**/*.redb
+**/aether.toml
+**/.vscode/
+console/node_modules/
+console/.next/
+console/out/
+console/test-results/
+console/playwright-report/
+console/next-env.d.ts
+console/*.tsbuildinfo

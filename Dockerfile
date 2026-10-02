@@ -1,15 +1,27 @@
-# Aether server image.
+# Aether server image, with the web console built in.
 #
-#   docker build -t aether ./aether_backend
-#   docker run -p 9000:9000 -v aether-data:/data \
+#   docker build -t aether .
+#   docker run -p 9000:9000 -p 127.0.0.1:9001:9001 -v aether-data:/data \
 #     -e AETHER_S3__ACCESS_KEY=admin -e AETHER_S3__SECRET_KEY=change-me-please aether
 #
 # Configuration comes from AETHER_* environment variables, or mount a config
-# file and pass `--config /etc/aether/aether.toml` as the command.
+# file and pass `--config /etc/aether/aether.toml` as the command. The console
+# is on the admin port (9001).
+
+# The console is a static export that the server binary embeds.
+FROM node:22-bookworm-slim AS console
+ENV NEXT_TELEMETRY_DISABLED=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+WORKDIR /console
+COPY console/package.json console/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY console/ ./
+RUN npm run build
 
 FROM rust:1.98-slim-bookworm AS build
 WORKDIR /src
-COPY . .
+COPY aether_backend/ ./
+COPY --from=console /console/out /console
+ENV AETHER_CONSOLE_DIR=/console
 # Cache mounts keep the crate registry and compiled dependencies between builds.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \

@@ -89,6 +89,16 @@ impl Authorizer {
         }
     }
 
+    /// The secret of an enabled key, for signing on its behalf (the
+    /// console's presigned share links).
+    pub fn secret_of(&self, access_key_id: &str) -> Option<String> {
+        self.secret_key(access_key_id)
+    }
+
+    pub fn root_access_key(&self) -> &str {
+        &self.root_access_key
+    }
+
     /// Checks a plaintext secret (admin API login) in constant time.
     pub fn authenticate(&self, access_key_id: &str, secret_key: &str) -> Option<Identity> {
         let expected = self.secret_key(access_key_id)?;

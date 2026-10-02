@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod history;
 pub mod http;
 pub mod logger;
 pub mod meta;

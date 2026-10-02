@@ -52,6 +52,11 @@ pub struct S3Config {
     /// Also accept the legacy Signature Version 2 (HMAC-SHA1, deprecated by
     /// AWS). Off by default; some old clients still sign with it.
     pub allow_sig_v2: bool,
+    /// The URL clients use to reach the S3 API, e.g. `https://s3.internal:9000`
+    /// (scheme, host and port only). The console shows it and puts it in
+    /// presigned share links. Unset: the host the console was opened on,
+    /// with the S3 port.
+    pub public_url: Option<String>,
 }
 
 /// The JSON admin API (keys, permissions, buckets, usage).
@@ -61,6 +66,8 @@ pub struct AdminConfig {
     pub enabled: bool,
     /// Loopback by default; expose it deliberately (e.g. `0.0.0.0:9001` in a container).
     pub listen: SocketAddr,
+    /// Serve the web console at `/` on this listener.
+    pub console: bool,
 }
 
 /// HTTPS. Setting both files enables TLS on the S3 port.
@@ -184,13 +191,14 @@ impl Default for S3Config {
             secret_key: Secret::default(),
             max_object_size: 5 * 1024 * 1024 * 1024,
             allow_sig_v2: false,
+            public_url: None,
         }
     }
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
-        Self { enabled: true, listen: SocketAddr::from(([127, 0, 0, 1], 9001)) }
+        Self { enabled: true, listen: SocketAddr::from(([127, 0, 0, 1], 9001)), console: true }
     }
 }
 
@@ -282,6 +290,13 @@ impl Config {
         if self.tls.admin && self.tls.files().is_none() {
             return invalid("tls.admin needs tls.cert_file and tls.key_file");
         }
+        if let Some(url) = &self.s3.public_url {
+            let authority = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+            let authority = authority.map(|a| a.trim_end_matches('/'));
+            if !authority.is_some_and(|a| !a.is_empty() && !a.contains(['/', '?', '#', '@'])) {
+                return invalid("s3.public_url must be http(s)://host[:port], without a path");
+            }
+        }
         let http = &self.http;
         if [http.header_timeout_secs, http.handshake_timeout_secs, http.body_timeout_secs].contains(&0) {
             return invalid("http timeouts must be positive");
@@ -355,6 +370,21 @@ mod tests {
             jail.set_env("AETHER_ADMIN__LISTEN", "0.0.0.0:9001");
             let config = Config::load(None).unwrap();
             assert_eq!(config.admin.listen, "0.0.0.0:9001".parse().unwrap());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn public_url_is_a_scheme_and_host() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("AETHER_S3__ACCESS_KEY", "admin");
+            jail.set_env("AETHER_S3__SECRET_KEY", "change-me-please");
+            jail.set_env("AETHER_S3__PUBLIC_URL", "https://s3.internal:9000/");
+            assert_eq!(Config::load(None).unwrap().s3.public_url.as_deref(), Some("https://s3.internal:9000/"));
+            for bad in ["s3.internal:9000", "https://s3.internal/prefix", "ftp://host"] {
+                jail.set_env("AETHER_S3__PUBLIC_URL", bad);
+                assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))), "{bad}");
+            }
             Ok(())
         });
     }

@@ -5,7 +5,7 @@
 //! engine when Prometheus scrapes.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
@@ -50,6 +50,75 @@ pub struct Metrics {
     started: Instant,
     requests: Family<RequestLabels, Counter>,
     durations: Family<OperationLabels, Histogram, fn() -> Histogram>,
+    activity: Activity,
+}
+
+/// Upper bounds, in milliseconds, of the latency buckets the console's
+/// percentiles are computed from (finer than the Prometheus histogram).
+pub const LATENCY_BOUNDS_MS: [f64; 25] = [
+    0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 50.0, 75.0, 100.0, 150.0, 200.0, 300.0, 500.0, 750.0,
+    1000.0, 2000.0, 5000.0, 10_000.0, 30_000.0, 60_000.0,
+];
+/// One bucket per bound, plus one for anything slower.
+pub const LATENCY_BUCKETS: usize = LATENCY_BOUNDS_MS.len() + 1;
+
+/// What S3 clients asked for, in four kinds, for the console's charts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationKind {
+    Read,
+    Write,
+    List,
+    Other,
+}
+
+impl OperationKind {
+    pub fn of(operation: &str) -> Self {
+        match operation {
+            "GetObject" | "HeadObject" | "GetObjectAttributes" => Self::Read,
+            "PutObject"
+            | "CopyObject"
+            | "UploadPart"
+            | "UploadPartCopy"
+            | "CreateMultipartUpload"
+            | "CompleteMultipartUpload"
+            | "AbortMultipartUpload"
+            | "DeleteObject"
+            | "DeleteObjects" => Self::Write,
+            "ListObjects"
+            | "ListObjectsV2"
+            | "ListObjectVersions"
+            | "ListBuckets"
+            | "ListMultipartUploads"
+            | "ListParts" => Self::List,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Cumulative S3 request counters since startup, sampled into
+/// [`crate::history`].
+#[derive(Debug, Default)]
+pub struct Activity {
+    /// Indexed by [`OperationKind`].
+    pub requests: [AtomicU64; 4],
+    pub client_errors: AtomicU64,
+    pub server_errors: AtomicU64,
+    pub latency: [AtomicU64; LATENCY_BUCKETS],
+}
+
+impl Activity {
+    fn record(&self, operation: &str, status: u16, elapsed: Duration) {
+        let kind = OperationKind::of(operation) as usize;
+        self.requests[kind].fetch_add(1, Ordering::Relaxed);
+        match status {
+            400..=499 => self.client_errors.fetch_add(1, Ordering::Relaxed),
+            500..=599 => self.server_errors.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let bucket = LATENCY_BOUNDS_MS.iter().position(|&bound| ms <= bound).unwrap_or(LATENCY_BOUNDS_MS.len());
+        self.latency[bucket].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn latency_histogram() -> Histogram {
@@ -63,10 +132,23 @@ impl Metrics {
             started: Instant::now(),
             requests: Family::default(),
             durations: Family::new_with_constructor(latency_histogram),
+            activity: Activity::default(),
         })
     }
 
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
+    pub fn activity(&self) -> &Activity {
+        &self.activity
+    }
+
     pub fn observe_request(&self, api: &'static str, operation: &str, status: u16, elapsed: Duration) {
+        // Health checks and the like are not client traffic.
+        if api == "s3" && operation != "internal" {
+            self.activity.record(operation, status, elapsed);
+        }
         let operation = operation.to_owned();
         self.requests.get_or_create(&RequestLabels { api, operation: operation.clone(), status }).inc();
         self.durations.get_or_create(&OperationLabels { api, operation }).observe(elapsed.as_secs_f64());

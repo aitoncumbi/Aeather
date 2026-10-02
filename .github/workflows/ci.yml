@@ -56,15 +56,65 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - name: Build the console
+        working-directory: console
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: aether_backend
+      # Embeds the console; the build fails if the directory holds no build.
       - run: cargo build --release --locked --bin aether
+        env:
+          AETHER_CONSOLE_DIR: ${{ github.workspace }}/console/out
       - uses: actions/upload-artifact@v4
         with:
           name: aether
           path: aether_backend/target/release/aether
+          retention-days: 7
+
+  console:
+    name: web console (typecheck, end-to-end)
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - uses: actions/download-artifact@v4
+        with:
+          name: aether
+          path: aether_backend/target/release
+      - run: chmod +x ../aether_backend/target/release/aether
+      - run: npx playwright install --with-deps chromium
+      # Drives the console embedded in the release binary.
+      - run: npx playwright test
+        env:
+          KEEP_LOG: ${{ runner.temp }}/console-server.log
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-e2e
+          path: |
+            console/playwright-report
+            console/test-results
+            ${{ runner.temp }}/console-server.log
           retention-days: 7
 
   clients:
@@ -153,6 +203,9 @@ jobs:
   docker:
     name: Docker image
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
     steps:
       - uses: actions/checkout@v5
       - run: docker build -t aether:ci .
@@ -162,7 +215,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ci-root-secret-key
           AWS_DEFAULT_REGION: us-east-1
         run: |
-          docker run -d --name aether -p 9000:9000 \
+          docker run -d --name aether -p 9000:9000 -p 127.0.0.1:9001:9001 \
             -e AETHER_S3__ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e AETHER_S3__SECRET_KEY="$AWS_SECRET_ACCESS_KEY" aether:ci
           for _ in $(seq 1 30); do
             if docker exec aether /usr/local/bin/aether health; then break; fi
@@ -173,6 +226,8 @@ jobs:
           aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://smoke
           aws --endpoint-url http://127.0.0.1:9000 s3 cp hello.txt s3://smoke/hello.txt
           test "$(aws --endpoint-url http://127.0.0.1:9000 s3 cp s3://smoke/hello.txt -)" = "hello from the image"
+          # The image embeds the console, not the page shown without one.
+          curl -fsS http://127.0.0.1:9001/login/ | grep -q '/_next/static/'
           docker image ls aether:ci
       - if: always()
         run: docker logs aether || true

@@ -14,9 +14,11 @@ use s3s::config::StaticConfigProvider;
 use s3s::service::S3ServiceBuilder;
 use tracing::{error, info, warn};
 
+use crate::admin::AdminSettings;
 use crate::auth::{Authorizer, S3Credentials, S3Permissions};
 use crate::config::Config;
 use crate::engine::Engine;
+use crate::history::History;
 use crate::http::tls::ReloadingCert;
 use crate::http::{self, Limits};
 use crate::metrics::Metrics;
@@ -28,6 +30,7 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'st
     let engine = Arc::new(Engine::open(config.engine_config()).await?);
     let mut background = engine.start_background_tasks();
     let routers = routers(engine, &config);
+    background.push(routers.history.spawn_sampler());
     let shutdown = shutdown.shared();
     let limits = Limits {
         header_timeout: Duration::from_secs(config.http.header_timeout_secs),
@@ -68,6 +71,8 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'st
 pub struct Routers {
     pub s3: Router,
     pub admin: Router,
+    /// Feeds the console's charts once its sampler is spawned.
+    pub history: Arc<History>,
 }
 
 pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
@@ -82,9 +87,11 @@ pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
     };
     let s3 = s3_router(Arc::clone(&engine), Arc::clone(&auth), config)
         .layer(middleware::from_fn_with_state(observer("s3", "x-amz-request-id"), observe));
-    let admin = crate::admin::router(engine, auth, Arc::clone(&metrics))
+    let history = History::new(Arc::clone(&metrics));
+    let settings = AdminSettings::from_config(config);
+    let admin = crate::admin::router(engine, auth, Arc::clone(&metrics), Arc::clone(&history), settings)
         .layer(middleware::from_fn_with_state(observer("admin", "x-request-id"), observe));
-    Routers { s3, admin }
+    Routers { s3, admin, history }
 }
 
 fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Router {
