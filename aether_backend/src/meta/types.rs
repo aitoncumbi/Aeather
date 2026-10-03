@@ -20,6 +20,8 @@ pub struct BucketRecord {
     pub cors: Vec<CorsRule>,
     #[serde(default)]
     pub quota: Quota,
+    #[serde(default)]
+    pub versioning: Versioning,
 }
 
 /// Limits on a bucket's usage. `None` is no limit.
@@ -35,10 +37,12 @@ impl Quota {
     /// Fails if a write would take usage from `before` to `after` past a
     /// limit. Writes that do not grow usage pass even when the bucket is over
     /// a limit (for example after it was lowered), so they can free space.
+    /// The size limit covers noncurrent versions too: they take disk space.
     pub fn check(&self, before: BucketUsage, after: BucketUsage) -> Result<()> {
+        let (before_bytes, after_bytes) = (before.total_bytes(), after.total_bytes());
         if let Some(max) = self.max_bytes
-            && after.bytes > max
-            && after.bytes > before.bytes
+            && after_bytes > max
+            && after_bytes > before_bytes
         {
             return Err(Error::QuotaExceeded(format!("the bucket's quota of {max} bytes would be exceeded")));
         }
@@ -73,8 +77,15 @@ pub struct CorsRule {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectRecord {
-    /// Unique per write. Exposed once bucket versioning exists (v2).
+    /// Unique per write. Exposed as the S3 version id when `versioned`.
     pub version_id: Uuid,
+    /// Written while versioning was enabled, so S3 sees `version_id`.
+    /// Otherwise this is the bucket's `null` version.
+    #[serde(default)]
+    pub versioned: bool,
+    /// A delete marker: no data, hides older versions from plain reads.
+    #[serde(default)]
+    pub delete_marker: bool,
     pub size: u64,
     /// Hex digest without quotes.
     pub etag: String,
@@ -92,6 +103,68 @@ pub struct ObjectRecord {
     /// The data key when the object is encrypted at rest (SSE-S3).
     #[serde(default)]
     pub sse: Option<crate::crypto::SealedKey>,
+}
+
+impl ObjectRecord {
+    pub fn version(&self) -> VersionRef {
+        if self.versioned { VersionRef::Id(self.version_id) } else { VersionRef::Null }
+    }
+
+    /// A delete marker written at `now`.
+    pub fn delete_marker(version_id: Uuid, now: Millis) -> Self {
+        Self {
+            version_id,
+            versioned: false,
+            delete_marker: true,
+            size: 0,
+            etag: String::new(),
+            last_modified: now,
+            attrs: ObjectAttrs::default(),
+            data: ObjectData::Inline(Vec::new()),
+            part_sizes: Vec::new(),
+            upload_id: None,
+            sse: None,
+        }
+    }
+}
+
+/// Which version of an object: S3's `null` version, or a versioned one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionRef {
+    Null,
+    Id(Uuid),
+}
+
+impl VersionRef {
+    /// S3's version id: `null`, or 32 hex digits.
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "null" {
+            return Some(Self::Null);
+        }
+        (s.len() == 32).then(|| Uuid::try_parse(s).ok().map(Self::Id)).flatten()
+    }
+
+    pub fn matches(&self, record: &ObjectRecord) -> bool {
+        record.version() == *self
+    }
+}
+
+impl fmt::Display for VersionRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("null"),
+            Self::Id(id) => write!(f, "{}", id.simple()),
+        }
+    }
+}
+
+/// A bucket's versioning state. Once enabled it can be suspended, never undone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Versioning {
+    #[default]
+    Unversioned,
+    Enabled,
+    Suspended,
 }
 
 /// Attributes supplied by the client when the object was written.
@@ -235,8 +308,20 @@ pub struct KeyUpdate {
 /// Object count and total size of a bucket, kept up to date by every write.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketUsage {
+    /// Current versions (what plain listings show).
     pub objects: u64,
     pub bytes: u64,
+    /// Noncurrent versions kept by versioning (delete markers not counted).
+    #[serde(default)]
+    pub noncurrent_objects: u64,
+    #[serde(default)]
+    pub noncurrent_bytes: u64,
+}
+
+impl BucketUsage {
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes + self.noncurrent_bytes
+    }
 }
 
 /// A multipart upload in progress.
@@ -373,4 +458,31 @@ pub struct ListPage {
     pub common_prefixes: Vec<String>,
     /// Inclusive start of the next page; `Some` means the listing was truncated.
     pub next_start: Option<Vec<u8>>,
+}
+
+/// One page of `ListObjectVersions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VersionsQuery {
+    pub prefix: String,
+    pub delimiter: Option<String>,
+    /// Continue after this key, or within it after `version_marker`.
+    pub key_marker: Option<String>,
+    pub version_marker: Option<VersionRef>,
+    pub max_keys: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VersionsPage {
+    /// Versions and delete markers, by key, newest first within a key.
+    pub versions: Vec<VersionEntry>,
+    pub common_prefixes: Vec<String>,
+    /// Where the next page starts (key and last version listed), if truncated.
+    pub next: Option<(String, Option<VersionRef>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionEntry {
+    pub key: String,
+    pub record: ObjectRecord,
+    pub is_latest: bool,
 }

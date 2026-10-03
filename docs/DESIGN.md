@@ -123,6 +123,7 @@ neither has a private backdoor.
 | `PUT, DELETE /api/v1/keys/{id}/buckets/{bucket}` | Set or remove a key's permissions on a bucket |
 | `GET, POST /api/v1/buckets` | List buckets with usage; create one |
 | `GET, DELETE /api/v1/buckets/{name}` | Usage, quota, CORS rules and the keys with access; delete an empty bucket |
+| `PUT /api/v1/buckets/{name}/versioning` | Enable or suspend versioning: `{"status": "Enabled" \| "Suspended"}` |
 | `PUT /api/v1/buckets/{name}/quota` | Set the quota: `{"max_bytes": n \| null, "max_objects": n \| null}` |
 | `GET /api/v1/buckets/{name}/objects` | List objects: `prefix`, `delimiter`, `continuation`, `max_keys` |
 | `GET, PUT, DELETE /api/v1/buckets/{name}/object?key=` | Object details (storage, parts, checksums, metadata); upload; delete |
@@ -193,10 +194,10 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 | `uploads` | bucket_id ‖ object key ‖ 0x00 ‖ upload_id | `UploadRecord` |
 | `parts` | upload_id ‖ part number (u32 BE) | `PartRecord` |
 | `access_keys` | access key id | `AccessKeyRecord` (secret, sealed with encryption at rest; roles; per-bucket permissions) |
-| `bucket_usage` | bucket_id | object count and bytes, updated by every write |
+| `versions` | bucket_id ‖ object key ‖ 0x00 ‖ inverted version id | `ObjectRecord` (noncurrent versions and delete markers) |
+| `bucket_usage` | bucket_id | object count and bytes (current and noncurrent), updated by every write |
 | `system` | name | schema version and other node-level values |
 
-Added in later milestones: `versions` (v2).
 
 The schema version is checked at startup and older databases are migrated in place
 (version 1 → 2 computed `bucket_usage` from existing objects).
@@ -456,6 +457,39 @@ replication (v3) the same pass will repair from a healthy copy.
 - `s3s` is not a full security boundary: we set body and object size limits,
   timeouts and listing limits ourselves.
 
+### Versioning
+
+Buckets start unversioned; `PutBucketVersioning` enables versioning, and can
+later suspend it (never undo it), as in S3.
+
+- **Layout.** `objects` keeps holding each key's current version when it is
+  an object, so plain listings and reads are unchanged. A `versions` table
+  holds noncurrent versions and delete markers, keyed by bucket id ‖ key ‖ 0x00
+  ‖ inverted version id (UUIDv7, so a key's versions sort newest first). The
+  current version is the `objects` entry, or else the newest `versions`
+  entry, which is then a delete marker.
+- **Writes** (PUT, multipart completion, copy, delete) all go through one
+  function that places the new version as the bucket's state says:
+  unversioned, the previous object is replaced and its blocks released;
+  enabled, it moves to `versions` and keeps its blocks; suspended, the `null`
+  version is replaced and other versions kept. A plain delete in a versioned
+  bucket adds a delete marker.
+- **Deleting a version** removes it for good and releases its blocks; if it
+  was current, the newest older version is promoted (a delete marker stays
+  where it is, current by being newest).
+- **Version ids** are the record's UUIDv7 in 32 hex digits; records written
+  while versioning was off are the `null` version, so existing data needs no
+  migration.
+- **Reads.** GET and HEAD take `versionId`. A current delete marker answers
+  404 and one asked for by id 405, both with `x-amz-delete-marker: true`.
+  `ListObjectVersions` walks both tables in key order, current version first.
+- **Usage.** Noncurrent versions are counted apart (`noncurrent_objects`,
+  `noncurrent_bytes`); the quota's size limit includes them, its object
+  limit counts current objects. Moving a version between current and
+  noncurrent never fails a quota check, so deletes always succeed.
+- A versioned bucket can only be deleted once every version and delete
+  marker is gone. The scrubber checks noncurrent versions' blocks too.
+
 ### Encryption at rest
 
 SSE-S3: with `encryption.master_key` set, every new object is encrypted.
@@ -485,13 +519,6 @@ SSE-S3: with `encryption.master_key` set, every new object is encrypted.
   or SSE-C fail with `NotImplemented`.
 
 ## Planned designs
-
-### Versioning (v2)
-
-Each `ObjectRecord` already carries a version id. Versioning adds a `versions`
-table keyed by bucket_id ‖ key ‖ inverted version time, plus delete markers.
-`objects` stays the index of latest versions, so plain listings stay fast.
-Unversioned buckets report the version id `null`, as S3 does.
 
 ### SSE-C (v2)
 

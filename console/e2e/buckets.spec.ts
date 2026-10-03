@@ -55,3 +55,17 @@ test("sets and clears a bucket quota", async ({ page }) => {
   await dialog.getByRole("button", { name: "Save quota" }).click();
   await expect(page.getByText("No limit")).toBeVisible();
 });
+
+test("turns versioning on and suspends it", async ({ page }) => {
+  const name = unique("versioned");
+  const res = await page.request.post("/api/v1/buckets", { headers: { "x-aether-console": "1" }, data: { name } });
+  expect(res.status()).toBe(201);
+  await page.goto(`/buckets/?bucket=${name}`);
+  await page.getByRole("button", { name: new RegExp(`^${name}`) }).click();
+  await expect(page.getByText(/Off: overwrites and deletes replace data for good/)).toBeVisible();
+  await page.getByRole("button", { name: "Enable", exact: true }).click();
+  await expect(page.getByText(`Enabled versioning on ${name}.`)).toBeVisible();
+  await expect(page.getByText(/On: overwrites and deletes keep the previous version/)).toBeVisible();
+  await page.getByRole("button", { name: "Suspend", exact: true }).click();
+  await expect(page.getByText(/Suspended: writes replace the current version/)).toBeVisible();
+});

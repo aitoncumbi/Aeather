@@ -35,6 +35,8 @@ mod tests {
     fn object_record_round_trips() {
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
+            versioned: true,
+            delete_marker: false,
             size: 3,
             etag: "abc".into(),
             last_modified: 42,

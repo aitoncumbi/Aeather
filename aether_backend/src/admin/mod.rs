@@ -33,7 +33,9 @@ use crate::config::Config;
 use crate::engine::{Engine, NewKey, ScrubReport, now_millis};
 use crate::error::Error;
 use crate::history::{self, History};
-use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, CorsRule, KeyUpdate, Millis, Quota};
+use crate::meta::{
+    AccessKeyRecord, BucketGrant, BucketRecord, BucketUsage, CorsRule, KeyUpdate, Millis, Quota, Versioning,
+};
 use crate::metrics::{self, Metrics};
 use crate::observe::RequestFacts;
 
@@ -124,6 +126,7 @@ pub fn router(
         .route("/buckets", get(list_buckets).post(create_bucket))
         .route("/buckets/{name}", get(get_bucket).delete(delete_bucket))
         .route("/buckets/{name}/quota", put(set_quota))
+        .route("/buckets/{name}/versioning", put(set_versioning))
         .route("/buckets/{name}/objects", get(objects::list))
         .route("/buckets/{name}/object", get(objects::head).put(objects::put).delete(objects::delete))
         .route("/buckets/{name}/object/download", get(objects::download))
@@ -207,6 +210,14 @@ pub struct BucketView {
     pub key_count: usize,
     #[serde(default)]
     pub quota: Quota,
+    /// `Unversioned`, `Enabled` or `Suspended`.
+    #[serde(default)]
+    pub versioning: Versioning,
+    /// Noncurrent versions kept by versioning (counted in the size quota).
+    #[serde(default)]
+    pub noncurrent_objects: u64,
+    #[serde(default)]
+    pub noncurrent_bytes: u64,
     /// Keys with explicit permissions; only in single-bucket responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<BucketKeyView>>,
@@ -309,6 +320,9 @@ fn bucket_view(bucket: BucketRecord, usage: BucketUsage, keys: &[AccessKeyRecord
         bytes: usage.bytes,
         key_count,
         quota: bucket.quota,
+        versioning: bucket.versioning,
+        noncurrent_objects: usage.noncurrent_objects,
+        noncurrent_bytes: usage.noncurrent_bytes,
         keys: None,
         cors: None,
     }
@@ -581,6 +595,23 @@ async fn set_quota(
     Ok(Json(bucket_view(bucket, usage, &s.engine.access_keys())))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VersioningRequest {
+    status: Versioning,
+}
+
+/// `{"status": "Enabled" | "Suspended"}`. Versioning cannot be removed once enabled.
+async fn set_versioning(
+    State(s): State<AdminState>,
+    Path(name): Path<String>,
+    body: Result<Json<VersioningRequest>, JsonRejection>,
+) -> ApiResult<Json<BucketView>> {
+    let Json(req) = body?;
+    s.engine.set_bucket_versioning(&name, req.status).await?;
+    let (bucket, usage) = s.engine.bucket_usage(&name).await?;
+    Ok(Json(bucket_view(bucket, usage, &s.engine.access_keys())))
+}
+
 async fn delete_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> ApiResult<StatusCode> {
     s.engine.delete_bucket(&name).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -712,6 +743,8 @@ impl From<Error> for ApiError {
         let (status, code) = match &e {
             Error::NoSuchBucket => (StatusCode::NOT_FOUND, "NoSuchBucket"),
             Error::NoSuchKey => (StatusCode::NOT_FOUND, "NoSuchKey"),
+            Error::NoSuchVersion => (StatusCode::NOT_FOUND, "NoSuchVersion"),
+            Error::MethodNotAllowed(_) => (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
             Error::NoSuchUpload => (StatusCode::NOT_FOUND, "NoSuchUpload"),
             Error::InvalidPart(_) => (StatusCode::BAD_REQUEST, "InvalidPart"),
             Error::InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),

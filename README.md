@@ -124,6 +124,7 @@ aether key grant AK64OA2XIS00HEL7LJ95 reports r   # r: read, w: write, o: owner
 aether key disable AK64OA2XIS00HEL7LJ95           # takes effect immediately
 aether bucket show invoices                       # usage and which keys have access
 aether bucket quota invoices --max-bytes 50GiB    # also --max-objects; `none` or --clear removes
+aether bucket versioning invoices enable          # keep every version; `suspend` to stop
 aether status
 ```
 
@@ -172,7 +173,7 @@ Current limitations:
   virtual-hosted style (`http://bucket.s3.example.com/key`), set
   `s3.domains = ["s3.example.com"]` with wildcard DNS for `*.s3.example.com`
   (and a wildcard certificate with TLS).
-- **Not supported yet:** versioning, SSE-KMS and SSE-C, lifecycle rules
+- **Not supported yet:** SSE-KMS and SSE-C, lifecycle rules
   (v2 on the roadmap); ACLs and bucket policies (per-key bucket permissions
   replace them); object lock; browser POST uploads.
   Requests that need these fail with `NotImplemented` rather than being ignored.

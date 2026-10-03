@@ -79,40 +79,50 @@ impl Engine {
             self.list_buckets().await?.into_iter().map(|bucket| (bucket.id, bucket.name)).collect();
         let mut limiter = RateLimiter::new(self.config.scrub_rate);
         let mut report = report;
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let cursor = after.clone();
-            let batch = self.read(move |meta| meta.objects_with_blocks(cursor.as_deref(), BATCH)).await?;
-            let Some((last, _)) = batch.last() else { break };
-            after = Some(last.clone());
+        // Current versions, then noncurrent ones kept by versioning.
+        for noncurrent in [false, true] {
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let cursor = after.clone();
+                let batch =
+                    self.read(move |meta| meta.objects_with_blocks(noncurrent, cursor.as_deref(), BATCH)).await?;
+                let Some((last, _)) = batch.last() else { break };
+                after = Some(last.clone());
 
-            for (raw_key, record) in batch {
-                for block in record.data.blocks() {
-                    let problem = self.verify_block(block, &mut limiter).await;
-                    report.blocks_checked += 1;
-                    report.bytes_checked += block.len;
-                    count(&self.stats.scrub_blocks_checked, 1);
-                    count(&self.stats.scrub_bytes_checked, block.len);
-                    let Some(problem) = problem else { continue };
-                    // The object may have been overwritten or deleted since the
-                    // batch was read; only blocks it still uses are corrupt.
-                    let raw = raw_key.clone();
-                    let current = self.read(move |meta| meta.object_at(&raw)).await?;
-                    if !current.is_some_and(|r| r.data.blocks().iter().any(|b| b.id == block.id)) {
-                        continue;
+                for (raw_key, record) in batch {
+                    for block in record.data.blocks() {
+                        let problem = self.verify_block(block, &mut limiter).await;
+                        report.blocks_checked += 1;
+                        report.bytes_checked += block.len;
+                        count(&self.stats.scrub_blocks_checked, 1);
+                        count(&self.stats.scrub_bytes_checked, block.len);
+                        let Some(problem) = problem else { continue };
+                        // The object may have been overwritten or deleted since the
+                        // batch was read; only blocks it still uses are corrupt.
+                        let raw = raw_key.clone();
+                        let current = self.read(move |meta| meta.object_at(noncurrent, &raw)).await?;
+                        if !current.is_some_and(|r| r.data.blocks().iter().any(|b| b.id == block.id)) {
+                            continue;
+                        }
+                        let bucket_id = Uuid::from_slice(&raw_key[..16]).unwrap_or_default();
+                        let bucket = buckets.get(&bucket_id).cloned().unwrap_or_else(|| bucket_id.to_string());
+                        let key = match noncurrent {
+                            false => String::from_utf8_lossy(&raw_key[16..]).into_owned(),
+                            true => format!(
+                                "{} (noncurrent version)",
+                                String::from_utf8_lossy(crate::meta::version_key_of(&raw_key))
+                            ),
+                        };
+                        error!(%bucket, %key, block = %block.id, %problem, "scrub found a damaged block");
+                        count(&self.stats.scrub_corrupt_blocks, 1);
+                        if report.corrupt.len() < MAX_REPORTED {
+                            report.corrupt.push(CorruptBlock { bucket, key, block_id: block.id, problem });
+                        }
                     }
-                    let bucket_id = Uuid::from_slice(&raw_key[..16]).unwrap_or_default();
-                    let bucket = buckets.get(&bucket_id).cloned().unwrap_or_else(|| bucket_id.to_string());
-                    let key = String::from_utf8_lossy(&raw_key[16..]).into_owned();
-                    error!(%bucket, %key, block = %block.id, %problem, "scrub found a damaged block");
-                    count(&self.stats.scrub_corrupt_blocks, 1);
-                    if report.corrupt.len() < MAX_REPORTED {
-                        report.corrupt.push(CorruptBlock { bucket, key, block_id: block.id, problem });
-                    }
+                    report.objects_checked += 1;
                 }
-                report.objects_checked += 1;
+                self.set_scrub_report(report.clone());
             }
-            self.set_scrub_report(report.clone());
         }
 
         report.finished_at = Some(now_millis());

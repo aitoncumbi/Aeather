@@ -21,6 +21,8 @@ pub fn s3_error(e: Error) -> S3Error {
         Error::BucketAlreadyExists => S3Error::new(S3ErrorCode::BucketAlreadyOwnedByYou),
         Error::BucketNotEmpty => S3Error::new(S3ErrorCode::BucketNotEmpty),
         Error::NoSuchKey => S3Error::new(S3ErrorCode::NoSuchKey),
+        Error::NoSuchVersion => S3Error::new(S3ErrorCode::NoSuchVersion),
+        Error::MethodNotAllowed(msg) => S3Error::with_message(S3ErrorCode::MethodNotAllowed, msg),
         Error::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         Error::InvalidBucketName(name) => {
             S3Error::with_message(S3ErrorCode::InvalidBucketName, format!("invalid bucket name: {name}"))
@@ -72,11 +74,40 @@ pub fn etag(record: &ObjectRecord) -> ETag {
 }
 
 /// Versioning arrives in v2; until then only the implicit `null` version exists.
-pub fn check_version_id(version_id: Option<&str>) -> S3Result<()> {
-    match version_id {
-        None | Some("null") => Ok(()),
-        Some(_) => Err(s3_error!(NoSuchVersion)),
+/// A `versionId` from a request: `null`, or one of ours.
+pub fn parse_version(version_id: Option<&str>) -> S3Result<Option<crate::meta::VersionRef>> {
+    match version_id.filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) => crate::meta::VersionRef::parse(v)
+            .map(Some)
+            .ok_or_else(|| s3_error!(InvalidArgument, "Invalid version id specified")),
     }
+}
+
+/// `x-amz-version-id` for a response: set for versions written while
+/// versioning was enabled; absent for `null` versions.
+pub fn version_id_of(record: &crate::meta::ObjectRecord) -> Option<String> {
+    record.versioned.then(|| record.version().to_string())
+}
+
+/// The error for reading a delete marker: 404 when it is the current version,
+/// 405 when asked for by version id, with `x-amz-delete-marker: true`.
+pub fn delete_marker_error(record: &crate::meta::ObjectRecord, by_version: bool) -> S3Error {
+    let mut e = if by_version {
+        S3Error::with_message(
+            S3ErrorCode::MethodNotAllowed,
+            "The specified method is not allowed against this resource.",
+        )
+    } else {
+        S3Error::new(S3ErrorCode::NoSuchKey)
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    if let Ok(v) = HeaderValue::from_str(&record.version().to_string()) {
+        headers.insert("x-amz-version-id", v);
+    }
+    e.set_headers(headers);
+    e
 }
 
 /// `If-Match` or `If-None-Match` on a write (one of them, not both).

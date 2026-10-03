@@ -244,7 +244,7 @@ function BucketDetail({
         <div className="ruled-list">
           <QuotaSetting bucket={b} onChanged={detail.reload} />
           <CorsSetting rules={b?.cors} />
-          <PlannedSetting title="Versioning" hint="Not available until v2" when="v2" />
+          <VersioningSetting bucket={b} onChanged={detail.reload} />
         </div>
       </div>
 
@@ -384,6 +384,44 @@ function QuotaDialog({ open, bucket, onClose, onSaved }: { open: boolean; bucket
   );
 }
 
+function VersioningSetting({ bucket, onChanged }: { bucket: Bucket | undefined; onChanged: () => void }) {
+  const notify = useToast();
+  const [busy, setBusy] = useState(false);
+  const on = bucket?.versioning === "Enabled";
+  async function toggle() {
+    if (!bucket) return;
+    setBusy(true);
+    try {
+      await api(`${paths.bucket(bucket.name)}/versioning`, { method: "PUT", json: { status: on ? "Suspended" : "Enabled" } });
+      notify(on ? `Suspended versioning on ${bucket.name}.` : `Enabled versioning on ${bucket.name}.`);
+      onChanged();
+    } catch (err) {
+      notify(err instanceof ApiError ? err.message : String(err), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  const older = bucket && bucket.noncurrent_objects > 0 ? ` · ${count(bucket.noncurrent_objects)} older versions (${bytes(bucket.noncurrent_bytes)})` : "";
+  const hint = !bucket
+    ? " "
+    : bucket.versioning === "Enabled"
+      ? `On: overwrites and deletes keep the previous version${older}`
+      : bucket.versioning === "Suspended"
+        ? `Suspended: writes replace the current version; older versions are kept${older}`
+        : "Off: overwrites and deletes replace data for good";
+  return (
+    <div className="row">
+      <div className="row-text">
+        <span className="row-title">Versioning</span>
+        <span className="row-hint">{hint}</span>
+      </div>
+      <button type="button" className="btn btn-sm" disabled={!bucket || busy} onClick={toggle}>
+        {on ? "Suspend" : "Enable"}
+      </button>
+    </div>
+  );
+}
+
 /** Read-only: rules are set with the S3 API (PutBucketCors). */
 function CorsSetting({ rules }: { rules: CorsRule[] | undefined }) {
   const origins = [...new Set(rules?.flatMap((r) => r.allowed_origins) ?? [])];
@@ -408,20 +446,6 @@ function CorsSetting({ rules }: { rules: CorsRule[] | undefined }) {
           {rules.length} rule{rules.length === 1 ? "" : "s"}
         </span>
       )}
-    </div>
-  );
-}
-
-function PlannedSetting({ title, hint, when }: { title: string; hint: string; when: string }) {
-  return (
-    <div className="row">
-      <div className="row-text">
-        <span className="row-title">{title}</span>
-        <span className="row-hint">{hint}</span>
-      </div>
-      <span className="chip" style={{ color: "var(--muted)" }}>
-        Planned · {when}
-      </span>
     </div>
   );
 }

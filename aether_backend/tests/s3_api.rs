@@ -1457,3 +1457,118 @@ async fn sse_s3_encrypts_objects_when_a_master_key_is_set() {
     let err = plain.client.get_bucket_encryption().bucket("bkt").send().await.unwrap_err();
     assert_eq!(code(err), "ServerSideEncryptionConfigurationNotFoundError");
 }
+
+#[tokio::test]
+async fn versioning_through_the_s3_api() {
+    use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+    let s = start().await;
+    let c = &s.client;
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    assert_eq!(c.get_bucket_versioning().bucket("bkt").send().await.unwrap().status(), None);
+    let enable = VersioningConfiguration::builder().status(BucketVersioningStatus::Enabled).build();
+    c.put_bucket_versioning().bucket("bkt").versioning_configuration(enable).send().await.unwrap();
+    let status = c.get_bucket_versioning().bucket("bkt").send().await.unwrap();
+    assert_eq!(status.status(), Some(&BucketVersioningStatus::Enabled));
+
+    let put = |body: &'static str| {
+        c.put_object().bucket("bkt").key("doc").body(ByteStream::from_static(body.as_bytes())).send()
+    };
+    let v1 = put("first").await.unwrap().version_id().unwrap().to_owned();
+    let v2 = put("second").await.unwrap().version_id().unwrap().to_owned();
+    assert_ne!(v1, v2);
+    let get_version = |v: &str| c.get_object().bucket("bkt").key("doc").version_id(v).send();
+    let first = get_version(&v1).await.unwrap();
+    assert_eq!(first.version_id(), Some(v1.as_str()));
+    assert_eq!(first.body.collect().await.unwrap().into_bytes(), "first".as_bytes());
+    let head = c.head_object().bucket("bkt").key("doc").send().await.unwrap();
+    assert_eq!(head.version_id(), Some(v2.as_str()));
+
+    // A plain delete adds a marker; reading the key then is a 404 with the marker headers.
+    let del = c.delete_object().bucket("bkt").key("doc").send().await.unwrap();
+    assert_eq!(del.delete_marker(), Some(true));
+    let marker = del.version_id().unwrap().to_owned();
+    let err = c.get_object().bucket("bkt").key("doc").send().await.unwrap_err();
+    let raw = err.raw_response().unwrap();
+    assert_eq!(raw.status().as_u16(), 404);
+    assert_eq!(raw.headers().get("x-amz-delete-marker"), Some("true"));
+    // Asking for the marker itself is a 405.
+    let err = c.head_object().bucket("bkt").key("doc").version_id(&marker).send().await.unwrap_err();
+    assert_eq!(err.raw_response().unwrap().status().as_u16(), 405);
+
+    // Copy an older version to a new key.
+    let copy = c
+        .copy_object()
+        .bucket("bkt")
+        .key("restored")
+        .copy_source(format!("bkt/doc?versionId={v1}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(copy.copy_source_version_id(), Some(v1.as_str()));
+    assert_eq!(get_bytes(c, "bkt", "restored").await, b"first");
+
+    // Listing versions, a page at a time.
+    let mut seen = Vec::new();
+    let (mut key_marker, mut version_marker) = (None, None);
+    loop {
+        let page = c
+            .list_object_versions()
+            .bucket("bkt")
+            .max_keys(1)
+            .set_key_marker(key_marker.clone())
+            .set_version_id_marker(version_marker.clone())
+            .send()
+            .await
+            .unwrap();
+        for v in page.versions() {
+            seen.push((v.key().unwrap().to_owned(), v.version_id().unwrap().to_owned(), v.is_latest().unwrap()));
+        }
+        for m in page.delete_markers() {
+            seen.push((
+                m.key().unwrap().to_owned(),
+                format!("marker {}", m.version_id().unwrap()),
+                m.is_latest().unwrap(),
+            ));
+        }
+        if !page.is_truncated().unwrap() {
+            break;
+        }
+        key_marker = page.next_key_marker().map(str::to_owned);
+        version_marker = page.next_version_id_marker().map(str::to_owned);
+    }
+    let restored = seen.iter().find(|(k, _, _)| k == "restored").unwrap().1.clone();
+    assert_eq!(
+        seen,
+        [
+            ("doc".into(), format!("marker {marker}"), true),
+            ("doc".into(), v2.clone(), false),
+            ("doc".into(), v1.clone(), false),
+            ("restored".into(), restored, true),
+        ]
+    );
+
+    // Batch delete of specific versions, including the marker: the key comes back as v1.
+    let objects = [&marker, &v2]
+        .iter()
+        .map(|v| ObjectIdentifier::builder().key("doc").version_id(*v).build().unwrap())
+        .collect::<Vec<_>>();
+    let out = c
+        .delete_objects()
+        .bucket("bkt")
+        .delete(Delete::builder().set_objects(Some(objects)).build().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.deleted().len(), 2);
+    assert!(out.deleted().iter().any(|d| d.delete_marker() == Some(true) && d.version_id() == Some(marker.as_str())));
+    assert_eq!(get_bytes(c, "bkt", "doc").await, b"first");
+
+    let err = c.get_object().bucket("bkt").key("doc").version_id("not-a-version").send().await.unwrap_err();
+    assert_eq!(code(err), "InvalidArgument");
+    let missing = "0".repeat(32);
+    let err = get_version(&missing).await.unwrap_err();
+    assert_eq!(code(err), "NoSuchVersion");
+    // A versioned bucket is only deleted once every version is gone.
+    let err = c.delete_bucket().bucket("bkt").send().await.unwrap_err();
+    assert_eq!(code(err), "BucketNotEmpty");
+}

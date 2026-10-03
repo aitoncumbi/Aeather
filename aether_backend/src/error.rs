@@ -21,6 +21,12 @@ pub enum Error {
     #[error("the specified key does not exist")]
     NoSuchKey,
 
+    #[error("the specified version does not exist")]
+    NoSuchVersion,
+
+    #[error("{0}")]
+    MethodNotAllowed(String),
+
     #[error("a precondition did not hold")]
     PreconditionFailed,
 

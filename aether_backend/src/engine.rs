@@ -38,6 +38,7 @@ use crate::meta::{
     ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery, UploadPage,
     UploadRecord, WriteCondition, usage_after,
 };
+pub use crate::meta::{Deleted, VersionRef, Versioning, VersionsPage, VersionsQuery};
 
 /// S3's limit for one ListObjects page.
 pub const MAX_LIST_KEYS: usize = 1000;
@@ -240,8 +241,14 @@ impl Engine {
     }
 
     /// Replaces an object's tags; an empty map removes them.
-    pub async fn set_object_tags(&self, bucket: &str, key: &str, tags: BTreeMap<String, String>) -> Result<()> {
-        let command = Command::SetObjectTags { bucket: bucket.to_owned(), key: key.to_owned(), tags };
+    pub async fn set_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<VersionRef>,
+        tags: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let command = Command::SetObjectTags { bucket: bucket.to_owned(), key: key.to_owned(), version, tags };
         self.apply(command).await?;
         Ok(())
     }
@@ -415,6 +422,8 @@ impl Engine {
         let now = now_millis();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
+            versioned: false,
+            delete_marker: false,
             size: staged.size,
             etag: staged.etag(),
             last_modified: now,
@@ -431,8 +440,10 @@ impl Engine {
             condition,
             gc_due_at: now + self.gc_grace_millis(),
         };
-        self.commit_staged(staged, command).await?;
-        Ok(record)
+        match self.commit_staged(staged, command).await? {
+            Outcome::Written { record, .. } => Ok(record),
+            other => unreachable!("a write returned {other:?}"),
+        }
     }
 
     /// Stage and commit in one call.
@@ -453,49 +464,78 @@ impl Engine {
         self.commit_put(bucket, key, staged, attrs, condition).await
     }
 
-    /// Deleting a key that does not exist succeeds, as in S3.
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Option<ObjectRecord>> {
-        self.delete_object_if(bucket, key, DeleteCondition::default()).await
+    /// Deleting a key that does not exist succeeds, as in S3. In a versioned
+    /// bucket this adds a delete marker.
+    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<Deleted> {
+        self.delete_object_if(bucket, key, None, DeleteCondition::default()).await
     }
 
     /// Deletes the key if it holds an object meeting `condition`; fails with
     /// `PreconditionFailed` if it holds another one.
+    /// With `version`, permanently removes that version instead.
     pub async fn delete_object_if(
         &self,
         bucket: &str,
         key: &str,
+        version: Option<VersionRef>,
         condition: DeleteCondition,
-    ) -> Result<Option<ObjectRecord>> {
+    ) -> Result<Deleted> {
+        let now = now_millis();
         let command = Command::DeleteObject {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            version,
             condition,
-            gc_due_at: now_millis() + self.gc_grace_millis(),
+            marker_id: Uuid::now_v7(),
+            now,
+            gc_due_at: now + self.gc_grace_millis(),
         };
         match self.apply(command).await? {
-            Outcome::Object(previous) => Ok(previous),
+            Outcome::Deleted(deleted) => Ok(deleted),
             other => unreachable!("DeleteObject returned {other:?}"),
         }
     }
 
     /// Deletes up to 1000 keys in one commit. Missing keys are not an error.
     pub async fn delete_objects(&self, bucket: &str, keys: Vec<String>) -> Result<()> {
-        let objects = keys.into_iter().map(|key| (key, DeleteCondition::default())).collect();
+        let objects = keys.into_iter().map(|key| (key, None, DeleteCondition::default())).collect();
         self.delete_objects_if(bucket, objects).await.map(drop)
     }
 
-    /// Like `delete_objects`, with a condition per key. Returns the indexes of
-    /// the keys left in place because their condition failed.
-    pub async fn delete_objects_if(&self, bucket: &str, objects: Vec<(String, DeleteCondition)>) -> Result<Vec<usize>> {
-        let command = Command::DeleteObjects {
-            bucket: bucket.to_owned(),
-            objects,
-            gc_due_at: now_millis() + self.gc_grace_millis(),
-        };
+    /// Like `delete_objects`, with an optional version and a condition per
+    /// key. Each entry gets what was deleted, or `None` if its precondition failed.
+    pub async fn delete_objects_if(
+        &self,
+        bucket: &str,
+        objects: Vec<(String, Option<VersionRef>, DeleteCondition)>,
+    ) -> Result<Vec<Option<Deleted>>> {
+        let now = now_millis();
+        let objects = objects.into_iter().map(|(key, version, cond)| (key, version, cond, Uuid::now_v7())).collect();
+        let command =
+            Command::DeleteObjects { bucket: bucket.to_owned(), objects, now, gc_due_at: now + self.gc_grace_millis() };
         match self.apply(command).await? {
-            Outcome::Failed(failed) => Ok(failed),
+            Outcome::DeletedMany(results) => Ok(results),
             other => unreachable!("DeleteObjects returned {other:?}"),
         }
+    }
+
+    /// Enables or suspends versioning (it cannot be turned off once enabled).
+    pub async fn set_bucket_versioning(&self, bucket: &str, versioning: Versioning) -> Result<()> {
+        self.apply(Command::SetBucketVersioning { bucket: bucket.to_owned(), versioning }).await?;
+        Ok(())
+    }
+
+    /// One page of every version and delete marker (ListObjectVersions).
+    pub async fn list_versions(&self, bucket: &str, query: VersionsQuery) -> Result<VersionsPage> {
+        let bucket = bucket.to_owned();
+        self.read(move |meta| meta.list_versions(&bucket, &query)).await
+    }
+
+    /// A version of `key`: the current one (possibly a delete marker) without
+    /// `version`. Fails with `NoSuchKey` or `NoSuchVersion`.
+    pub async fn get_version(&self, bucket: &str, key: &str, version: Option<VersionRef>) -> Result<ObjectRecord> {
+        let (bucket, key) = (bucket.to_owned(), key.to_owned());
+        self.read(move |meta| meta.get_version(&bucket, &key, version)).await
     }
 
     /// Makes `dst_bucket/dst_key` a copy of `source`, which the caller read from
@@ -516,6 +556,8 @@ impl Engine {
         let now = now_millis();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
+            versioned: false,
+            delete_marker: false,
             size: source.size,
             etag: source.etag.clone(),
             last_modified: now,
@@ -536,8 +578,10 @@ impl Engine {
             condition,
             gc_due_at: now + self.gc_grace_millis(),
         };
-        self.apply(command).await?;
-        Ok(record)
+        match self.apply(command).await? {
+            Outcome::Written { record, .. } => Ok(record),
+            other => unreachable!("a write returned {other:?}"),
+        }
     }
 
     // ---- multipart uploads ----
@@ -672,6 +716,8 @@ impl Engine {
         attrs.checksum_type = checksum_type;
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
+            versioned: false,
+            delete_marker: false,
             size: completion.size(),
             etag: completion.etag()?,
             last_modified: now,
@@ -690,8 +736,10 @@ impl Engine {
             condition,
             gc_due_at: now + self.gc_grace_millis(),
         };
-        self.apply(command).await?;
-        Ok(record)
+        match self.apply(command).await? {
+            Outcome::Written { record, .. } => Ok(record),
+            other => unreachable!("a write returned {other:?}"),
+        }
     }
 
     /// The object at `key` if `upload_id` created it: lets a retried

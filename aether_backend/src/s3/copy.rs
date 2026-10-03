@@ -12,7 +12,7 @@ use s3s::{S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use super::AetherS3;
 use super::convert::*;
 use crate::error::Error as EngineError;
-use crate::meta::{ObjectAttrs, ObjectRecord};
+use crate::meta::{ObjectAttrs, ObjectRecord, VersionRef};
 
 /// S3's limit on one part, and so on one UploadPartCopy.
 const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -42,6 +42,20 @@ impl SourceConditions {
 }
 
 impl AetherS3 {
+    /// A copy source: the current object, or the version named. Delete
+    /// markers cannot be copied.
+    async fn source(&self, bucket: &str, key: &str, version: Option<VersionRef>) -> S3Result<ObjectRecord> {
+        let record = self.engine.get_version(bucket, key, version).await.map_err(s3_error)?;
+        match (record.delete_marker, version) {
+            (false, _) => Ok(record),
+            (true, None) => Err(s3_error!(NoSuchKey)),
+            (true, Some(_)) => Err(s3_error!(
+                InvalidRequest,
+                "The source of a copy request may not specifically refer to a delete marker by version id."
+            )),
+        }
+    }
+
     pub(super) async fn copy_object_op(
         &self,
         req: S3Request<CopyObjectInput>,
@@ -62,7 +76,7 @@ impl AetherS3 {
         }
         check_storage_class(input.storage_class.as_ref())?;
 
-        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
+        let (src_bucket, src_key, src_version) = copy_source(&input.copy_source)?;
         let replace = match input.metadata_directive.as_ref().map(|d| d.as_str()) {
             None | Some(MetadataDirective::COPY) => false,
             Some(MetadataDirective::REPLACE) => true,
@@ -88,7 +102,7 @@ impl AetherS3 {
         let mut attempt = 0;
         let record = loop {
             attempt += 1;
-            let source = self.engine.get_object(&src_bucket, &src_key).await.map_err(s3_error)?;
+            let source = self.source(&src_bucket, &src_key, src_version).await?;
             conditions.check(&source)?;
             // The data does not change, so neither do its checksums.
             let mut attrs = match &new_attrs {
@@ -110,6 +124,7 @@ impl AetherS3 {
                 Err(e) => return Err(s3_error(e)),
             }
         };
+        let copied_version = src_version.map(|v| v.to_string());
 
         let mut result = CopyObjectResult {
             e_tag: Some(etag(&record)),
@@ -122,6 +137,8 @@ impl AetherS3 {
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(result),
             server_side_encryption: sse,
+            version_id: version_id_of(&record),
+            copy_source_version_id: copied_version,
             ..Default::default()
         }))
     }
@@ -136,8 +153,8 @@ impl AetherS3 {
         let number = part_number(input.part_number)?;
         let upload = self.engine.get_upload(&input.bucket, &input.key, upload_id).await.map_err(s3_error)?;
 
-        let (src_bucket, src_key) = copy_source(&input.copy_source)?;
-        let source = self.engine.get_object(&src_bucket, &src_key).await.map_err(s3_error)?;
+        let (src_bucket, src_key, src_version) = copy_source(&input.copy_source)?;
+        let source = self.source(&src_bucket, &src_key, src_version).await?;
         let conditions = SourceConditions {
             if_match: input.copy_source_if_match,
             if_none_match: input.copy_source_if_none_match,
@@ -178,11 +195,10 @@ impl AetherS3 {
 }
 
 /// The source bucket and key. Only the `null` version exists until versioning.
-fn copy_source(source: &CopySource) -> S3Result<(String, String)> {
+fn copy_source(source: &CopySource) -> S3Result<(String, String, Option<VersionRef>)> {
     match source {
         CopySource::Bucket { bucket, key, version_id } => {
-            check_version_id(version_id.as_deref())?;
-            Ok((bucket.to_string(), key.to_string()))
+            Ok((bucket.to_string(), key.to_string(), parse_version(version_id.as_deref())?))
         }
         _ => Err(s3_error!(NotImplemented, "access point and outpost copy sources are not supported")),
     }

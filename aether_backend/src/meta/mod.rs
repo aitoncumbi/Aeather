@@ -9,6 +9,7 @@ mod codec;
 mod keys;
 mod types;
 mod usage;
+mod versions;
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -22,6 +23,7 @@ pub use self::keys::prefix_successor;
 use self::keys::{gc_key, object_key, parse_gc_key, parse_part_number, parse_upload_key, part_key, upload_key};
 pub use self::types::*;
 pub use self::usage::replaced as usage_after;
+pub use self::versions::{Deleted, key_of as version_key_of};
 use crate::error::{Error, Result};
 
 /// bucket name → `BucketRecord`
@@ -38,6 +40,9 @@ const PARTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("parts");
 const GC_QUEUE: TableDefinition<&[u8], ()> = TableDefinition::new("gc_queue");
 /// access key id → `AccessKeyRecord`
 const ACCESS_KEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("access_keys");
+/// bucket id ‖ key ‖ 0x00 ‖ inverted version id → `ObjectRecord` (noncurrent
+/// versions and delete markers; see `versions`)
+const VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("versions");
 /// bucket id → `BucketUsage`
 const BUCKET_USAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bucket_usage");
 /// name → value
@@ -73,17 +78,24 @@ pub enum Command {
         gc_due_at: Millis,
     },
     /// Fails with `PreconditionFailed` if the key exists and does not meet `condition`.
+    /// Without `version`: removes the object, or in a versioned bucket adds a
+    /// delete marker (`marker_id`, `now`). With it: removes that version.
     DeleteObject {
         bucket: String,
         key: String,
+        version: Option<VersionRef>,
         condition: DeleteCondition,
+        marker_id: Uuid,
+        now: Millis,
         gc_due_at: Millis,
     },
     /// Deletes many keys in one transaction (S3 DeleteObjects). Keys whose
     /// condition fails are left in place and listed in `Outcome::Failed`.
     DeleteObjects {
         bucket: String,
-        objects: Vec<(String, DeleteCondition)>,
+        /// Key, version, condition and the id of the delete marker it may create.
+        objects: Vec<(String, Option<VersionRef>, DeleteCondition, Uuid)>,
+        now: Millis,
         gc_due_at: Millis,
     },
     CreateUpload {
@@ -155,11 +167,17 @@ pub enum Command {
         bucket: String,
         grant: BucketGrant,
     },
-    /// Replaces an object's tags. Fails with `NoSuchKey`.
+    /// Replaces the tags of an object (its current version unless `version`).
     SetObjectTags {
         bucket: String,
         key: String,
+        version: Option<VersionRef>,
         tags: BTreeMap<String, String>,
+    },
+    /// Enables or suspends versioning.
+    SetBucketVersioning {
+        bucket: String,
+        versioning: Versioning,
     },
     /// Replaces a bucket's CORS rules; no rules removes the configuration.
     SetBucketCors {
@@ -178,12 +196,17 @@ pub enum Command {
 pub enum Outcome {
     Done,
     Bucket(BucketRecord),
-    /// The object record that was replaced or deleted, if any.
-    Object(Option<ObjectRecord>),
-    Key(AccessKeyRecord),
-    /// Indexes of the entries a batch command skipped because their
+    /// An object written: the record as stored (with its version) and the
+    /// current object it replaced, if any.
+    Written {
+        record: ObjectRecord,
+        previous: Option<ObjectRecord>,
+    },
+    Deleted(Deleted),
+    /// Per entry of a DeleteObjects batch: what was deleted, or `None` if its
     /// precondition failed.
-    Failed(Vec<usize>),
+    DeletedMany(Vec<Option<Deleted>>),
+    Key(AccessKeyRecord),
 }
 
 pub struct MetaStore {
@@ -203,6 +226,7 @@ impl MetaStore {
             txn.open_table(PARTS)?;
             txn.open_table(ACCESS_KEYS)?;
             txn.open_table(BUCKET_USAGE)?;
+            txn.open_table(VERSIONS)?;
             let mut system = txn.open_table(SYSTEM)?;
             let stored = system.get("schema_version")?.map(|v| codec::decode::<u32>(v.value())).transpose()?;
             match stored {
@@ -279,7 +303,14 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             if buckets.get(name.as_str())?.is_some() {
                 return Err(Error::BucketAlreadyExists);
             }
-            let record = BucketRecord { id, name, created_at, cors: Vec::new(), quota: Quota::default() };
+            let record = BucketRecord {
+                id,
+                name,
+                created_at,
+                cors: Vec::new(),
+                quota: Quota::default(),
+                versioning: Versioning::default(),
+            };
             buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
             usage::adjust(txn, &record, None, None)?;
             if let Some(owner) = owner {
@@ -298,6 +329,10 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             };
             let objects = txn.open_table(OBJECTS)?;
             if objects.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?.next().is_some() {
+                return Err(Error::BucketNotEmpty);
+            }
+            // Noncurrent versions and delete markers count too, as in S3.
+            if txn.open_table(VERSIONS)?.range::<&[u8]>(as_slice_bounds(&bucket_bounds(&bucket.id)))?.next().is_some() {
                 return Err(Error::BucketNotEmpty);
             }
             let uploads: Vec<Vec<u8>> = {
@@ -329,23 +364,15 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
         Command::PutObject { bucket, key, record, condition, gc_due_at } => {
             note_sealing_key(txn, record.sse.as_ref())?;
             let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-            let mut objects = txn.open_table(OBJECTS)?;
-            let okey = object_key(&bucket.id, key.as_bytes());
-            let previous: Option<ObjectRecord> =
-                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-            condition.check(previous.as_ref())?;
-            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-            usage::adjust(txn, &bucket, Some(&record), previous.as_ref())?;
-
-            let mut blocks = txn.open_table(BLOCKS)?;
-            let mut gc = txn.open_table(GC_QUEUE)?;
-            for block in record.data.blocks() {
-                add_block_ref(&mut blocks, &block.id)?;
+            condition.check(current_object(txn, &bucket, &key)?.as_ref())?;
+            {
+                let mut blocks = txn.open_table(BLOCKS)?;
+                for block in record.data.blocks() {
+                    add_block_ref(&mut blocks, &block.id)?;
+                }
             }
-            if let Some(prev) = &previous {
-                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-            }
-            Outcome::Object(previous)
+            let (record, previous) = versions::place(txn, &bucket, &key, record, gc_due_at)?;
+            Outcome::Written { record, previous }
         }
         Command::CreateUpload { bucket, upload } => {
             note_sealing_key(txn, upload.sse.as_ref())?;
@@ -391,24 +418,12 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
                 }
             }
 
-            let mut objects = txn.open_table(OBJECTS)?;
-            let okey = object_key(&bucket.id, key.as_bytes());
-            let previous: Option<ObjectRecord> =
-                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-            condition.check(previous.as_ref())?;
-            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-            drop(objects);
-            usage::adjust(txn, &bucket, Some(&record), previous.as_ref())?;
-
+            condition.check(current_object(txn, &bucket, &key)?.as_ref())?;
             // The object takes over the references held by the parts it uses.
             let ukey = upload_key(&bucket.id, key.as_bytes(), &upload_id);
             remove_upload(txn, &ukey, &upload_id, &part_numbers, gc_due_at)?;
-            if let Some(prev) = &previous {
-                let mut blocks = txn.open_table(BLOCKS)?;
-                let mut gc = txn.open_table(GC_QUEUE)?;
-                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-            }
-            Outcome::Object(previous)
+            let (record, previous) = versions::place(txn, &bucket, &key, record, gc_due_at)?;
+            Outcome::Written { record, previous }
         }
         Command::AbortUpload { bucket, key, upload_id, gc_due_at } => {
             let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
@@ -418,51 +433,42 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             Outcome::Done
         }
         Command::CopyObject { src_bucket, src_key, src_version, dst_bucket, dst_key, record, condition, gc_due_at } => {
-            let buckets = txn.open_table(BUCKETS)?;
-            let src_bucket = load_bucket(&buckets, &src_bucket)?;
-            let dst_bucket = load_bucket(&buckets, &dst_bucket)?;
-            let mut objects = txn.open_table(OBJECTS)?;
-            let source: ObjectRecord = match objects.get(object_key(&src_bucket.id, src_key.as_bytes()).as_slice())? {
-                Some(v) => codec::decode(v.value())?,
-                None => return Err(Error::NoSuchKey),
+            let (src_bucket, dst_bucket) = {
+                let buckets = txn.open_table(BUCKETS)?;
+                (load_bucket(&buckets, &src_bucket)?, load_bucket(&buckets, &dst_bucket)?)
             };
-            if source.version_id != src_version || source.data != record.data {
+            // The source may be any version, current or not, but must still exist unchanged.
+            let source = find_version_by_id(txn, &src_bucket, &src_key, &src_version)?;
+            if source.as_ref().is_none_or(|s| s.delete_marker || s.data != record.data) {
                 return Err(Error::Conflict("the source object changed during the copy".into()));
             }
-            let okey = object_key(&dst_bucket.id, dst_key.as_bytes());
-            let previous: Option<ObjectRecord> =
-                objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-            condition.check(previous.as_ref())?;
-            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-            usage::adjust(txn, &dst_bucket, Some(&record), previous.as_ref())?;
-
-            // Add references before releasing the previous object: when copying
-            // an object onto itself they are the same blocks.
-            let mut blocks = txn.open_table(BLOCKS)?;
-            let mut gc = txn.open_table(GC_QUEUE)?;
-            for block in record.data.blocks() {
-                add_block_ref(&mut blocks, &block.id)?;
-            }
-            if let Some(prev) = &previous {
-                release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
-            }
-            Outcome::Object(previous)
-        }
-        Command::DeleteObject { bucket, key, condition, gc_due_at } => {
-            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-            Outcome::Object(delete_object(txn, &bucket, &key, &condition, gc_due_at)?)
-        }
-        Command::DeleteObjects { bucket, objects, gc_due_at } => {
-            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-            let mut failed = Vec::new();
-            for (i, (key, condition)) in objects.iter().enumerate() {
-                match delete_object(txn, &bucket, key, condition, gc_due_at) {
-                    Ok(_) => {}
-                    Err(Error::PreconditionFailed) => failed.push(i),
-                    Err(e) => return Err(e),
+            condition.check(current_object(txn, &dst_bucket, &dst_key)?.as_ref())?;
+            // Add references before any are released: when copying an object
+            // onto itself they are the same blocks.
+            {
+                let mut blocks = txn.open_table(BLOCKS)?;
+                for block in record.data.blocks() {
+                    add_block_ref(&mut blocks, &block.id)?;
                 }
             }
-            Outcome::Failed(failed)
+            let (record, previous) = versions::place(txn, &dst_bucket, &dst_key, record, gc_due_at)?;
+            Outcome::Written { record, previous }
+        }
+        Command::DeleteObject { bucket, key, version, condition, marker_id, now, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            Outcome::Deleted(delete_one(txn, &bucket, &key, version, &condition, marker_id, now, gc_due_at)?)
+        }
+        Command::DeleteObjects { bucket, objects, now, gc_due_at } => {
+            let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
+            let mut results = Vec::with_capacity(objects.len());
+            for (key, version, condition, marker_id) in objects {
+                match delete_one(txn, &bucket, &key, version, &condition, marker_id, now, gc_due_at) {
+                    Err(Error::PreconditionFailed) => results.push(None),
+                    Err(e) => return Err(e),
+                    Ok(deleted) => results.push(Some(deleted)),
+                }
+            }
+            Outcome::DeletedMany(results)
         }
         Command::CreateKey { key } => {
             note_sealing_key(txn, key.sealed_secret.as_ref())?;
@@ -524,17 +530,44 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
             Outcome::Bucket(record)
         }
-        Command::SetObjectTags { bucket, key, tags } => {
+        Command::SetObjectTags { bucket, key, version, tags } => {
             let bucket = load_bucket(&txn.open_table(BUCKETS)?, &bucket)?;
-            let mut objects = txn.open_table(OBJECTS)?;
             let okey = object_key(&bucket.id, key.as_bytes());
-            let mut record: ObjectRecord = match objects.get(okey.as_slice())? {
-                Some(v) => codec::decode(v.value())?,
-                None => return Err(Error::NoSuchKey),
-            };
-            record.attrs.tags = tags;
-            objects.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
-            Outcome::Object(Some(record))
+            let current = current_object(txn, &bucket, &key)?;
+            match (version, current) {
+                (None, Some(mut record)) => {
+                    record.attrs.tags = tags;
+                    txn.open_table(OBJECTS)?.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+                }
+                (None, None) => return Err(Error::NoSuchKey),
+                (Some(v), Some(mut record)) if v.matches(&record) => {
+                    record.attrs.tags = tags;
+                    txn.open_table(OBJECTS)?.insert(okey.as_slice(), codec::encode(&record).as_slice())?;
+                }
+                (Some(v), _) => {
+                    let found = versions::noncurrent(&txn.open_table(VERSIONS)?, &bucket.id, &key)?
+                        .into_iter()
+                        .find(|r| v.matches(r));
+                    let Some(mut record) = found else { return Err(Error::NoSuchVersion) };
+                    if record.delete_marker {
+                        return Err(Error::MethodNotAllowed("delete markers have no tags".into()));
+                    }
+                    record.attrs.tags = tags;
+                    let vkey = versions::version_key(&bucket.id, key.as_bytes(), &record.version_id);
+                    txn.open_table(VERSIONS)?.insert(vkey.as_slice(), codec::encode(&record).as_slice())?;
+                }
+            }
+            Outcome::Done
+        }
+        Command::SetBucketVersioning { bucket, versioning } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            let mut record = load_bucket(&buckets, &bucket)?;
+            if versioning == Versioning::Unversioned {
+                return Err(Error::InvalidArgument("versioning can be enabled or suspended, not removed".into()));
+            }
+            record.versioning = versioning;
+            buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+            Outcome::Bucket(record)
         }
         Command::SetBucketQuota { bucket, quota } => {
             let mut buckets = txn.open_table(BUCKETS)?;
@@ -582,6 +615,36 @@ fn fail_all(mut results: Vec<Option<Result<Outcome>>>, pending: &[usize], error:
 }
 
 impl MetaStore {
+    /// One page of every version and delete marker, for ListObjectVersions.
+    pub fn list_versions(&self, bucket: &str, query: &VersionsQuery) -> Result<VersionsPage> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        versions::list(&txn.open_table(OBJECTS)?, &txn.open_table(VERSIONS)?, &bucket, query)
+    }
+
+    /// A version of `key`: without `version`, the current one, which may be a
+    /// delete marker. Fails with `NoSuchKey` or `NoSuchVersion`.
+    pub fn get_version(&self, bucket: &str, key: &str, version: Option<VersionRef>) -> Result<ObjectRecord> {
+        let txn = self.db.begin_read()?;
+        let bucket = load_bucket(&txn.open_table(BUCKETS)?, bucket)?;
+        let current: Option<ObjectRecord> = txn
+            .open_table(OBJECTS)?
+            .get(object_key(&bucket.id, key.as_bytes()).as_slice())?
+            .map(|v| codec::decode(v.value()))
+            .transpose()?;
+        match (version, current) {
+            (None, Some(current)) => return Ok(current),
+            (Some(v), Some(current)) if v.matches(&current) => return Ok(current),
+            _ => {}
+        }
+        let mut older = versions::noncurrent(&txn.open_table(VERSIONS)?, &bucket.id, key)?.into_iter();
+        match version {
+            // Without a current object, the newest version is a delete marker (or there is none).
+            None => older.next().ok_or(Error::NoSuchKey),
+            Some(v) => older.find(|r| v.matches(r)).ok_or(Error::NoSuchVersion),
+        }
+    }
+
     /// Fingerprints of every master key that has encrypted stored data.
     pub fn sealing_key_ids(&self) -> Result<Vec<String>> {
         let txn = self.db.begin_read()?;
@@ -856,9 +919,16 @@ impl MetaStore {
 
     /// Objects stored in blocks, after the raw `objects` key `after`, for the
     /// scrubber. Returns (raw key, record) pairs; inline objects are skipped.
-    pub fn objects_with_blocks(&self, after: Option<&[u8]>, limit: usize) -> Result<Vec<(Vec<u8>, ObjectRecord)>> {
+    /// Objects stored in blocks, by raw key, from `objects` (current versions)
+    /// or with `noncurrent` from `versions`.
+    pub fn objects_with_blocks(
+        &self,
+        noncurrent: bool,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, ObjectRecord)>> {
         let txn = self.db.begin_read()?;
-        let objects = txn.open_table(OBJECTS)?;
+        let objects = txn.open_table(if noncurrent { VERSIONS } else { OBJECTS })?;
         let start = match after {
             Some(after) => Bound::Excluded(after),
             None => Bound::Unbounded,
@@ -877,10 +947,10 @@ impl MetaStore {
         Ok(out)
     }
 
-    /// The object stored under a raw `objects` key.
-    pub fn object_at(&self, raw_key: &[u8]) -> Result<Option<ObjectRecord>> {
+    /// The object stored under a raw `objects` (or `versions`) key.
+    pub fn object_at(&self, noncurrent: bool, raw_key: &[u8]) -> Result<Option<ObjectRecord>> {
         let txn = self.db.begin_read()?;
-        let objects = txn.open_table(OBJECTS)?;
+        let objects = txn.open_table(if noncurrent { VERSIONS } else { OBJECTS })?;
         objects.get(raw_key)?.map(|v| codec::decode(v.value())).transpose()
     }
 
@@ -1005,27 +1075,58 @@ fn bad_upload_key() -> Error {
     Error::Corrupt("bad uploads key".into())
 }
 
-fn delete_object(
-    txn: &redb::WriteTransaction,
+/// The current object of `key` (not a delete marker), if any.
+fn current_object(txn: &WriteTransaction, bucket: &BucketRecord, key: &str) -> Result<Option<ObjectRecord>> {
+    let okey = object_key(&bucket.id, key.as_bytes());
+    txn.open_table(OBJECTS)?.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()
+}
+
+/// Any version of `key` by its internal id: the current object or a noncurrent one.
+fn find_version_by_id(
+    txn: &WriteTransaction,
     bucket: &BucketRecord,
     key: &str,
-    condition: &DeleteCondition,
-    gc_due_at: Millis,
+    id: &Uuid,
 ) -> Result<Option<ObjectRecord>> {
-    let mut objects = txn.open_table(OBJECTS)?;
-    let okey = object_key(&bucket.id, key.as_bytes());
-    let previous: Option<ObjectRecord> = objects.get(okey.as_slice())?.map(|v| codec::decode(v.value())).transpose()?;
-    if let Some(prev) = &previous {
-        condition.check(prev)?;
-        objects.remove(okey.as_slice())?;
+    if let Some(current) = current_object(txn, bucket, key)?.filter(|c| c.version_id == *id) {
+        return Ok(Some(current));
     }
-    if let Some(prev) = &previous {
-        usage::adjust(txn, bucket, None, Some(prev))?;
+    Ok(versions::noncurrent(&txn.open_table(VERSIONS)?, &bucket.id, key)?.into_iter().find(|v| v.version_id == *id))
+}
+
+/// One S3 DeleteObject: a version, or the current object (a delete marker
+/// in versioned buckets). Deleting something that does not exist succeeds.
+#[allow(clippy::too_many_arguments)]
+fn delete_one(
+    txn: &WriteTransaction,
+    bucket: &BucketRecord,
+    key: &str,
+    version: Option<VersionRef>,
+    condition: &DeleteCondition,
+    marker_id: Uuid,
+    now: Millis,
+    gc_due_at: Millis,
+) -> Result<Deleted> {
+    let current = current_object(txn, bucket, key)?;
+    if let Some(current) = &current {
+        condition.check(current)?;
+    }
+    if let Some(version) = version {
+        return versions::delete_version(txn, bucket, key, version, gc_due_at);
+    }
+    if bucket.versioning != Versioning::Unversioned {
+        let marker = ObjectRecord::delete_marker(marker_id, now);
+        let (marker, _) = versions::place(txn, bucket, key, marker, gc_due_at)?;
+        return Ok(Deleted { version: Some(marker.version()), delete_marker: true });
+    }
+    if let Some(current) = current {
+        txn.open_table(OBJECTS)?.remove(object_key(&bucket.id, key.as_bytes()).as_slice())?;
+        usage::adjust(txn, bucket, None, Some(&current))?;
         let mut blocks = txn.open_table(BLOCKS)?;
         let mut gc = txn.open_table(GC_QUEUE)?;
-        release_blocks(&mut blocks, &mut gc, prev.data.blocks(), gc_due_at)?;
+        release_blocks(&mut blocks, &mut gc, current.data.blocks(), gc_due_at)?;
     }
-    Ok(previous)
+    Ok(Deleted::default())
 }
 
 fn add_block_ref(blocks: &mut redb::Table<&[u8], u64>, id: &Uuid) -> Result<()> {
@@ -1060,10 +1161,10 @@ fn bucket_bounds(id: &Uuid) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
     (start, end)
 }
 
-fn as_slice_bounds(range: &(Bound<Vec<u8>>, Bound<Vec<u8>>)) -> (Bound<&[u8]>, Bound<&[u8]>) {
+pub(super) fn as_slice_bounds(range: &(Bound<Vec<u8>>, Bound<Vec<u8>>)) -> (Bound<&[u8]>, Bound<&[u8]>) {
     (range.0.as_ref().map(Vec::as_slice), range.1.as_ref().map(Vec::as_slice))
 }
 
-fn utf8(bytes: &[u8]) -> Result<String> {
+pub(super) fn utf8(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| Error::Corrupt("object key is not UTF-8".into()))
 }
