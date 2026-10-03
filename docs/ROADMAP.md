@@ -100,7 +100,12 @@ Design: [CLUSTERING.md](CLUSTERING.md).
 - Erasure coding
 - Webhook/queue notifications on object changes
 - Object lock (WORM retention, legal hold)
-- Multiple disks per node
+- Multiple disks per node, with redundancy across them (like RAID 1): each block
+  on two disks, so a node keeps serving all its data when one disk fails, and a
+  replaced disk is refilled from the other
+- Automated backups: `aether backup` on a schedule (`backup.schedule`,
+  `backup.dir`), dated directories, retention (keep the last N daily and
+  weekly), and the last result in `aether status` and the metrics
 - Compression, deduplication
 - Bucket replication between clusters
 - External KMS for encryption keys
