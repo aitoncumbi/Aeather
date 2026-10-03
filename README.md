@@ -186,8 +186,27 @@ Current limitations:
   transitions (Aether has one storage class); ACLs and bucket policies
   (per-key bucket permissions replace them); object lock; browser POST uploads.
   Requests that need these fail with `NotImplemented` rather than being ignored.
-- One node only: no replication yet, so back up the data directory (see the
+- One node only: no replication yet, so [back it up](#back-it-up) (see the
   roadmap for clustering).
+
+## Back it up
+
+```sh
+aether backup /mnt/backups/aether-2026-10-03          # on the server host
+docker compose exec aether aether backup /backups/2026-10-03   # with Docker
+docker compose cp aether:/backups/2026-10-03 ./aether-2026-10-03
+```
+
+The server copies itself while it keeps running: the metadata as of one
+moment, then every block that metadata refers to (garbage collection waits
+until the copy is done). The target must be a new or empty directory, outside
+the data directory, preferably on another disk. Copy it off the machine
+afterwards.
+
+The backup is a data directory: to restore, stop the server and start it with
+`storage.data_dir` pointing at the backup (or a copy of it). Objects written
+after the backup started are not in it. Encrypted data needs the same master
+key, so keep the key with, but not inside, your backups.
 
 ## Monitor it
 

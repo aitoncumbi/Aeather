@@ -16,7 +16,7 @@ use std::net::Ipv4Addr;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -114,6 +114,8 @@ pub struct Engine {
     keys: Arc<KeyCache>,
     stats: Arc<EngineStats>,
     scrub: scrub::ScrubState,
+    /// Running backups: garbage collection waits while there are any.
+    backups: AtomicUsize,
     config: EngineConfig,
 }
 
@@ -173,6 +175,7 @@ impl Engine {
             keys: Arc::new(keys),
             stats,
             scrub: scrub::ScrubState::default(),
+            backups: AtomicUsize::new(0),
             config,
         };
         let sealed = engine.seal_key_secrets().await?;
@@ -941,7 +944,8 @@ impl Engine {
     pub async fn collect_garbage(&self) -> Result<usize> {
         let now = now_millis();
         let mut total = 0;
-        loop {
+        // A backup copies blocks after snapshotting the metadata: keep them all.
+        while !self.backup_running() {
             let due = self.read(move |meta| meta.due_gc(now, GC_BATCH)).await?;
             let batch = due.len();
             if batch == 0 {
@@ -1368,11 +1372,13 @@ pub fn validate_part_number(part_number: u32) -> Result<()> {
     Ok(())
 }
 
+mod backup;
 mod keys;
 mod lifecycle;
 mod scrub;
 mod writer;
 
+pub use self::backup::BackupReport;
 pub use self::lifecycle::LifecycleReport;
 
 pub use self::scrub::{CorruptBlock, ScrubReport};

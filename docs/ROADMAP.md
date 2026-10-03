@@ -84,7 +84,7 @@ anything from a 1 KB document to a 100 GB file.
 
 ## v2.1: polish
 - [x] Console: browse an object's versions, restore or delete them, and list deleted objects
-- [ ] `aether backup`: a consistent snapshot of a running node (metadata and blocks)
+- [x] `aether backup`: a consistent snapshot of a running node (metadata and blocks)
 - [ ] GET and HEAD by `partNumber`, and `GetObjectAttributes`
 
 ## v3: clustering

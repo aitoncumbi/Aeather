@@ -118,6 +118,7 @@ neither has a private backdoor.
 | `GET /api/v1/status` | Version, uptime, counts, disk, storage settings, GC queue, scrub report, the S3 endpoint |
 | `GET /api/v1/stats?range=1h\|24h\|7d` | Request rates by kind, latency percentiles, bandwidth, errors and object counts over time |
 | `POST /api/v1/scrub` | Start a scrub now (`409` while one runs) |
+| `POST /api/v1/backup` | Back the node up to a directory on the server: `{"dir": "/abs/path"}`. Answers when done |
 | `GET, POST /api/v1/keys` | List keys; create one (the response is the only time its secret is shown) |
 | `GET, PATCH, DELETE /api/v1/keys/{id}` | Show, update (name, admin, can_create_buckets, disabled), delete |
 | `PUT, DELETE /api/v1/keys/{id}/buckets/{bucket}` | Set or remove a key's permissions on a bucket |
@@ -401,6 +402,31 @@ are read from the engine at scrape time.
 | `aether_metadata_commits_total`, `aether_metadata_writes_total` (writes ÷ commits = average group-commit batch) | |
 | `aether_lifecycle_expired_total` (objects, versions and delete markers removed by lifecycle rules) | |
 | `aether_build_info`, `aether_uptime_seconds` | `version` |
+
+### Backups
+
+`aether backup <dir>` (`POST /api/v1/backup`) copies a running node into a
+directory on the server laid out like a data directory, so restoring is
+starting Aether on it.
+
+- **Consistency.** The metadata is copied table by table from one read
+  transaction into a new `meta.redb`, so it is a single point in time. Blocks
+  are immutable, so copying them afterwards gives exactly the data that
+  metadata refers to. The only risk is a block being deleted meanwhile, so
+  garbage collection pauses while a backup runs (blocks it would free wait in
+  `gc_queue`).
+- **Contents.** Every block with a reference count above zero, including
+  older versions and parts of unfinished multipart uploads. Blocks waiting for
+  GC, and the queue itself, are left out.
+- **Completeness.** The metadata is written as `meta.redb.partial` and renamed
+  once every block is copied and fsynced, so a directory with `meta.redb` is a
+  complete backup. The request runs to the end even if the client goes away.
+- **Safety.** The target must be absolute, new or empty (a backup never
+  overwrites files), and outside the data directory, whose orphan sweeper
+  would delete blocks it finds there.
+- Sealed data keys and access-key secrets are copied as they are, so the
+  backup needs the same master key, and the server refuses to start on it
+  without that key.
 
 ### Scrubbing
 
