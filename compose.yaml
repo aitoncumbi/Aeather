@@ -3,6 +3,7 @@
 #   cp .env.example .env    # then edit .env
 #   docker compose up -d
 #   docker compose exec aether aether key create my-app --grant my-bucket=rw
+#   docker compose exec aether aether backup /backups/$(date +%F)
 #
 # The S3 API is published on port 9000. The admin API, the web console
 # (http://127.0.0.1:9001/) and /metrics are published on the host's loopback
@@ -22,8 +23,10 @@ services:
       - "127.0.0.1:9001:9001"
     volumes:
       - aether-data:/data
+      - aether-backups:/backups
     # Longer than http.shutdown_timeout_secs, so in-flight requests can finish.
     stop_grace_period: 40s
 
 volumes:
   aether-data:
+  aether-backups:

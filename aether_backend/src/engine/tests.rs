@@ -1445,3 +1445,60 @@ async fn lifecycle_rules_expire_objects_versions_markers_and_uploads() {
     assert_eq!(engine.apply_lifecycle(now_millis()).await.unwrap().expired_objects, 0);
     assert_eq!(engine.apply_lifecycle(now_millis() + 2 * day).await.unwrap().expired_objects, 2);
 }
+
+#[tokio::test]
+async fn backups_are_consistent_and_open_as_a_data_directory() {
+    let (engine, dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    engine.set_bucket_versioning("bkt", Versioning::Enabled).await.unwrap();
+    put(&engine, "bkt", "small", b"inline").await;
+    put(&engine, "bkt", "big", &pattern(2500)).await;
+    put(&engine, "bkt", "big", &other_pattern(1500)).await; // the first stays as an older version
+    let upload = engine.create_upload("bkt", "multi", ObjectAttrs::default(), None, None).await.unwrap();
+    upload_part(&engine, "multi", upload.upload_id, 1, &pattern(1200)).await;
+    engine.create_bucket("gone").await.unwrap();
+    put(&engine, "gone", "x", &pattern(1500)).await;
+    engine.delete_object("gone", "x").await.unwrap(); // its blocks wait for GC
+
+    // Refusals: a relative path, a non-empty directory, the data directory itself.
+    let out = tempfile::tempdir().unwrap();
+    assert!(matches!(engine.backup(std::path::Path::new("relative")).await, Err(Error::InvalidArgument(_))));
+    std::fs::write(out.path().join("file"), b"x").unwrap();
+    assert!(matches!(engine.backup(out.path()).await, Err(Error::InvalidArgument(_))));
+    let inside = dir.path().join("backup");
+    assert!(matches!(engine.backup(&inside).await, Err(Error::InvalidArgument(_))));
+    assert!(!inside.exists(), "a refused backup leaves nothing behind");
+
+    let target = out.path().join("b1");
+    let report = engine.backup(&target).await.unwrap();
+    assert_eq!(report.blocks, 3 + 2 + 2, "both versions of big and the part, not the deleted object");
+    assert!(target.join("meta.redb").exists() && !target.join("meta.redb.partial").exists());
+    assert!(!engine.backup_running());
+    put(&engine, "bkt", "later", b"after the backup").await;
+
+    let restored = Engine::open(EngineConfig { data_dir: target.clone(), ..engine.config.clone() }).await.unwrap();
+    let big = restored.get_object("bkt", "big").await.unwrap();
+    assert_eq!(read_all(&restored, &big, 0..big.size).await, other_pattern(1500));
+    let versions = restored.list_versions("bkt", VersionsQuery { max_keys: 100, ..Default::default() }).await.unwrap();
+    assert_eq!(versions.versions.len(), 3, "small, and big's two versions");
+    assert!(matches!(restored.get_object("bkt", "later").await, Err(Error::NoSuchKey)));
+    assert!(restored.get_upload("bkt", "multi", upload.upload_id).await.is_ok());
+    assert!(matches!(restored.get_object("gone", "x").await, Err(Error::NoSuchKey)));
+    assert_eq!(restored.gc_pending().await.unwrap(), 0);
+    let scrub = restored.scrub().await.unwrap();
+    assert!(scrub.corrupt.is_empty(), "{:?}", scrub.corrupt);
+    assert_eq!(block_files(&restored).await, 7);
+}
+
+#[tokio::test]
+async fn gc_waits_for_running_backups() {
+    let (engine, _dir) = test_engine().await;
+    engine.create_bucket("bkt").await.unwrap();
+    put(&engine, "bkt", "x", &pattern(1500)).await;
+    engine.delete_object("bkt", "x").await.unwrap();
+    engine.backups.fetch_add(1, Ordering::SeqCst);
+    assert_eq!(engine.collect_garbage().await.unwrap(), 0);
+    assert_eq!(block_files(&engine).await, 2);
+    engine.backups.fetch_sub(1, Ordering::SeqCst);
+    assert_eq!(engine.collect_garbage().await.unwrap(), 2);
+}

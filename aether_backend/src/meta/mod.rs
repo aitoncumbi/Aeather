@@ -15,7 +15,10 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -995,6 +998,36 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// Writes the metadata as of now to a new database at `path`, leaving out
+    /// blocks waiting for GC. Returns the blocks it references.
+    pub fn snapshot(&self, path: &Path) -> Result<Vec<Uuid>> {
+        let read = self.db.begin_read()?;
+        let out = Database::create(path)?;
+        let write = out.begin_write()?;
+        copy_table(&read, &write, BUCKETS)?;
+        copy_table(&read, &write, OBJECTS)?;
+        copy_table(&read, &write, UPLOADS)?;
+        copy_table(&read, &write, PARTS)?;
+        copy_table(&read, &write, ACCESS_KEYS)?;
+        copy_table(&read, &write, VERSIONS)?;
+        copy_table(&read, &write, BUCKET_USAGE)?;
+        copy_table(&read, &write, SYSTEM)?;
+        write.open_table(GC_QUEUE)?;
+        let mut ids = Vec::new();
+        {
+            let mut blocks = write.open_table(BLOCKS)?;
+            for entry in read.open_table(BLOCKS)?.iter()? {
+                let (id, refs) = entry?;
+                if refs.value() > 0 {
+                    blocks.insert(id.value(), refs.value())?;
+                    ids.push(Uuid::from_slice(id.value()).map_err(|_| Error::Corrupt("bad block id".into()))?);
+                }
+            }
+        }
+        write.commit()?;
+        Ok(ids)
+    }
+
     /// Whether a block is referenced or waiting for GC (as opposed to orphaned).
     pub fn block_known(&self, id: &Uuid) -> Result<bool> {
         let txn = self.db.begin_read()?;
@@ -1022,6 +1055,19 @@ impl MetaStore {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(GC_QUEUE)?.len()?)
     }
+}
+
+fn copy_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    read: &ReadTransaction,
+    write: &WriteTransaction,
+    table: TableDefinition<K, V>,
+) -> Result<()> {
+    let mut to = write.open_table(table)?;
+    for entry in read.open_table(table)?.iter()? {
+        let (k, v) = entry?;
+        to.insert(k.value(), v.value())?;
+    }
+    Ok(())
 }
 
 fn load_bucket(buckets: &impl ReadableTable<&'static str, &'static [u8]>, name: &str) -> Result<BucketRecord> {

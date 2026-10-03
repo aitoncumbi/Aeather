@@ -27,12 +27,14 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --bin aether \
  && cp target/release/aether /usr/local/bin/aether \
- && mkdir /data
+ && mkdir /data /backups
 
 # glibc, CA certificates and nothing else; runs as uid 65532.
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /usr/local/bin/aether /usr/local/bin/aether
 COPY --from=build --chown=65532:65532 /data /data
+# Where `aether backup` can write inside the container (mount a volume here).
+COPY --from=build --chown=65532:65532 /backups /backups
 
 # Inside a container both APIs must listen on all interfaces to be published;
 # publish the admin port (9001) only where it should be reachable.

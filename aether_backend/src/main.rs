@@ -47,6 +47,13 @@ enum Command {
         #[command(flatten)]
         client: ClientArgs,
     },
+    /// Copy the running server's data to a new directory on the server host
+    Backup {
+        /// Absolute path on the server: new or empty, outside the data directory
+        dir: std::path::PathBuf,
+        #[command(flatten)]
+        client: ClientArgs,
+    },
     /// Exit successfully if the server is ready (for container health checks)
     Health {
         /// S3 endpoint [default: from s3.listen in the config file]
@@ -65,6 +72,7 @@ async fn main() -> ExitCode {
         Some(Command::Bucket { client, command }) => (cli::Request::Bucket(command), client),
         Some(Command::Status { client }) => (cli::Request::Status, client),
         Some(Command::Scrub { client }) => (cli::Request::Scrub, client),
+        Some(Command::Backup { dir, client }) => (cli::Request::Backup(dir), client),
         Some(Command::Health { url }) => {
             return match cli::health(url.as_deref(), config_path).await {
                 Ok(()) => ExitCode::SUCCESS,

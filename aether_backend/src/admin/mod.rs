@@ -121,6 +121,7 @@ pub fn router(
         .route("/status", get(status))
         .route("/stats", get(stats))
         .route("/scrub", post(start_scrub))
+        .route("/backup", post(backup))
         .route("/session", get(current_session))
         .route("/keys", get(list_keys).post(create_key))
         .route("/keys/{id}", get(get_key).patch(update_key).delete(delete_key))
@@ -489,6 +490,25 @@ async fn start_scrub(State(s): State<AdminState>) -> ApiResult<(StatusCode, Json
         }
     });
     Ok((StatusCode::ACCEPTED, Json(serde_json::json!({ "started": true }))))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupRequest {
+    /// An absolute path on the server, new or empty, outside the data directory.
+    dir: std::path::PathBuf,
+}
+
+/// Backs the node up to a directory on the server and answers when done.
+/// The backup runs to the end even if the client goes away.
+async fn backup(
+    State(s): State<AdminState>,
+    body: Result<Json<BackupRequest>, JsonRejection>,
+) -> ApiResult<Json<crate::engine::BackupReport>> {
+    let Json(req) = body?;
+    let engine = Arc::clone(&s.engine);
+    let report = tokio::spawn(async move { engine.backup(&req.dir).await }).await.map_err(Error::from)??;
+    Ok(Json(report))
 }
 
 async fn list_keys(State(s): State<AdminState>) -> Json<Vec<KeyView>> {

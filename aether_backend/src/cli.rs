@@ -123,6 +123,7 @@ pub enum Request {
     Bucket(BucketCommand),
     Status,
     Scrub,
+    Backup(std::path::PathBuf),
 }
 
 pub async fn run(request: Request, args: &ClientArgs, config_path: Option<&Path>) -> anyhow::Result<()> {
@@ -137,6 +138,23 @@ pub async fn run(request: Request, args: &ClientArgs, config_path: Option<&Path>
         Request::Scrub => {
             client.call(Method::POST, "/api/v1/scrub", None).await?;
             "Scrub started. Follow its progress with `aether status`.\n".to_owned()
+        }
+        Request::Backup(dir) => {
+            // Relative paths are taken from here, as users expect.
+            let dir = if dir.is_absolute() { dir } else { std::env::current_dir()?.join(dir) };
+            let report = client.call(Method::POST, "/api/v1/backup", Some(serde_json::json!({ "dir": dir }))).await?;
+            if args.json {
+                pretty(&report)
+            } else {
+                format!(
+                    "Backed up {} blocks ({}) to {} in {:.1} s.\n\
+                     To restore, start Aether with that directory as storage.data_dir (and the same encryption keys).\n",
+                    text(&report["blocks"]),
+                    bytes(report["bytes"].as_u64().unwrap_or(0)),
+                    text(&report["dir"]),
+                    report["duration_ms"].as_u64().unwrap_or(0) as f64 / 1000.0
+                )
+            }
         }
     };
     print!("{output}");
