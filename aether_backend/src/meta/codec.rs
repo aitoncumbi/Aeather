@@ -50,6 +50,7 @@ mod tests {
             upload_id: Some(Uuid::now_v7()),
             sse: None,
             sse_customer: None,
+            part_checksums: vec![[("crc32".to_string(), "AAAAAA==".to_string())].into()],
         };
         let back: ObjectRecord = decode(&encode(&record)).unwrap();
         assert_eq!(back, record);

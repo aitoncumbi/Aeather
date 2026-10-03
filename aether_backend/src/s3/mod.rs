@@ -399,7 +399,6 @@ impl S3 for AetherS3 {
         if record.delete_marker {
             return Err(delete_marker_error(&record, version.is_some()));
         }
-        Self::check_customer_key(&record, customer.as_ref())?;
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -408,6 +407,8 @@ impl S3 for AetherS3 {
             input.if_unmodified_since.as_ref(),
         )?;
         let Selection { range, content_range, parts_count } = select(&record, input.part_number, input.range.as_ref())?;
+        // After the part number, as Ceph does: a missing part is reported first.
+        Self::check_customer_key(&record, customer.as_ref())?;
         let headers = ObjectHeaders::new(
             &record,
             content_range.is_none() && parts_count.is_none(),
@@ -456,7 +457,6 @@ impl S3 for AetherS3 {
         if record.delete_marker {
             return Err(delete_marker_error(&record, version.is_some()));
         }
-        Self::check_customer_key(&record, customer.as_ref())?;
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -465,6 +465,8 @@ impl S3 for AetherS3 {
             input.if_unmodified_since.as_ref(),
         )?;
         let Selection { range, content_range, parts_count } = select(&record, input.part_number, input.range.as_ref())?;
+        // After the part number, as Ceph does: a missing part is reported first.
+        Self::check_customer_key(&record, customer.as_ref())?;
         let headers = ObjectHeaders::new(
             &record,
             content_range.is_none() && parts_count.is_none(),
@@ -796,8 +798,73 @@ impl S3 for AetherS3 {
         Ok(S3Response::new(PutBucketVersioningOutput::default()))
     }
 
-    /// Tags cannot be set yet (such requests are refused), so every object's
-    /// tag set is empty. Copy tools read it to carry tags over to the copy.
+    /// Size, ETag, checksums and parts of an object, without its data.
+    async fn get_object_attributes(
+        &self,
+        req: S3Request<GetObjectAttributesInput>,
+    ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        let input = req.input;
+        let customer = customer_key!(self, input)?;
+        let version = parse_version(input.version_id.as_deref())?;
+        let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
+        if record.delete_marker {
+            return Err(delete_marker_error(&record, version.is_some()));
+        }
+        Self::check_customer_key(&record, customer.as_ref())?;
+        // One header, `x-amz-object-attributes: ETag,ObjectSize`, arrives as one entry.
+        let wants =
+            |name: &str| input.object_attributes.iter().flat_map(|a| a.as_str().split(',')).any(|a| a.trim() == name);
+        let mut output = GetObjectAttributesOutput {
+            version_id: version_id_of(&record),
+            last_modified: Some(timestamp(record.last_modified)),
+            ..Default::default()
+        };
+        if wants(ObjectAttributes::ETAG) {
+            output.e_tag = Some(etag(&record));
+        }
+        if wants(ObjectAttributes::OBJECT_SIZE) {
+            output.object_size = Some(record.size as i64);
+        }
+        if wants(ObjectAttributes::STORAGE_CLASS) {
+            output.storage_class = Some(StorageClass::from_static(StorageClass::STANDARD));
+        }
+        if wants(ObjectAttributes::CHECKSUM) && !record.attrs.checksums.is_empty() {
+            let mut checksum = checksum_from_map(&record.attrs.checksums);
+            checksum.checksum_type = stored_checksum_type(&record.attrs);
+            output.checksum = Some(checksum);
+        }
+        if wants(ObjectAttributes::OBJECT_PARTS) && !record.part_sizes.is_empty() {
+            let marker = input.part_number_marker.unwrap_or(0).max(0) as usize;
+            let max_parts = input.max_parts.unwrap_or(1000).clamp(1, 1000);
+            let parts: Vec<ObjectPart> = record
+                .part_sizes
+                .iter()
+                .enumerate()
+                .skip(marker)
+                .take(max_parts as usize)
+                .map(|(i, size)| {
+                    let mut part =
+                        ObjectPart { part_number: Some(i as i32 + 1), size: Some(*size as i64), ..Default::default() };
+                    if let Some(checksums) = record.part_checksums.get(i) {
+                        set_checksums!(part, checksum_from_map(checksums));
+                    }
+                    part
+                })
+                .collect();
+            let last = (marker + parts.len()) as i32;
+            output.object_parts = Some(GetObjectAttributesParts {
+                total_parts_count: Some(record.part_sizes.len() as i32),
+                part_number_marker: Some(marker as i32),
+                next_part_number_marker: Some(last),
+                max_parts: Some(max_parts),
+                is_truncated: Some((last as usize) < record.part_sizes.len()),
+                parts: Some(parts),
+            });
+        }
+        Ok(S3Response::new(output))
+    }
+
+    /// Copy tools read the tag set to carry tags over to the copy.
     async fn get_object_tagging(
         &self,
         req: S3Request<GetObjectTaggingInput>,

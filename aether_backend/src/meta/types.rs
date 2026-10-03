@@ -163,6 +163,10 @@ pub struct ObjectRecord {
     /// Encrypted with a key the client sends with every request (SSE-C).
     #[serde(default)]
     pub sse_customer: Option<crate::crypto::SseCustomer>,
+    /// Each part's checksums (algorithm to base64 value), as uploaded, for
+    /// GetObjectAttributes. Empty for single-part objects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub part_checksums: Vec<BTreeMap<String, String>>,
 }
 
 impl ObjectRecord {
@@ -185,6 +189,7 @@ impl ObjectRecord {
             upload_id: None,
             sse: None,
             sse_customer: None,
+            part_checksums: Vec::new(),
         }
     }
 }
