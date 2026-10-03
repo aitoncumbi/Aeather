@@ -88,6 +88,8 @@ anything from a 1 KB document to a 100 GB file.
 - [x] `GetObjectAttributes` (size, ETag, checksums, parts with their checksums), and part-number GETs answered as Ceph does
 
 ## v3: clustering
+Design: [CLUSTERING.md](CLUSTERING.md).
+
 - [ ] Raft-replicated metadata (openraft) using the existing command model
 - [ ] Cluster layout, node join/leave, failure detection
 - [ ] Block replication (3 copies by default) with rendezvous-hash placement
