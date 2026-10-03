@@ -192,7 +192,7 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 | `gc_queue` | due_at (u64 BE) ‖ block_id | – |
 | `uploads` | bucket_id ‖ object key ‖ 0x00 ‖ upload_id | `UploadRecord` |
 | `parts` | upload_id ‖ part number (u32 BE) | `PartRecord` |
-| `access_keys` | access key id | `AccessKeyRecord` (secret, roles, per-bucket permissions) |
+| `access_keys` | access key id | `AccessKeyRecord` (secret, sealed with encryption at rest; roles; per-bucket permissions) |
 | `bucket_usage` | bucket_id | object count and bytes, updated by every write |
 | `system` | name | schema version and other node-level values |
 
@@ -433,7 +433,11 @@ replication (v3) the same pass will repair from a healthy copy.
   `InvalidAccessKeyId`. Permissions are by bucket name and are removed when the
   bucket is deleted, so a new bucket with the same name starts with no grants.
 - Admin API secrets are compared in constant time.
-- SigV4 needs the plaintext secret to verify signatures, so secrets cannot be hashed.
+- SigV4 needs the plaintext secret to verify signatures, so secrets cannot be
+  hashed. With encryption at rest they are stored sealed under the master key
+  (AES-256-GCM, bound to the access key id) and only the in-memory key cache
+  holds them decrypted. At startup, plaintext secrets are sealed and secrets
+  sealed under an earlier master key are re-sealed under the current one.
   In v1 they are protected by file permissions on the data directory. With
   encryption at rest (v2), they are encrypted under the master key.
 - TLS is supported natively (rustls) or can be terminated by a reverse proxy. The

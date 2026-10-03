@@ -10,6 +10,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 
 use super::{Engine, now_millis};
+use crate::crypto::{Keyring, SealedKey};
 use crate::error::{Error, Result};
 use crate::meta::{AccessKeyRecord, BucketGrant, BucketRecord, Command, KeyUpdate, MetaStore, Outcome};
 
@@ -36,12 +37,29 @@ pub(super) struct KeyCache {
 }
 
 impl KeyCache {
-    pub(super) fn load(meta: &MetaStore, cache: &KeyCache) -> Result<()> {
+    /// Loads every key, with sealed secrets decrypted.
+    pub(super) fn load(meta: &MetaStore, cache: &KeyCache, keyring: Option<&Keyring>) -> Result<()> {
         let _guard = cache.reload.lock().expect("key cache lock poisoned");
-        let keys = meta.list_keys()?.into_iter().map(|k| (k.access_key_id.clone(), k)).collect();
+        let mut keys = HashMap::new();
+        for mut key in meta.list_keys()? {
+            if let Some(sealed) = &key.sealed_secret {
+                let ring = keyring.ok_or_else(|| {
+                    Error::Corrupt(format!("access key secrets are sealed with master key {}", sealed.key_id))
+                })?;
+                let secret = ring.unseal(sealed, key.access_key_id.as_bytes())?;
+                key.secret_key =
+                    String::from_utf8(secret).map_err(|_| Error::Corrupt("sealed secret is not UTF-8".into()))?;
+            }
+            keys.insert(key.access_key_id.clone(), key);
+        }
         *cache.keys.write().expect("key cache lock poisoned") = Arc::new(keys);
         Ok(())
     }
+}
+
+/// The secret sealed for storage, bound to the key's id.
+fn seal_secret(ring: &Keyring, key: &AccessKeyRecord) -> Result<SealedKey> {
+    ring.seal(key.secret_key.as_bytes(), key.access_key_id.as_bytes())
 }
 
 impl Engine {
@@ -77,8 +95,14 @@ impl Engine {
             can_create_buckets: new.can_create_buckets,
             disabled: false,
             buckets: new.buckets.into_iter().filter(|(_, grant)| !grant.is_empty()).collect(),
+            sealed_secret: None,
         };
-        self.apply_to_keys(Command::CreateKey { key: key.clone() }).await?;
+        let mut stored = key.clone();
+        if let Some(ring) = &self.config.keyring {
+            stored.sealed_secret = Some(seal_secret(ring, &key)?);
+            stored.secret_key.clear();
+        }
+        self.apply_to_keys(Command::CreateKey { key: stored }).await?;
         Ok(key)
     }
 
@@ -122,6 +146,25 @@ impl Engine {
         }
     }
 
+    /// With encryption at rest, seals secrets still stored in plaintext and
+    /// re-seals those sealed under an earlier master key, so it can be retired
+    /// once no object needs it. Runs at startup.
+    pub(super) async fn seal_key_secrets(&self) -> Result<usize> {
+        let Some(ring) = &self.config.keyring else { return Ok(0) };
+        let mut sealed = Vec::new();
+        for key in self.access_keys() {
+            let current = key.sealed_secret.as_ref().is_some_and(|s| s.key_id == ring.current_id());
+            if !current {
+                sealed.push((key.access_key_id.clone(), seal_secret(ring, &key)?));
+            }
+        }
+        let count = sealed.len();
+        if count > 0 {
+            self.apply_to_keys(Command::SealKeySecrets { sealed }).await?;
+        }
+        Ok(count)
+    }
+
     /// Applies a command that changes keys, then refreshes the cache before
     /// returning, so the change applies to the very next request.
     pub(super) async fn apply_to_keys(&self, command: Command) -> Result<Outcome> {
@@ -133,7 +176,8 @@ impl Engine {
     async fn reload_keys(&self) -> Result<()> {
         let meta = Arc::clone(&self.meta);
         let cache = Arc::clone(&self.keys);
-        tokio::task::spawn_blocking(move || KeyCache::load(&meta, &cache)).await?
+        let keyring = self.config.keyring.clone();
+        tokio::task::spawn_blocking(move || KeyCache::load(&meta, &cache, keyring.as_deref())).await?
     }
 }
 

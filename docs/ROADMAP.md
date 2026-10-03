@@ -78,7 +78,7 @@ anything from a 1 KB document to a 100 GB file.
 - [ ] Bucket versioning: enable/suspend, version listing, delete markers, GET/DELETE by version
 - [x] Encryption at rest: SSE-S3 (master key from config)
 - [ ] SSE-C (customer-provided keys)
-- [ ] Encrypt stored access-key secrets under the master key
+- [x] Encrypt stored access-key secrets under the master key
 - [ ] Lifecycle rules: expire objects, expire noncurrent versions, abort incomplete uploads
 - [x] Object tagging
 

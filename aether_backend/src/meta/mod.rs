@@ -145,6 +145,10 @@ pub enum Command {
     DeleteKey {
         access_key_id: String,
     },
+    /// Stores keys' secrets sealed (encryption at rest), replacing the plaintext.
+    SealKeySecrets {
+        sealed: Vec<(String, crate::crypto::SealedKey)>,
+    },
     /// Sets a key's permissions on a bucket; an empty grant removes them.
     SetGrant {
         access_key_id: String,
@@ -461,6 +465,7 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
             Outcome::Failed(failed)
         }
         Command::CreateKey { key } => {
+            note_sealing_key(txn, key.sealed_secret.as_ref())?;
             let mut keys = txn.open_table(ACCESS_KEYS)?;
             if keys.get(key.access_key_id.as_str())?.is_some() {
                 return Err(Error::AccessKeyExists);
@@ -486,6 +491,17 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
         Command::DeleteKey { access_key_id } => {
             if txn.open_table(ACCESS_KEYS)?.remove(access_key_id.as_str())?.is_none() {
                 return Err(Error::NoSuchAccessKey);
+            }
+            Outcome::Done
+        }
+        Command::SealKeySecrets { sealed } => {
+            let mut keys = txn.open_table(ACCESS_KEYS)?;
+            for (access_key_id, secret) in sealed {
+                note_sealing_key(txn, Some(&secret))?;
+                let mut key = load_key(&keys, &access_key_id)?;
+                key.secret_key.clear();
+                key.sealed_secret = Some(secret);
+                keys.insert(access_key_id.as_str(), codec::encode(&key).as_slice())?;
             }
             Outcome::Done
         }
