@@ -23,6 +23,8 @@ pub fn s3_error(e: Error) -> S3Error {
         Error::NoSuchKey => S3Error::new(S3ErrorCode::NoSuchKey),
         Error::NoSuchVersion => S3Error::new(S3ErrorCode::NoSuchVersion),
         Error::MethodNotAllowed(msg) => S3Error::with_message(S3ErrorCode::MethodNotAllowed, msg),
+        // 400 for a wrong key too, as Ceph and the s3-tests expect.
+        Error::CustomerKey(problem) => S3Error::with_message(S3ErrorCode::InvalidRequest, problem.to_string()),
         Error::PreconditionFailed => S3Error::new(S3ErrorCode::PreconditionFailed),
         Error::InvalidBucketName(name) => {
             S3Error::with_message(S3ErrorCode::InvalidBucketName, format!("invalid bucket name: {name}"))
@@ -550,6 +552,14 @@ pub fn url_encode(s: &str) -> String {
 /// `x-amz-server-side-encryption` for an object encrypted at rest.
 pub fn sse_of(record: &crate::meta::ObjectRecord) -> Option<dto::ServerSideEncryption> {
     record.sse.as_ref().map(|_| dto::ServerSideEncryption::from_static(dto::ServerSideEncryption::AES256))
+}
+
+/// SSE-C response headers: the algorithm and the key's MD5.
+pub fn sse_customer_of(record: &crate::meta::ObjectRecord) -> (Option<String>, Option<String>) {
+    match &record.sse_customer {
+        Some(stored) => (Some("AES256".into()), Some(stored.key_md5.clone())),
+        None => (None, None),
+    }
 }
 
 #[cfg(test)]

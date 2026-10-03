@@ -119,6 +119,9 @@ pub struct S3Config {
     /// here, `photos.s3.example.com/key` addresses bucket `photos`. Requests
     /// to any other host stay path-style. Empty: path-style only.
     pub domains: Vec<String>,
+    /// Accept SSE-C (customer-provided keys) on a plain-HTTP S3 port. Off:
+    /// the key would cross the network in the clear, so S3 requires HTTPS.
+    pub allow_sse_c_over_http: bool,
 }
 
 /// The JSON admin API (keys, permissions, buckets, usage).
@@ -255,6 +258,7 @@ impl Default for S3Config {
             allow_sig_v2: false,
             public_url: None,
             domains: Vec::new(),
+            allow_sse_c_over_http: false,
         }
     }
 }

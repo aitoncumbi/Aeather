@@ -751,6 +751,7 @@ impl From<Error> for ApiError {
             Error::NoSuchKey => (StatusCode::NOT_FOUND, "NoSuchKey"),
             Error::NoSuchVersion => (StatusCode::NOT_FOUND, "NoSuchVersion"),
             Error::MethodNotAllowed(_) => (StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed"),
+            Error::CustomerKey(_) => (StatusCode::BAD_REQUEST, "CustomerKeyRequired"),
             Error::NoSuchUpload => (StatusCode::NOT_FOUND, "NoSuchUpload"),
             Error::InvalidPart(_) => (StatusCode::BAD_REQUEST, "InvalidPart"),
             Error::InvalidPartOrder => (StatusCode::BAD_REQUEST, "InvalidPartOrder"),

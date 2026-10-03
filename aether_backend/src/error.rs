@@ -27,6 +27,10 @@ pub enum Error {
     #[error("{0}")]
     MethodNotAllowed(String),
 
+    /// SSE-C: the request's customer key does not fit the object.
+    #[error("{0}")]
+    CustomerKey(CustomerKeyProblem),
+
     #[error("a precondition did not hold")]
     PreconditionFailed,
 
@@ -92,3 +96,26 @@ macro_rules! from_redb {
 }
 
 from_redb!(redb::DatabaseError, redb::TransactionError, redb::TableError, redb::StorageError, redb::CommitError);
+
+/// How an SSE-C request's key does not fit the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CustomerKeyProblem {
+    /// The object needs its customer key, and none was sent.
+    Missing,
+    /// A different key than the object was written with.
+    Mismatch,
+    /// A key was sent for an object that is not encrypted with one.
+    NotEncrypted,
+}
+
+impl std::fmt::Display for CustomerKeyProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => {
+                "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object."
+            }
+            Self::Mismatch => "The provided customer key does not match the one the object was written with.",
+            Self::NotEncrypted => "The object was not stored with a customer-provided key.",
+        })
+    }
+}

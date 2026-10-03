@@ -72,9 +72,12 @@ pub struct ObjectDetail {
     #[serde(default)]
     pub tags: BTreeMap<String, String>,
     pub checksums: BTreeMap<String, String>,
-    /// Encrypted at rest (SSE-S3).
+    /// Encrypted at rest (SSE-S3 or SSE-C).
     #[serde(default)]
     pub encrypted: bool,
+    /// Encrypted with a key the client sends (SSE-C): the console cannot read it.
+    #[serde(default)]
+    pub customer_key: bool,
     /// Number of parts for objects made by a multipart upload, else 0.
     pub parts: usize,
     /// `inline` (stored in the metadata record) or `blocks`.
@@ -195,7 +198,8 @@ pub async fn head(
         user_metadata: attrs.user_metadata.clone(),
         tags: attrs.tags.clone(),
         checksums: attrs.checksums.clone(),
-        encrypted: record.sse.is_some(),
+        encrypted: record.sse.is_some() || record.sse_customer.is_some(),
+        customer_key: record.sse_customer.is_some(),
         parts: record.part_sizes.len(),
         storage,
         blocks,
@@ -204,12 +208,22 @@ pub async fn head(
 
 /// Always an attachment, and never with the stored `Content-Type`: an
 /// uploaded HTML file must not run as a page of the console's origin.
+fn customer_key_needed() -> ApiError {
+    ApiError::bad_request(
+        "this object is encrypted with a customer-provided key (SSE-C): read it through the S3 API with that key",
+    )
+}
+
 pub async fn download(
     State(s): State<AdminState>,
     Path(bucket): Path<String>,
     Query(KeyParam { key }): Query<KeyParam>,
 ) -> ApiResult<Response> {
     let record = s.engine.get_object(&bucket, &key).await?;
+    // SSE-C objects need the client's key, which the console never has.
+    if record.sse_customer.is_some() {
+        return Err(customer_key_needed());
+    }
     let body = Body::from_stream(s.engine.read_object(&record, 0..record.size));
     let name = key.rsplit('/').next().filter(|n| !n.is_empty()).unwrap_or("download");
     let mut response = body.into_response();
@@ -335,7 +349,9 @@ pub async fn share(
     if !(1..=MAX_EXPIRES_SECS).contains(&req.expires_secs) {
         return Err(ApiError::bad_request(format!("expires_secs must be between 1 and {MAX_EXPIRES_SECS}")));
     }
-    s.engine.get_object(&bucket, &req.key).await?;
+    if s.engine.get_object(&bucket, &req.key).await?.sse_customer.is_some() {
+        return Err(customer_key_needed());
+    }
     let secret = s.auth.secret_of(&caller.access_key_id).ok_or(Error::NoSuchAccessKey)?;
     let signer = Signer { access_key_id: &caller.access_key_id, secret_key: &secret, region: &s.settings.region };
     let endpoint = s.settings.s3_endpoint(&headers);

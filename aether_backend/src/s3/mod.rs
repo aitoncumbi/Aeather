@@ -23,7 +23,8 @@ use sync_wrapper::SyncStream;
 
 use self::convert::*;
 use crate::auth::Authorizer;
-use crate::engine::{Engine, StagedObject, VersionRef, Versioning, VersionsQuery};
+use crate::crypto::CustomerKey;
+use crate::engine::{CustomerKeyProblem, Engine, StagedObject, VersionRef, Versioning, VersionsQuery};
 use crate::error::Error as EngineError;
 use crate::meta::{ListPage, ListQuery, ObjectRecord, UploadRecord};
 
@@ -34,18 +35,86 @@ pub struct AetherS3 {
     engine: Arc<Engine>,
     auth: Arc<Authorizer>,
     region: String,
+    /// Whether SSE-C keys may arrive over plain HTTP (the S3 port without TLS).
+    sse_c_allowed: bool,
 }
 
+/// The three `x-amz-server-side-encryption-customer-*` headers (or their
+/// `copy-source` variants) of a request.
+macro_rules! customer_key {
+    ($s:expr, $input:ident) => {
+        $s.customer_key(
+            $input.sse_customer_algorithm.as_deref(),
+            $input.sse_customer_key.as_deref(),
+            $input.sse_customer_key_md5.as_deref(),
+        )
+    };
+    ($s:expr, $input:ident, copy_source) => {
+        $s.customer_key(
+            $input.copy_source_sse_customer_algorithm.as_deref(),
+            $input.copy_source_sse_customer_key.as_deref(),
+            $input.copy_source_sse_customer_key_md5.as_deref(),
+        )
+    };
+}
+pub(crate) use customer_key;
+
 impl AetherS3 {
-    pub fn new(engine: Arc<Engine>, auth: Arc<Authorizer>, region: String) -> Self {
-        Self { engine, auth, region }
+    /// `sse_c_allowed`: the S3 port uses TLS, or SSE-C over HTTP was allowed.
+    pub fn new(engine: Arc<Engine>, auth: Arc<Authorizer>, region: String, sse_c_allowed: bool) -> Self {
+        Self { engine, auth, region, sse_c_allowed }
+    }
+
+    /// The customer key of an SSE-C request, if it sends one.
+    fn customer_key(
+        &self,
+        algorithm: Option<&str>,
+        key: Option<&str>,
+        md5: Option<&str>,
+    ) -> S3Result<Option<CustomerKey>> {
+        if algorithm.is_none() && key.is_none() && md5.is_none() {
+            return Ok(None);
+        }
+        if algorithm != Some("AES256") {
+            return Err(s3_error!(InvalidEncryptionAlgorithmError, "The encryption algorithm must be AES256"));
+        }
+        let (Some(key), Some(md5)) = (key, md5) else {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Requests specifying Server Side Encryption with Customer provided keys must provide the key and its MD5"
+            ));
+        };
+        if !self.sse_c_allowed {
+            return Err(s3_error!(
+                InvalidRequest,
+                "Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection."
+            ));
+        }
+        CustomerKey::parse(key, md5).map(Some).map_err(s3_error)
+    }
+
+    /// Checks a request's key against an object, as S3 does: an SSE-C object
+    /// needs its key (400 without, 403 with another), others refuse one.
+    fn check_customer_key(record: &ObjectRecord, key: Option<&CustomerKey>) -> S3Result<()> {
+        let problem = match (&record.sse_customer, key) {
+            (Some(stored), Some(key)) if stored.matches(key) => return Ok(()),
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => CustomerKeyProblem::Mismatch,
+            (Some(_), None) => CustomerKeyProblem::Missing,
+            (None, Some(_)) => CustomerKeyProblem::NotEncrypted,
+        };
+        Err(s3_error(EngineError::CustomerKey(problem)))
     }
 
     /// Requests may ask for SSE-S3 (`AES256`), which applies to every new
-    /// object once a master key is configured. SSE-KMS and SSE-C are refused.
+    /// object once a master key is configured; SSE-C comes with its own key
+    /// headers and excludes it. SSE-KMS is refused.
     fn check_sse(&self, requested: Option<&ServerSideEncryption>, customer_key: bool) -> S3Result<()> {
-        if customer_key {
-            return Err(s3_error!(NotImplemented, "SSE-C (customer-provided keys) is not supported yet"));
+        if customer_key && requested.is_some() {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Server Side Encryption with Customer provided keys excludes other SSE"
+            ));
         }
         match requested.map(|s| s.as_str()) {
             None => Ok(()),
@@ -79,6 +148,7 @@ impl AetherS3 {
         body: Option<StreamingBlob>,
         checks: BodyChecks<'_>,
         part_of: Option<&UploadRecord>,
+        customer: Option<&CustomerKey>,
     ) -> S3Result<(StagedObject, BTreeMap<String, String>)> {
         let BodyChecks { mut sent, algorithm, also, content_md5, trailer, trailing_headers } = checks;
         let mut hasher = checksum_hasher(&sent, algorithm, trailer)?;
@@ -88,8 +158,8 @@ impl AetherS3 {
         let body = body.unwrap_or_else(|| StreamingBlob::from(Bytes::new()));
         let stream = body.inspect_ok(|chunk| hasher.update(chunk));
         let staged = match part_of {
-            Some(upload) => self.engine.stage_part(stream, upload).await,
-            None => self.engine.stage(stream).await,
+            Some(upload) => self.engine.stage_part_with(stream, upload, customer).await,
+            None => self.engine.stage_with_customer_key(stream, customer).await,
         };
         let staged = staged.map_err(s3_error)?;
 
@@ -276,7 +346,8 @@ impl S3 for AetherS3 {
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         let S3Request { input, headers, trailing_headers, .. } = req;
 
-        self.check_sse(input.server_side_encryption.as_ref(), input.sse_customer_key.is_some())?;
+        let customer = customer_key!(self, input)?;
+        self.check_sse(input.server_side_encryption.as_ref(), customer.is_some())?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -301,13 +372,15 @@ impl S3 for AetherS3 {
             trailer: headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()),
             trailing_headers,
         };
-        let (staged, checksums) = self.stage_body(body, checks, None).await?;
+        let (staged, checksums) = self.stage_body(body, checks, None, customer.as_ref()).await?;
 
         let mut attrs = object_attrs!(input);
         attrs.checksums = checksums;
         let record = self.engine.commit_put(&bucket, &key, staged, attrs, condition).await.map_err(s3_error)?;
 
         let mut output = PutObjectOutput {
+            sse_customer_algorithm: sse_customer_of(&record).0,
+            sse_customer_key_md5: sse_customer_of(&record).1,
             version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             e_tag: Some(etag(&record)),
@@ -320,12 +393,13 @@ impl S3 for AetherS3 {
 
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let input = req.input;
-        self.check_sse(None, input.sse_customer_key.is_some())?;
+        let customer = customer_key!(self, input)?;
         let version = parse_version(input.version_id.as_deref())?;
         let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
         if record.delete_marker {
             return Err(delete_marker_error(&record, version.is_some()));
         }
+        Self::check_customer_key(&record, customer.as_ref())?;
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -346,8 +420,10 @@ impl S3 for AetherS3 {
             input.response_expires,
         );
 
-        let body = SyncStream::new(self.engine.read_object(&record, range.clone()));
+        let body = SyncStream::new(self.engine.read_object_with(&record, range.clone(), customer.as_ref()));
         let mut output = GetObjectOutput {
+            sse_customer_algorithm: sse_customer_of(&record).0,
+            sse_customer_key_md5: sse_customer_of(&record).1,
             version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             body: Some(StreamingBlob::wrap(body)),
@@ -374,11 +450,13 @@ impl S3 for AetherS3 {
 
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
         let input = req.input;
+        let customer = customer_key!(self, input)?;
         let version = parse_version(input.version_id.as_deref())?;
         let record = self.engine.get_version(&input.bucket, &input.key, version).await.map_err(s3_error)?;
         if record.delete_marker {
             return Err(delete_marker_error(&record, version.is_some()));
         }
+        Self::check_customer_key(&record, customer.as_ref())?;
         check_read_conditions(
             &record,
             input.if_match.as_ref(),
@@ -399,6 +477,8 @@ impl S3 for AetherS3 {
             input.response_expires,
         );
         let mut output = HeadObjectOutput {
+            sse_customer_algorithm: sse_customer_of(&record).0,
+            sse_customer_key_md5: sse_customer_of(&record).1,
             version_id: version_id_of(&record),
             server_side_encryption: sse_of(&record),
             content_length: Some((range.end - range.start) as i64),

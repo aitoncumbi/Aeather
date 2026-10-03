@@ -119,6 +119,7 @@ export type ObjectDetail = ObjectItem & {
   tags: Record<string, string>;
   checksums: Record<string, string>;
   encrypted: boolean;
+  customer_key: boolean;
   parts: number;
   storage: "inline" | "blocks";
   blocks: number;

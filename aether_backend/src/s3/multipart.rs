@@ -15,7 +15,7 @@ use s3s::dto::*;
 use s3s::{S3Request, S3Response, S3Result, s3_error};
 
 use super::convert::*;
-use super::{AetherS3, BodyChecks};
+use super::{AetherS3, BodyChecks, customer_key};
 use crate::engine::Completion;
 use crate::error::Error as EngineError;
 use crate::meta::{ObjectRecord, PartsPage, UploadListQuery, UploadRecord};
@@ -29,7 +29,8 @@ impl AetherS3 {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        self.check_sse(input.server_side_encryption.as_ref(), input.sse_customer_key.is_some())?;
+        let customer = customer_key!(self, input)?;
+        self.check_sse(input.server_side_encryption.as_ref(), customer.is_some())?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -41,8 +42,11 @@ impl AetherS3 {
 
         let (bucket, key) = (input.bucket.clone(), input.key.clone());
         let attrs = object_attrs!(input);
-        let upload =
-            self.engine.create_upload(&bucket, &key, attrs, algorithm, checksum_type).await.map_err(s3_error)?;
+        let upload = self
+            .engine
+            .create_upload_with(&bucket, &key, attrs, algorithm, checksum_type, customer.as_ref())
+            .await
+            .map_err(s3_error)?;
         let output = CreateMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
@@ -53,6 +57,8 @@ impl AetherS3 {
                 .sse
                 .as_ref()
                 .map(|_| ServerSideEncryption::from_static(ServerSideEncryption::AES256)),
+            sse_customer_algorithm: upload.sse_customer.as_ref().map(|_| "AES256".to_owned()),
+            sse_customer_key_md5: upload.sse_customer.as_ref().map(|c| c.key_md5.clone()),
             ..Default::default()
         };
         Ok(S3Response::new(output))
@@ -63,6 +69,7 @@ impl AetherS3 {
         req: S3Request<UploadPartInput>,
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let S3Request { input, headers, trailing_headers, .. } = req;
+        let customer = customer_key!(self, input)?;
         let upload_id = parse_upload_id(&input.upload_id)?;
         let number = part_number(input.part_number)?;
         // Fail before reading the body if the upload does not exist, or if the
@@ -81,11 +88,16 @@ impl AetherS3 {
             trailer: headers.get("x-amz-trailer").and_then(|v| v.to_str().ok()),
             trailing_headers,
         };
-        let (staged, checksums) = self.stage_body(body, checks, Some(&upload)).await?;
+        let (staged, checksums) = self.stage_body(body, checks, Some(&upload), customer.as_ref()).await?;
         let part =
             self.engine.commit_part(&bucket, &key, upload_id, number, staged, checksums).await.map_err(s3_error)?;
 
-        let mut output = UploadPartOutput { e_tag: Some(ETag::Strong(part.etag)), ..Default::default() };
+        let mut output = UploadPartOutput {
+            e_tag: Some(ETag::Strong(part.etag)),
+            sse_customer_algorithm: upload.sse_customer.as_ref().map(|_| "AES256".to_owned()),
+            sse_customer_key_md5: upload.sse_customer.as_ref().map(|c| c.key_md5.clone()),
+            ..Default::default()
+        };
         set_checksums!(output, checksum_from_map(&part.checksums));
         Ok(S3Response::new(output))
     }

@@ -11,6 +11,7 @@ use s3s::{S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 use super::AetherS3;
 use super::convert::*;
+use super::customer_key;
 use crate::error::Error as EngineError;
 use crate::meta::{ObjectAttrs, ObjectRecord, VersionRef};
 
@@ -67,10 +68,9 @@ impl AetherS3 {
             Some(TaggingDirective::REPLACE) => Some(super::tags::from_header(input.tagging.as_deref())?),
             Some(other) => return Err(s3_error!(InvalidArgument, "unknown tagging directive {other}")),
         };
-        self.check_sse(
-            input.server_side_encryption.as_ref(),
-            input.sse_customer_key.is_some() || input.copy_source_sse_customer_key.is_some(),
-        )?;
+        let src_customer = customer_key!(self, input, copy_source)?;
+        let dst_customer = customer_key!(self, input)?;
+        self.check_sse(input.server_side_encryption.as_ref(), dst_customer.is_some())?;
         if input.object_lock_mode.is_some() || input.object_lock_legal_hold_status.is_some() {
             return Err(s3_error!(NotImplemented, "object lock is not supported"));
         }
@@ -82,7 +82,9 @@ impl AetherS3 {
             Some(MetadataDirective::REPLACE) => true,
             Some(other) => return Err(s3_error!(InvalidArgument, "unknown metadata directive {other}")),
         };
-        if !replace && src_bucket == input.bucket && src_key == input.key {
+        // Re-encrypting with another key changes the object, so it may copy onto itself.
+        let reencrypt = src_customer.is_some() || dst_customer.is_some();
+        if !replace && !reencrypt && src_bucket == input.bucket && src_key == input.key {
             return Err(s3_error!(
                 InvalidRequest,
                 "this copy request is illegal because it is trying to copy an object to itself without \
@@ -114,6 +116,24 @@ impl AetherS3 {
                 None => source.attrs.clone(),
             };
             attrs.tags = new_tags.clone().unwrap_or_else(|| source.attrs.tags.clone());
+            Self::check_customer_key(&source, src_customer.as_ref())?;
+            if reencrypt {
+                // Blocks cannot be shared across keys: read, then write anew.
+                let data = self.engine.read_object_with(&source, 0..source.size, src_customer.as_ref());
+                let staged =
+                    self.engine.stage_with_customer_key(data, dst_customer.as_ref()).await.map_err(|e| match e {
+                        EngineError::Body(source) => {
+                            s3_error!(InternalError, "reading the copy source failed: {source}")
+                        }
+                        other => s3_error(other),
+                    })?;
+                let record = self
+                    .engine
+                    .commit_put(&dst_bucket, &dst_key, staged, attrs, condition.clone())
+                    .await
+                    .map_err(s3_error)?;
+                break record;
+            }
             let copied = self
                 .engine
                 .copy_object(&src_bucket, &src_key, &source, &dst_bucket, &dst_key, attrs, condition.clone())
@@ -139,6 +159,8 @@ impl AetherS3 {
             server_side_encryption: sse,
             version_id: version_id_of(&record),
             copy_source_version_id: copied_version,
+            sse_customer_algorithm: sse_customer_of(&record).0,
+            sse_customer_key_md5: sse_customer_of(&record).1,
             ..Default::default()
         }))
     }
@@ -148,7 +170,8 @@ impl AetherS3 {
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let input = req.input;
-        self.check_sse(None, input.sse_customer_key.is_some() || input.copy_source_sse_customer_key.is_some())?;
+        let src_customer = customer_key!(self, input, copy_source)?;
+        let dst_customer = customer_key!(self, input)?;
         let upload_id = parse_upload_id(&input.upload_id)?;
         let number = part_number(input.part_number)?;
         let upload = self.engine.get_upload(&input.bucket, &input.key, upload_id).await.map_err(s3_error)?;
@@ -162,6 +185,7 @@ impl AetherS3 {
             if_unmodified_since: input.copy_source_if_unmodified_since,
         };
         conditions.check(&source)?;
+        Self::check_customer_key(&source, src_customer.as_ref())?;
         let range = copy_source_range(input.copy_source_range.as_deref(), source.size)?;
         if range.end - range.start > MAX_PART_SIZE {
             return Err(s3_error!(EntityTooLarge, "a part can be at most 5 GiB"));
@@ -171,9 +195,12 @@ impl AetherS3 {
         if let Some(alg) = upload.checksum_algorithm.as_deref() {
             enable_checksum(&mut hasher, alg)?;
         }
-        let data = self.engine.read_object(&source, range).inspect_ok(|chunk| hasher.update(chunk));
+        let data = self
+            .engine
+            .read_object_with(&source, range, src_customer.as_ref())
+            .inspect_ok(|chunk| hasher.update(chunk));
         // Failing to read our own source is a server error, not a client one.
-        let staged = self.engine.stage_part(data, &upload).await.map_err(|e| match e {
+        let staged = self.engine.stage_part_with(data, &upload, dst_customer.as_ref()).await.map_err(|e| match e {
             EngineError::Body(source) => s3_error!(InternalError, "reading the copy source failed: {source}"),
             other => s3_error(other),
         })?;

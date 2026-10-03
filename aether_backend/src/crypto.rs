@@ -129,6 +129,74 @@ impl Keyring {
     }
 }
 
+/// A key the client sends with each request (SSE-C), already checked
+/// against its MD5. Never stored: objects keep a salted HMAC of it instead.
+pub struct CustomerKey {
+    key: DataKey,
+    raw: [u8; KEY_LEN],
+    /// Base64 MD5 of the key, as S3 echoes it in responses.
+    pub md5: String,
+}
+
+impl std::fmt::Debug for CustomerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CustomerKey(md5 {})", self.md5)
+    }
+}
+
+impl CustomerKey {
+    /// `key` and `md5` are the base64 values of the request headers.
+    pub fn parse(key: &str, md5: &str) -> Result<Self> {
+        use base64::Engine as _;
+        use md5::Digest as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let raw: [u8; KEY_LEN] =
+            b64.decode(key).ok().and_then(|k| k.try_into().ok()).ok_or_else(|| {
+                invalid("The secret key was invalid for the specified algorithm: it must be 256 bits")
+            })?;
+        let actual = b64.encode(md5::Md5::digest(raw));
+        if actual != md5 {
+            return Err(invalid("The calculated MD5 hash of the key did not match the hash that was provided."));
+        }
+        Ok(Self { key: DataKey(raw), raw, md5: actual })
+    }
+
+    pub fn data_key(&self) -> &DataKey {
+        &self.key
+    }
+
+    /// What an object stores to recognise this key later.
+    pub fn check(&self) -> Result<SseCustomer> {
+        let mut salt = [0u8; 16];
+        SystemRandom::new().fill(&mut salt).map_err(|_| Error::Io(std::io::Error::other("no randomness")))?;
+        Ok(SseCustomer {
+            key_md5: self.md5.clone(),
+            salt: salt.to_vec(),
+            hmac: ring::hmac::sign(&self.hmac_key(), &salt).as_ref().to_vec(),
+        })
+    }
+
+    fn hmac_key(&self) -> ring::hmac::Key {
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.raw)
+    }
+}
+
+/// Stored with an SSE-C object: enough to recognise its key, not to recover it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SseCustomer {
+    pub key_md5: String,
+    #[serde(with = "serde_bytes")]
+    salt: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    hmac: Vec<u8>,
+}
+
+impl SseCustomer {
+    pub fn matches(&self, key: &CustomerKey) -> bool {
+        ring::hmac::verify(&key.hmac_key(), &self.salt, &self.hmac).is_ok()
+    }
+}
+
 /// An object's data key, in memory only.
 #[derive(Clone)]
 pub struct DataKey([u8; KEY_LEN]);
@@ -192,6 +260,22 @@ impl FrameCipher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn customer_keys_are_checked_and_recognised() {
+        use base64::Engine as _;
+        use md5::Digest as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let (key, md5) = (b64.encode([5u8; 32]), b64.encode(md5::Md5::digest([5u8; 32])));
+        let customer = CustomerKey::parse(&key, &md5).unwrap();
+        assert!(CustomerKey::parse(&key, &b64.encode([0u8; 16])).is_err(), "MD5 mismatch");
+        assert!(CustomerKey::parse(&b64.encode([5u8; 16]), &md5).is_err(), "not 256 bits");
+        let stored = customer.check().unwrap();
+        assert!(stored.matches(&customer));
+        let other = CustomerKey::parse(&b64.encode([6u8; 32]), &b64.encode(md5::Md5::digest([6u8; 32]))).unwrap();
+        assert!(!stored.matches(&other));
+        assert!(!format!("{customer:?}").contains(&key), "debug output hides the key");
+    }
 
     fn keyring() -> Keyring {
         Keyring::new(&[7u8; 32], &[vec![9u8; 32]]).unwrap()
