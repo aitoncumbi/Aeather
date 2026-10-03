@@ -323,3 +323,90 @@ async fn the_console_is_served_with_strict_headers() {
     let post = s.http.post(s.url("/keys/")).send().await.unwrap();
     assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+#[tokio::test]
+async fn browsing_and_restoring_versions() {
+    let s = start().await;
+    let cookie = s.login(ROOT_KEY, ROOT_SECRET).await.unwrap();
+    s.console(&cookie, Method::POST, "/api/v1/buckets").json(&json!({"name": "docs"})).send().await.unwrap();
+    let versioning = s
+        .console(&cookie, Method::PUT, "/api/v1/buckets/docs/versioning")
+        .json(&json!({"status": "Enabled"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(versioning.status(), StatusCode::OK);
+    for body in ["first", "second"] {
+        let put = s.console(&cookie, Method::PUT, "/api/v1/buckets/docs/object").query(&[("key", "a/doc")]).body(body);
+        assert_eq!(put.send().await.unwrap().status(), StatusCode::CREATED);
+    }
+    // A longer key with the same prefix must not show up among a/doc's versions.
+    let put = s.console(&cookie, Method::PUT, "/api/v1/buckets/docs/object").query(&[("key", "a/doc2")]).body("x");
+    put.send().await.unwrap();
+
+    let versions =
+        || s.json(s.console(&cookie, Method::GET, "/api/v1/buckets/docs/object/versions").query(&[("key", "a/doc")]));
+    let (status, list) = versions().await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let list = list["versions"].as_array().unwrap().clone();
+    assert_eq!(list.len(), 2);
+    assert_eq!((list[0]["latest"].as_bool(), list[1]["latest"].as_bool()), (Some(true), Some(false)));
+    let first = list[1]["version_id"].as_str().unwrap().to_owned();
+
+    let download = |version: &str| {
+        s.console(&cookie, Method::GET, "/api/v1/buckets/docs/object/download")
+            .query(&[("key", "a/doc"), ("version", version)])
+            .send()
+    };
+    assert_eq!(download(&first).await.unwrap().text().await.unwrap(), "first");
+
+    // Deleting adds a delete marker: the key leaves the listing and appears among deleted keys.
+    let delete = s.console(&cookie, Method::DELETE, "/api/v1/buckets/docs/object").query(&[("key", "a/doc")]);
+    assert_eq!(delete.send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    let list = |deleted: &str| {
+        s.json(s.console(&cookie, Method::GET, "/api/v1/buckets/docs/objects").query(&[
+            ("prefix", "a/"),
+            ("delimiter", "/"),
+            ("deleted", deleted),
+        ]))
+    };
+    let (_, live) = list("false").await;
+    assert_eq!(live["objects"].as_array().unwrap().len(), 1, "{live}");
+    let (_, deleted) = list("true").await;
+    assert_eq!(
+        deleted["objects"],
+        json!([{"key": "a/doc", "size": 0, "etag": "", "last_modified": deleted["objects"][0]["last_modified"], "deleted": true}])
+    );
+    let (_, list_after) = versions().await;
+    assert_eq!(list_after["versions"][0]["delete_marker"], true);
+
+    // Restoring copies the old version over the key.
+    let restore = s
+        .console(&cookie, Method::POST, "/api/v1/buckets/docs/object/restore")
+        .json(&json!({"key": "a/doc", "version": first}));
+    let (status, item) = s.json(restore).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    let current = s
+        .console(&cookie, Method::GET, "/api/v1/buckets/docs/object/download")
+        .query(&[("key", "a/doc")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(current.text().await.unwrap(), "first");
+    let (_, list) = versions().await;
+    assert_eq!(list["versions"].as_array().unwrap().len(), 4, "restore keeps the history");
+
+    // Deleting a version removes it for good.
+    let delete = s
+        .console(&cookie, Method::DELETE, "/api/v1/buckets/docs/object")
+        .query(&[("key", "a/doc"), ("version", first.as_str())]);
+    assert_eq!(delete.send().await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(download(&first).await.unwrap().status(), StatusCode::NOT_FOUND);
+    let (status, _) = s
+        .json(
+            s.console(&cookie, Method::GET, "/api/v1/buckets/docs/object")
+                .query(&[("key", "a/doc"), ("version", "bad")]),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

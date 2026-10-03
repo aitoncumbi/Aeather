@@ -95,7 +95,9 @@ Clients then need to trust it: `aws --ca-bundle tls.crt`, `aether --ca-cert tls.
 Open the admin port in a browser, `http://127.0.0.1:9001/`, and sign in with the
 root key or another admin key. The console shows usage and request activity,
 creates and deletes buckets, browses, uploads, downloads and deletes objects,
-makes presigned share links, and manages keys and their bucket permissions.
+makes presigned share links, and manages keys and their bucket permissions. In
+versioned buckets it lists each object's versions to download, restore or
+delete, and **Deleted objects** brings back deleted ones.
 
 The admin port listens on loopback by default. From another machine, use an SSH
 tunnel (`ssh -L 9001:127.0.0.1:9001 server`, then open `http://127.0.0.1:9001/`)

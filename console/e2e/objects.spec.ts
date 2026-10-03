@@ -80,3 +80,42 @@ test("refuses uploads past the bucket's quota before sending them", async ({ pag
   const bucket = await (await page.request.get(`/api/v1/buckets/${name}`, { headers })).json();
   expect(bucket.objects).toBe(0);
 });
+
+test("browses, restores and deletes versions in a versioned bucket", async ({ page }) => {
+  const name = unique("versioned");
+  const headers = { "x-aether-console": "1" };
+  expect((await page.request.post("/api/v1/buckets", { headers, data: { name } })).status()).toBe(201);
+  expect((await page.request.put(`/api/v1/buckets/${name}/versioning`, { headers, data: { status: "Enabled" } })).status()).toBe(200);
+  for (const body of ["first draft", "second draft"]) {
+    const put = await page.request.put(`/api/v1/buckets/${name}/object?key=notes.txt`, { headers, data: body });
+    expect(put.status()).toBe(201);
+  }
+
+  await page.goto(`/objects/?bucket=${name}&key=notes.txt`);
+  const versions = page.getByRole("list", { name: "Versions" }).getByRole("listitem");
+  await expect(versions).toHaveCount(2);
+  await expect(versions.first()).toContainText("current");
+
+  // Deleting keeps the versions: the key moves to "Deleted objects".
+  await page.getByRole("button", { name: "Delete object" }).click();
+  await expect(page.getByRole("dialog")).toContainText("Its versions are kept");
+  await page.getByRole("dialog").getByRole("button", { name: "Delete object" }).click();
+  await expect(page.getByRole("button", { name: /^notes\.txt/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Deleted objects" }).click();
+  await page.getByRole("button", { name: /^notes\.txt/ }).click();
+  await expect(page.getByText("Deleted. Restore a version to bring it back.")).toBeVisible();
+  await expect(versions).toHaveCount(3);
+  await expect(versions.first()).toContainText("delete marker");
+
+  // Restore the first draft: it becomes the current version again.
+  await versions.last().getByRole("button", { name: "Restore" }).click();
+  await expect(page.getByText(/^Restored the version/)).toBeVisible();
+  await expect(versions).toHaveCount(4);
+  const current = await page.request.get(`/api/v1/buckets/${name}/object/download?key=notes.txt`, { headers });
+  expect(await current.text()).toBe("first draft");
+
+  // Delete the oldest version for good.
+  await versions.last().getByRole("button", { name: /permanently$/ }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Delete version" }).click();
+  await expect(versions).toHaveCount(3);
+});

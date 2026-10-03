@@ -4,7 +4,17 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type DragEvent } from "react";
 
-import { api, ApiError, paths, type Bucket, type ObjectDetail, type ObjectList, type ShareLink } from "@/lib/api";
+import {
+  api,
+  ApiError,
+  paths,
+  type Bucket,
+  type ObjectDetail,
+  type ObjectList,
+  type ShareLink,
+  type VersionItem,
+  type VersionList,
+} from "@/lib/api";
 import { baseName, bytes, count, dateTime, extension, kind } from "@/lib/format";
 import { copyText, useApi } from "@/lib/hooks";
 import { upload, type Progress, type UploadHandle } from "@/lib/upload";
@@ -120,7 +130,11 @@ function Browser({
     setFilter("");
   }
 
-  const first = useApi<ObjectList>(paths.objects(bucket, prefix + query));
+  // Versioned buckets keep deleted keys' versions; this lists those keys instead.
+  const versioned = (buckets.find((b) => b.name === bucket)?.versioning ?? "Unversioned") !== "Unversioned";
+  const [showDeleted, setShowDeleted] = useState(false);
+  const deleted = versioned && showDeleted;
+  const first = useApi<ObjectList>(paths.objects(bucket, prefix + query, null, deleted));
   const [more, setMore] = useState<ObjectList[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreFor, setMoreFor] = useState(first.data);
@@ -137,7 +151,7 @@ function Browser({
     if (!continuation) return;
     setLoadingMore(true);
     try {
-      const page = await api<ObjectList>(paths.objects(bucket, prefix + query, continuation));
+      const page = await api<ObjectList>(paths.objects(bucket, prefix + query, continuation, deleted));
       setMore((m) => [...m, page]);
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), "error");
@@ -230,6 +244,21 @@ function Browser({
             <span className="sr-only">Filter this prefix by the start of the name</span>
             <input type="search" placeholder="Filter: name starts with" value={filter} onChange={(e) => setFilter(e.target.value)} />
           </label>
+          {versioned && (
+            <button
+              type="button"
+              className="btn btn-toggle"
+              aria-pressed={deleted}
+              title="List the keys deleted in this prefix whose older versions can be restored"
+              onClick={() => {
+                setShowDeleted(!deleted);
+                go({ key: null });
+              }}
+            >
+              <TrashIcon size={15} />
+              Deleted objects
+            </button>
+          )}
           <button type="button" className="btn btn-primary" style={{ fontWeight: 500 }} onClick={() => fileInput.current?.click()}>
             <UploadIcon />
             Upload
@@ -302,10 +331,10 @@ function Browser({
                 </span>
               </span>
               <span className="right tnum muted" style={{ fontSize: 13 }}>
-                {bytes(o.size)}
+                {o.deleted ? "—" : bytes(o.size)}
               </span>
               <span className="muted hide-sm" style={{ fontSize: 13 }}>
-                {kind(o.key)}
+                {o.deleted ? "Deleted" : kind(o.key)}
               </span>
               <span className="muted hide-sm ellipsis" style={{ fontSize: 13 }}>
                 {dateTime(o.last_modified)}
@@ -317,8 +346,16 @@ function Browser({
               <div className="empty-icon">
                 <UploadIcon size={18} />
               </div>
-              <span style={{ fontWeight: 500, color: "var(--text)" }}>{query ? "Nothing starts with that" : "Nothing here yet"}</span>
-              <span style={{ fontSize: 13 }}>{query ? "Filters match the start of names in this prefix." : "Upload files, or drop them on this list."}</span>
+              <span style={{ fontWeight: 500, color: "var(--text)" }}>
+                {query ? "Nothing starts with that" : deleted ? "No deleted objects here" : "Nothing here yet"}
+              </span>
+              <span style={{ fontSize: 13 }}>
+                {query
+                  ? "Filters match the start of names in this prefix."
+                  : deleted
+                    ? "Objects deleted in this prefix appear here while older versions of them remain."
+                    : "Upload files, or drop them on this list."}
+              </span>
             </div>
           )}
           {continuation && (
@@ -342,8 +379,13 @@ function Browser({
             key={selected}
             bucket={bucket}
             objectKey={selected}
+            versioned={versioned}
             onDeleted={() => {
               go({ key: null });
+              reload();
+              onChanged();
+            }}
+            onChanged={() => {
               reload();
               onChanged();
             }}
@@ -471,14 +513,46 @@ const EXPIRIES = [
   { label: "7 days (maximum)", secs: 604800 },
 ];
 
-function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectKey: string; onDeleted: () => void }) {
+function ObjectPanel({
+  bucket,
+  objectKey,
+  versioned,
+  onDeleted,
+  onChanged,
+}: {
+  bucket: string;
+  objectKey: string;
+  versioned: boolean;
+  onDeleted: () => void;
+  onChanged: () => void;
+}) {
   const detail = useApi<ObjectDetail>(paths.object(bucket, objectKey));
+  const versions = useApi<VersionList>(versioned ? paths.versions(bucket, objectKey) : null);
+  const changed = () => {
+    detail.reload();
+    versions.reload();
+    onChanged();
+  };
   const notify = useToast();
   const [deleting, setDeleting] = useState(false);
   const [expires, setExpires] = useState(3600);
   const [link, setLink] = useState<ShareLink | null>(null);
   const [sharing, setSharing] = useState(false);
 
+  if (detail.error?.status === 404 && versioned) {
+    // Deleted in a versioned bucket: only its older versions are left.
+    return (
+      <section aria-label="Object details" className="panel" style={{ gap: 18 }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+          <h2 className="mono wrap-any" style={{ fontSize: 16, fontWeight: 600 }}>
+            {baseName(objectKey)}
+          </h2>
+          <span className="panel-sub">Deleted. Restore a version to bring it back.</span>
+        </div>
+        <Versions bucket={bucket} objectKey={objectKey} list={versions} onChanged={changed} />
+      </section>
+    );
+  }
   if (detail.error) {
     return (
       <section aria-label="Object details" className="panel">
@@ -627,6 +701,8 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
         </div>
       )}
 
+      {versioned && <Versions bucket={bucket} objectKey={objectKey} list={versions} onChanged={changed} />}
+
       <div className="card">
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <LinkIcon size={15} color="var(--muted)" />
@@ -668,7 +744,17 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
         title={`Delete ${name}?`}
         body={
           <>
-            <span className="mono wrap-any">{uri}</span> is removed for every client. Its data is freed after the GC grace period. This cannot be undone.
+            {versioned ? (
+              <>
+                <span className="mono wrap-any">{uri}</span> disappears for every client. Its versions are kept and it can be restored
+                from <b>Deleted objects</b>.
+              </>
+            ) : (
+              <>
+                <span className="mono wrap-any">{uri}</span> is removed for every client. Its data is freed after the GC grace period. This
+                cannot be undone.
+              </>
+            )}
           </>
         }
         confirm="Delete object"
@@ -680,5 +766,105 @@ function ObjectPanel({ bucket, objectKey, onDeleted }: { bucket: string; objectK
         }}
       />
     </section>
+  );
+}
+
+/** Every version of a key, newest first: download, restore or delete each. */
+function Versions({
+  bucket,
+  objectKey,
+  list,
+  onChanged,
+}: {
+  bucket: string;
+  objectKey: string;
+  list: { data?: VersionList; error?: Error | null; reload: () => void };
+  onChanged: () => void;
+}) {
+  const notify = useToast();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<VersionItem | null>(null);
+  const name = baseName(objectKey);
+
+  async function restore(v: VersionItem) {
+    setBusy(v.version_id);
+    try {
+      await api(paths.restore(bucket), { method: "POST", json: { key: objectKey, version: v.version_id } });
+      notify(`Restored the version from ${dateTime(v.last_modified)}.`);
+      onChanged();
+    } catch (e) {
+      notify(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <span className="section-label">Versions{list.data ? ` · ${count(list.data.versions.length)}${list.data.truncated ? "+" : ""}` : ""}</span>
+      {list.error && <ErrorPanel message={list.error.message} onRetry={list.reload} />}
+      <div style={{ display: "flex", flexDirection: "column" }} role="list" aria-label="Versions">
+        {list.data?.versions.map((v) => (
+          <div key={v.version_id} role="listitem" className="meta-row" style={{ alignItems: "center", gap: 8, padding: "6px 0" }}>
+            <span style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+              <span title={v.last_modified}>
+                {dateTime(v.last_modified)}
+                {v.latest && <span className="subtle"> · current</span>}
+              </span>
+              <span className="caption mono ellipsis" title={v.version_id}>
+                {v.delete_marker ? "delete marker" : `${bytes(v.size)} · ${v.version_id}`}
+              </span>
+            </span>
+            <span style={{ display: "flex", gap: 4, marginLeft: "auto", flexShrink: 0 }}>
+              {!v.delete_marker && (
+                <a
+                  className="btn btn-quiet btn-icon btn-sm"
+                  href={paths.download(bucket, objectKey, v.version_id)}
+                  download={name}
+                  aria-label={`Download the version from ${dateTime(v.last_modified)}`}
+                >
+                  <DownloadIcon size={14} />
+                </a>
+              )}
+              {!v.latest && !v.delete_marker && (
+                <button type="button" className="btn btn-sm" disabled={busy !== null} onClick={() => restore(v)}>
+                  {busy === v.version_id ? "Restoring…" : "Restore"}
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btn-quiet btn-icon btn-sm"
+                aria-label={`Delete the version from ${dateTime(v.last_modified)} permanently`}
+                onClick={() => setDeleting(v)}
+              >
+                <TrashIcon size={14} />
+              </button>
+            </span>
+          </div>
+        ))}
+      </div>
+      <ConfirmDialog
+        open={deleting !== null}
+        title={deleting?.delete_marker ? "Remove this delete marker?" : "Delete this version permanently?"}
+        body={
+          deleting?.delete_marker ? (
+            <>Removing the delete marker brings back the newest version before it.</>
+          ) : (
+            <>
+              The version of <span className="mono wrap-any">{name}</span> from {deleting ? dateTime(deleting.last_modified) : ""} is removed
+              for good. {deleting?.latest ? "The next older version becomes current. " : ""}This cannot be undone.
+            </>
+          )
+        }
+        confirm={deleting?.delete_marker ? "Remove marker" : "Delete version"}
+        onClose={() => setDeleting(null)}
+        onConfirm={async () => {
+          if (!deleting) return;
+          await api(paths.object(bucket, objectKey, deleting.version_id), { method: "DELETE" });
+          notify(deleting.delete_marker ? "Removed the delete marker." : "Deleted the version.");
+          onChanged();
+        }}
+      />
+    </div>
   );
 }
