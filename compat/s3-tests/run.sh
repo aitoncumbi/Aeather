@@ -19,6 +19,8 @@ PYTHON=${PYTHON:-python3}
 PASSING=compat/s3-tests/passing.txt
 MODE=${1:-passing}
 
+# s3-tests count a lifecycle "day" as 10 seconds (Ceph's rgw_lc_debug_interval).
+export AETHER_LIFECYCLE__DAY_SECS=10 AETHER_LIFECYCLE__INTERVAL_SECS=1
 start_server "${PORT:-9300}"
 key() {
     "$AETHER" key create "$1" --create-buckets --import-id "$2" --import-secret "$3" > /dev/null

@@ -1350,3 +1350,98 @@ async fn versioning_keeps_versions_and_delete_markers() {
     assert_eq!(usage, BucketUsage::default());
     engine.delete_bucket("bkt").await.unwrap();
 }
+
+#[tokio::test]
+async fn lifecycle_rules_expire_objects_versions_markers_and_uploads() {
+    use crate::meta::{LifecycleFilter, LifecycleRule};
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        block_size: 1000,
+        inline_threshold: 100,
+        gc_grace: Duration::ZERO,
+        min_part_size: 1000,
+        lifecycle_day: Duration::from_secs(1),
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(config).await.unwrap();
+    let day = 1000;
+    let rule = |prefix: &str| LifecycleRule {
+        enabled: true,
+        filter: LifecycleFilter { prefix: prefix.into(), ..LifecycleFilter::default() },
+        ..LifecycleRule::default()
+    };
+
+    // Unversioned: expiry removes objects; tag and size filters narrow it down.
+    engine.create_bucket("plain").await.unwrap();
+    let tagged = ObjectAttrs { tags: [("temp".to_string(), "yes".to_string())].into(), ..ObjectAttrs::default() };
+    engine.put_object("plain", "tmp/a", body(b"aaaa", 4), tagged, WriteCondition::None).await.unwrap();
+    put(&engine, "plain", "tmp/b", b"bbbb").await;
+    put(&engine, "plain", "tmp/big", &pattern(5000)).await;
+    put(&engine, "plain", "keep", b"kept").await;
+    let mut tags_only = rule("tmp/");
+    tags_only.filter.tags = [("temp".to_string(), "yes".to_string())].into();
+    tags_only.expiration_days = Some(1);
+    let mut big_only = rule("tmp/");
+    big_only.filter.size_greater_than = Some(1000);
+    big_only.expiration_days = Some(1);
+    let mut disabled = rule("");
+    disabled.enabled = false;
+    disabled.expiration_days = Some(1);
+    engine.set_bucket_lifecycle("plain", vec![tags_only, big_only, disabled]).await.unwrap();
+
+    let now = now_millis();
+    assert_eq!(engine.apply_lifecycle(now).await.unwrap(), LifecycleReport::default(), "nothing is old enough yet");
+    let report = engine.apply_lifecycle(now + 2 * day).await.unwrap();
+    assert_eq!(report.expired_objects, 2);
+    let left: Vec<_> =
+        engine.list_objects("plain", ListQuery { max_keys: 10, ..ListQuery::default() }).await.unwrap().objects;
+    assert_eq!(left.iter().map(|o| o.key.as_str()).collect::<Vec<_>>(), ["keep", "tmp/b"]);
+
+    // Versioned: current objects get delete markers, old versions go, the newest is kept.
+    engine.create_bucket("ver").await.unwrap();
+    engine.set_bucket_versioning("ver", Versioning::Enabled).await.unwrap();
+    for i in 0..4 {
+        put(&engine, "ver", "doc", format!("v{i}").as_bytes()).await;
+    }
+    put(&engine, "ver", "logs/x", b"log").await;
+    let upload = engine.create_upload("ver", "half", ObjectAttrs::default(), None, None).await.unwrap();
+    let mut logs = rule("logs/");
+    logs.expiration_days = Some(1);
+    logs.noncurrent_days = Some(1);
+    let mut history = rule("doc");
+    history.noncurrent_days = Some(1);
+    history.newer_noncurrent_versions = Some(1);
+    let mut markers = rule("");
+    markers.expired_object_delete_marker = true;
+    let mut uploads = rule("");
+    uploads.abort_upload_days = Some(1);
+    engine.set_bucket_lifecycle("ver", vec![logs, history, markers, uploads]).await.unwrap();
+
+    let report = engine.apply_lifecycle(now_millis() + 2 * day).await.unwrap();
+    assert_eq!(report.expired_objects, 1, "logs/x gets a delete marker");
+    assert_eq!(report.expired_versions, 2, "doc keeps its current and newest noncurrent version");
+    assert_eq!(report.aborted_uploads, 1);
+    assert!(matches!(engine.get_upload("ver", "half", upload.upload_id).await, Err(Error::NoSuchUpload)));
+    let versions_of = |key: &'static str| {
+        let engine = &engine;
+        async move { listing(engine, "ver").await.into_iter().filter(|e| e.0 == key).count() }
+    };
+    assert_eq!(versions_of("doc").await, 2);
+    assert_eq!(versions_of("logs/x").await, 2, "the marker and the old version");
+
+    // Later: the old log version expires, then its marker is left alone and removed.
+    let report = engine.apply_lifecycle(now_millis() + 4 * day).await.unwrap();
+    assert_eq!(report.expired_versions, 1);
+    assert_eq!(versions_of("logs/x").await, 1);
+    let report = engine.apply_lifecycle(now_millis() + 4 * day).await.unwrap();
+    assert_eq!(report.expired_markers, 1);
+    assert_eq!(versions_of("logs/x").await, 0);
+
+    // Expiry by date.
+    let mut dated = rule("");
+    dated.expiration_date = Some(now_millis() + day);
+    engine.set_bucket_lifecycle("plain", vec![dated]).await.unwrap();
+    assert_eq!(engine.apply_lifecycle(now_millis()).await.unwrap().expired_objects, 0);
+    assert_eq!(engine.apply_lifecycle(now_millis() + 2 * day).await.unwrap().expired_objects, 2);
+}

@@ -8,6 +8,7 @@ pub(crate) mod convert;
 mod copy;
 pub mod cors;
 pub mod host;
+mod lifecycle;
 mod multipart;
 mod tags;
 
@@ -755,6 +756,39 @@ impl S3 for AetherS3 {
     }
 
     /// No bucket has tags; S3 answers NoSuchTagSet for an untagged bucket.
+    async fn put_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<PutBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        let input = req.input;
+        let config = input
+            .lifecycle_configuration
+            .ok_or_else(|| s3_error!(MalformedXML, "a lifecycle configuration is required"))?;
+        let rules = lifecycle::rules_from_s3(config)?;
+        self.engine.set_bucket_lifecycle(&input.bucket, rules).await.map_err(s3_error)?;
+        Ok(S3Response::new(PutBucketLifecycleConfigurationOutput::default()))
+    }
+
+    async fn get_bucket_lifecycle_configuration(
+        &self,
+        req: S3Request<GetBucketLifecycleConfigurationInput>,
+    ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
+        let bucket = self.engine.get_bucket(&req.input.bucket).await.map_err(s3_error)?;
+        if bucket.lifecycle.is_empty() {
+            return Err(s3_error!(NoSuchLifecycleConfiguration));
+        }
+        let rules = Some(lifecycle::rules_to_s3(bucket.lifecycle));
+        Ok(S3Response::new(GetBucketLifecycleConfigurationOutput { rules, ..Default::default() }))
+    }
+
+    async fn delete_bucket_lifecycle(
+        &self,
+        req: S3Request<DeleteBucketLifecycleInput>,
+    ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
+        self.engine.set_bucket_lifecycle(&req.input.bucket, Vec::new()).await.map_err(s3_error)?;
+        Ok(S3Response::new(DeleteBucketLifecycleOutput::default()))
+    }
+
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let input = req.input;
         let rules = cors::rules_from_s3(input.cors_configuration)?;

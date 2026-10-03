@@ -22,6 +22,63 @@ pub struct BucketRecord {
     pub quota: Quota,
     #[serde(default)]
     pub versioning: Versioning,
+    /// Lifecycle rules (S3's PutBucketLifecycleConfiguration). Empty: none.
+    #[serde(default)]
+    pub lifecycle: Vec<LifecycleRule>,
+}
+
+/// One lifecycle rule: which objects it covers and what happens to them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRule {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub enabled: bool,
+    #[serde(default)]
+    pub filter: LifecycleFilter,
+    /// Set with the deprecated top-level `<Prefix>` instead of `<Filter>`;
+    /// returned the same way.
+    #[serde(default)]
+    pub legacy_prefix: bool,
+    /// Expire current objects this many days after they were written...
+    #[serde(default)]
+    pub expiration_days: Option<u32>,
+    /// ...or once this time has passed.
+    #[serde(default)]
+    pub expiration_date: Option<Millis>,
+    /// Remove a delete marker once no other version of its key is left.
+    #[serde(default)]
+    pub expired_object_delete_marker: bool,
+    /// Remove noncurrent versions this many days after they became noncurrent...
+    #[serde(default)]
+    pub noncurrent_days: Option<u32>,
+    /// ...but keep this many of the newest noncurrent versions.
+    #[serde(default)]
+    pub newer_noncurrent_versions: Option<u32>,
+    /// Abort multipart uploads this many days after they started.
+    #[serde(default)]
+    pub abort_upload_days: Option<u32>,
+}
+
+/// Which objects a lifecycle rule covers: every condition must hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleFilter {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default)]
+    pub size_greater_than: Option<u64>,
+    #[serde(default)]
+    pub size_less_than: Option<u64>,
+}
+
+impl LifecycleFilter {
+    pub fn matches(&self, key: &str, record: &ObjectRecord) -> bool {
+        key.starts_with(&self.prefix)
+            && self.tags.iter().all(|(k, v)| record.attrs.tags.get(k) == Some(v))
+            && self.size_greater_than.is_none_or(|min| record.size > min)
+            && self.size_less_than.is_none_or(|max| record.size < max)
+    }
 }
 
 /// Limits on a bucket's usage. `None` is no limit.

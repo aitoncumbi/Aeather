@@ -174,6 +174,11 @@ pub enum Command {
         version: Option<VersionRef>,
         tags: BTreeMap<String, String>,
     },
+    /// Replaces a bucket's lifecycle rules; no rules removes the configuration.
+    SetBucketLifecycle {
+        bucket: String,
+        rules: Vec<LifecycleRule>,
+    },
     /// Enables or suspends versioning.
     SetBucketVersioning {
         bucket: String,
@@ -310,6 +315,7 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
                 cors: Vec::new(),
                 quota: Quota::default(),
                 versioning: Versioning::default(),
+                lifecycle: Vec::new(),
             };
             buckets.insert(record.name.as_str(), codec::encode(&record).as_slice())?;
             usage::adjust(txn, &record, None, None)?;
@@ -558,6 +564,13 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
                 }
             }
             Outcome::Done
+        }
+        Command::SetBucketLifecycle { bucket, rules } => {
+            let mut buckets = txn.open_table(BUCKETS)?;
+            let mut record = load_bucket(&buckets, &bucket)?;
+            record.lifecycle = rules;
+            buckets.insert(bucket.as_str(), codec::encode(&record).as_slice())?;
+            Outcome::Bucket(record)
         }
         Command::SetBucketVersioning { bucket, versioning } => {
             let mut buckets = txn.open_table(BUCKETS)?;

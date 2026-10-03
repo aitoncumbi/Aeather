@@ -179,7 +179,16 @@ impl Metrics {
             ("sent_bytes", "Object data sent to clients", &stats.bytes_sent),
             ("gc_deleted_blocks", "Block files deleted by garbage collection", &stats.gc_blocks_deleted),
             ("orphan_removed_blocks", "Unreferenced block files removed after crashes", &stats.orphans_removed),
-            ("aborted_uploads", "Abandoned multipart uploads aborted", &stats.uploads_aborted),
+            (
+                "aborted_uploads",
+                "Abandoned multipart uploads aborted (expiry and lifecycle rules)",
+                &stats.uploads_aborted,
+            ),
+            (
+                "lifecycle_expired",
+                "Objects, versions and delete markers removed by lifecycle rules",
+                &stats.lifecycle_expired,
+            ),
             ("scrub_checked_blocks", "Blocks verified by the scrubber", &stats.scrub_blocks_checked),
             ("scrub_checked_bytes", "Bytes verified by the scrubber", &stats.scrub_bytes_checked),
             ("scrub_corrupt_blocks", "Damaged or missing blocks found by the scrubber", &stats.scrub_corrupt_blocks),
