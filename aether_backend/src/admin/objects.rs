@@ -24,7 +24,7 @@ use uuid::Uuid;
 use super::presign::{self, MAX_EXPIRES_SECS, Signer};
 use super::{AdminState, ApiError, ApiResult, Caller, rfc3339};
 use crate::error::{BoxError, Error};
-use crate::meta::{ListQuery, ObjectAttrs, ObjectData, ObjectRecord, WriteCondition};
+use crate::meta::{ListQuery, ObjectAttrs, ObjectData, ObjectRecord, VersionRef, VersionsQuery, WriteCondition};
 
 #[derive(Debug, Deserialize)]
 pub struct ListParams {
@@ -36,6 +36,9 @@ pub struct ListParams {
     /// From a previous page's `continuation`.
     continuation: Option<String>,
     max_keys: Option<usize>,
+    /// List the keys whose current version is a delete marker instead.
+    #[serde(default)]
+    deleted: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -54,11 +57,38 @@ pub struct ObjectItem {
     pub size: u64,
     pub etag: String,
     pub last_modified: String,
+    /// Deleted in a versioned bucket: older versions can be restored.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VersionItem {
+    /// `null` for versions written while versioning was off.
+    pub version_id: String,
+    pub size: u64,
+    pub etag: String,
+    pub last_modified: String,
+    pub latest: bool,
+    pub delete_marker: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VersionList {
+    pub versions: Vec<VersionItem>,
+    /// More than [`MAX_VERSIONS`] versions: only the newest are listed.
+    pub truncated: bool,
+}
+
+/// The most versions of one key the console lists.
+const MAX_VERSIONS: usize = 1000;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ObjectDetail {
     pub key: String,
+    /// `null` for versions written while versioning was off.
+    #[serde(default)]
+    pub version_id: String,
     pub size: u64,
     pub etag: String,
     pub last_modified: String,
@@ -88,6 +118,29 @@ pub struct ObjectDetail {
 #[derive(Debug, Deserialize)]
 pub struct KeyParam {
     key: String,
+}
+
+/// A key, and optionally one of its versions (the current one without).
+#[derive(Debug, Deserialize)]
+pub struct VersionParam {
+    key: String,
+    version: Option<String>,
+}
+
+impl VersionParam {
+    fn version(&self) -> ApiResult<Option<VersionRef>> {
+        match self.version.as_deref().filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) => VersionRef::parse(v).map(Some).ok_or_else(|| ApiError::bad_request("invalid version id")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreRequest {
+    key: String,
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,7 +195,22 @@ pub struct ShareLink {
 }
 
 fn item(key: String, record: &ObjectRecord) -> ObjectItem {
-    ObjectItem { key, size: record.size, etag: record.etag.clone(), last_modified: rfc3339(record.last_modified) }
+    ObjectItem {
+        key,
+        size: record.size,
+        etag: record.etag.clone(),
+        last_modified: rfc3339(record.last_modified),
+        deleted: false,
+    }
+}
+
+/// The version asked for, refusing delete markers (they have no data).
+async fn readable(s: &AdminState, bucket: &str, param: &VersionParam) -> ApiResult<ObjectRecord> {
+    let record = s.engine.get_version(bucket, &param.key, param.version()?).await?;
+    if record.delete_marker {
+        return Err(Error::NoSuchKey.into());
+    }
+    Ok(record)
 }
 
 pub async fn list(
@@ -150,6 +218,9 @@ pub async fn list(
     Path(bucket): Path<String>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<ObjectList>> {
+    if params.deleted {
+        return list_deleted(&s, &bucket, params).await.map(Json);
+    }
     let start = match &params.continuation {
         Some(token) => Some(URL_SAFE_NO_PAD.decode(token).map_err(|_| ApiError::bad_request("invalid continuation"))?),
         None => None,
@@ -166,19 +237,121 @@ pub async fn list(
         objects: page
             .objects
             .into_iter()
-            .map(|o| ObjectItem { key: o.key, size: o.size, etag: o.etag, last_modified: rfc3339(o.last_modified) })
+            .map(|o| ObjectItem {
+                key: o.key,
+                size: o.size,
+                etag: o.etag,
+                last_modified: rfc3339(o.last_modified),
+                deleted: false,
+            })
             .collect(),
         prefixes: page.common_prefixes,
         continuation: page.next_start.map(|start| URL_SAFE_NO_PAD.encode(start)),
     }))
 }
 
-pub async fn head(
+/// Keys whose current version is a delete marker, one level of `prefix`.
+/// The continuation is the version listing's resume point, `key\0version`.
+async fn list_deleted(s: &AdminState, bucket: &str, params: ListParams) -> ApiResult<ObjectList> {
+    let (key_marker, version_marker) = match &params.continuation {
+        Some(token) => {
+            let bad = || ApiError::bad_request("invalid continuation");
+            let raw = String::from_utf8(URL_SAFE_NO_PAD.decode(token).map_err(|_| bad())?).map_err(|_| bad())?;
+            let (key, version) = raw.split_once('\0').ok_or_else(bad)?;
+            let version = if version.is_empty() { None } else { Some(VersionRef::parse(version).ok_or_else(bad)?) };
+            (Some(key.to_owned()), version)
+        }
+        None => (None, None),
+    };
+    let query = VersionsQuery {
+        prefix: params.prefix.clone(),
+        delimiter: Some(params.delimiter).filter(|d| !d.is_empty()),
+        key_marker,
+        version_marker,
+        max_keys: params.max_keys.unwrap_or(crate::engine::MAX_LIST_KEYS).max(1),
+    };
+    let page = s.engine.list_versions(bucket, query).await?;
+    let objects = page
+        .versions
+        .into_iter()
+        .filter(|v| v.is_latest && v.record.delete_marker)
+        .map(|v| ObjectItem { deleted: true, ..item(v.key, &v.record) })
+        .collect();
+    let continuation = page.next.map(|(key, version)| {
+        let version = version.map(|v| v.to_string()).unwrap_or_default();
+        URL_SAFE_NO_PAD.encode(format!("{key}\0{version}"))
+    });
+    Ok(ObjectList { prefix: params.prefix, objects, prefixes: page.common_prefixes, continuation })
+}
+
+/// Every version of one key, newest first (up to [`MAX_VERSIONS`]).
+pub async fn versions(
     State(s): State<AdminState>,
     Path(bucket): Path<String>,
     Query(KeyParam { key }): Query<KeyParam>,
+) -> ApiResult<Json<VersionList>> {
+    let mut versions = Vec::new();
+    let mut query = VersionsQuery { prefix: key.clone(), max_keys: MAX_VERSIONS + 1, ..Default::default() };
+    // The key's own versions come first: longer keys with it as a prefix sort after.
+    'pages: loop {
+        let page = s.engine.list_versions(&bucket, query).await?;
+        for v in page.versions {
+            if v.key != key || versions.len() > MAX_VERSIONS {
+                break 'pages;
+            }
+            versions.push(VersionItem {
+                version_id: v.record.version().to_string(),
+                size: v.record.size,
+                etag: v.record.etag.clone(),
+                last_modified: rfc3339(v.record.last_modified),
+                latest: v.is_latest,
+                delete_marker: v.record.delete_marker,
+            });
+        }
+        match page.next {
+            Some((next_key, version)) if next_key == key => {
+                query = VersionsQuery {
+                    prefix: key.clone(),
+                    key_marker: Some(next_key),
+                    version_marker: version,
+                    max_keys: MAX_VERSIONS + 1,
+                    ..Default::default()
+                };
+            }
+            _ => break,
+        }
+    }
+    if versions.is_empty() {
+        return Err(Error::NoSuchKey.into());
+    }
+    let truncated = versions.len() > MAX_VERSIONS;
+    versions.truncate(MAX_VERSIONS);
+    Ok(Json(VersionList { versions, truncated }))
+}
+
+/// Makes an older version current again, by copying it over the key (as
+/// S3 clients restore versions). The data is shared, not rewritten.
+pub async fn restore(
+    State(s): State<AdminState>,
+    Path(bucket): Path<String>,
+    body: Result<Json<RestoreRequest>, JsonRejection>,
+) -> ApiResult<Json<ObjectItem>> {
+    let Json(req) = body?;
+    let param = VersionParam { key: req.key, version: Some(req.version) };
+    let source = readable(&s, &bucket, &param).await?;
+    let key = param.key;
+    let record =
+        s.engine.copy_object(&bucket, &key, &source, &bucket, &key, source.attrs.clone(), WriteCondition::None).await?;
+    Ok(Json(item(key, &record)))
+}
+
+pub async fn head(
+    State(s): State<AdminState>,
+    Path(bucket): Path<String>,
+    Query(param): Query<VersionParam>,
 ) -> ApiResult<Json<ObjectDetail>> {
-    let record = s.engine.get_object(&bucket, &key).await?;
+    let record = readable(&s, &bucket, &param).await?;
+    let key = param.key;
     let attrs = &record.attrs;
     let (storage, blocks) = match &record.data {
         ObjectData::Inline(_) => ("inline", 0),
@@ -186,6 +359,7 @@ pub async fn head(
     };
     Ok(Json(ObjectDetail {
         key,
+        version_id: record.version().to_string(),
         size: record.size,
         etag: record.etag.clone(),
         last_modified: rfc3339(record.last_modified),
@@ -217,9 +391,10 @@ fn customer_key_needed() -> ApiError {
 pub async fn download(
     State(s): State<AdminState>,
     Path(bucket): Path<String>,
-    Query(KeyParam { key }): Query<KeyParam>,
+    Query(param): Query<VersionParam>,
 ) -> ApiResult<Response> {
-    let record = s.engine.get_object(&bucket, &key).await?;
+    let record = readable(&s, &bucket, &param).await?;
+    let key = param.key;
     // SSE-C objects need the client's key, which the console never has.
     if record.sse_customer.is_some() {
         return Err(customer_key_needed());
@@ -258,9 +433,11 @@ fn attachment(name: &str) -> HeaderValue {
 pub async fn delete(
     State(s): State<AdminState>,
     Path(bucket): Path<String>,
-    Query(KeyParam { key }): Query<KeyParam>,
+    Query(param): Query<VersionParam>,
 ) -> ApiResult<StatusCode> {
-    s.engine.delete_object(&bucket, &key).await?;
+    // With a version, that version is removed for good.
+    let version = param.version()?;
+    s.engine.delete_object_if(&bucket, &param.key, version, Default::default()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

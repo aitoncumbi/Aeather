@@ -99,7 +99,19 @@ export type Session = {
 
 export type Health = { status: "ready" | "unavailable"; version: string; tls: boolean };
 
-export type ObjectItem = { key: string; size: number; etag: string; last_modified: string };
+/** `deleted`: the current version is a delete marker (versioned buckets). */
+export type ObjectItem = { key: string; size: number; etag: string; last_modified: string; deleted?: boolean };
+
+export type VersionItem = {
+  version_id: string;
+  size: number;
+  etag: string;
+  last_modified: string;
+  latest: boolean;
+  delete_marker: boolean;
+};
+
+export type VersionList = { versions: VersionItem[]; truncated: boolean };
 
 export type ObjectList = {
   prefix: string;
@@ -109,6 +121,7 @@ export type ObjectList = {
 };
 
 export type ObjectDetail = ObjectItem & {
+  version_id: string;
   content_type: string | null;
   content_encoding: string | null;
   content_disposition: string | null;
@@ -219,11 +232,16 @@ const enc = encodeURIComponent;
 
 export const paths = {
   bucket: (name: string) => `/buckets/${enc(name)}`,
-  objects: (bucket: string, prefix: string, continuation?: string | null, maxKeys = 200) =>
+  objects: (bucket: string, prefix: string, continuation?: string | null, deleted = false, maxKeys = 200) =>
     `/buckets/${enc(bucket)}/objects?prefix=${enc(prefix)}&delimiter=%2F&max_keys=${maxKeys}` +
-    (continuation ? `&continuation=${enc(continuation)}` : ""),
-  object: (bucket: string, key: string) => `/buckets/${enc(bucket)}/object?key=${enc(key)}`,
-  download: (bucket: string, key: string) => `/api/v1/buckets/${enc(bucket)}/object/download?key=${enc(key)}`,
+    (continuation ? `&continuation=${enc(continuation)}` : "") +
+    (deleted ? "&deleted=true" : ""),
+  object: (bucket: string, key: string, version?: string) =>
+    `/buckets/${enc(bucket)}/object?key=${enc(key)}` + (version ? `&version=${enc(version)}` : ""),
+  download: (bucket: string, key: string, version?: string) =>
+    `/api/v1/buckets/${enc(bucket)}/object/download?key=${enc(key)}` + (version ? `&version=${enc(version)}` : ""),
+  versions: (bucket: string, key: string) => `/buckets/${enc(bucket)}/object/versions?key=${enc(key)}`,
+  restore: (bucket: string) => `/buckets/${enc(bucket)}/object/restore`,
   share: (bucket: string) => `/buckets/${enc(bucket)}/object/share`,
   uploads: (bucket: string) => `/buckets/${enc(bucket)}/uploads`,
   upload: (bucket: string, id: string, key: string) => `/buckets/${enc(bucket)}/uploads/${enc(id)}?key=${enc(key)}`,

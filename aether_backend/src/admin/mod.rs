@@ -26,7 +26,9 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-pub use self::objects::{ObjectDetail, ObjectItem, ObjectList, PartView, ShareLink, UploadView};
+pub use self::objects::{
+    ObjectDetail, ObjectItem, ObjectList, PartView, ShareLink, UploadView, VersionItem, VersionList,
+};
 use self::session::Sessions;
 use crate::auth::{Authorizer, Identity};
 use crate::config::Config;
@@ -130,6 +132,8 @@ pub fn router(
         .route("/buckets/{name}/objects", get(objects::list))
         .route("/buckets/{name}/object", get(objects::head).put(objects::put).delete(objects::delete))
         .route("/buckets/{name}/object/download", get(objects::download))
+        .route("/buckets/{name}/object/versions", get(objects::versions))
+        .route("/buckets/{name}/object/restore", post(objects::restore))
         .route("/buckets/{name}/object/share", post(objects::share))
         .route("/buckets/{name}/uploads", post(objects::create_upload))
         .route("/buckets/{name}/uploads/{upload_id}", delete(objects::abort_upload))

@@ -125,9 +125,11 @@ neither has a private backdoor.
 | `GET, DELETE /api/v1/buckets/{name}` | Usage, quota, CORS rules and the keys with access; delete an empty bucket |
 | `PUT /api/v1/buckets/{name}/versioning` | Enable or suspend versioning: `{"status": "Enabled" \| "Suspended"}` |
 | `PUT /api/v1/buckets/{name}/quota` | Set the quota: `{"max_bytes": n \| null, "max_objects": n \| null}` |
-| `GET /api/v1/buckets/{name}/objects` | List objects: `prefix`, `delimiter`, `continuation`, `max_keys` |
-| `GET, PUT, DELETE /api/v1/buckets/{name}/object?key=` | Object details (storage, parts, checksums, metadata); upload; delete |
-| `GET /api/v1/buckets/{name}/object/download?key=` | The object's data, as an attachment |
+| `GET /api/v1/buckets/{name}/objects` | List objects: `prefix`, `delimiter`, `continuation`, `max_keys`; `deleted=true` lists keys whose current version is a delete marker instead |
+| `GET, PUT, DELETE /api/v1/buckets/{name}/object?key=[&version=]` | Object details (storage, parts, checksums, metadata); upload; delete (with `version`, that version for good) |
+| `GET /api/v1/buckets/{name}/object/download?key=[&version=]` | The object's data, as an attachment |
+| `GET /api/v1/buckets/{name}/object/versions?key=` | Every version and delete marker of a key, newest first (up to 1000) |
+| `POST /api/v1/buckets/{name}/object/restore` | Make a version current again: `{"key": …, "version": …}`. It is copied over the key, sharing its data |
 | `POST /api/v1/buckets/{name}/object/share` | A presigned S3 GET URL, signed with the caller's key |
 | `POST /api/v1/buckets/{name}/uploads`, `PUT …/uploads/{id}/parts/{n}`, `POST …/uploads/{id}/complete`, `DELETE …/uploads/{id}` | Multipart uploads |
 | `GET /api/v1/session`, `POST /api/v1/login`, `POST /api/v1/logout` | Console sessions |
@@ -166,6 +168,10 @@ explaining how to build it; `admin.console = false` turns it off.
   rules on buckets, and signs nothing in the browser. Files up to 32 MiB are
   one `PUT`; larger ones are multipart uploads, three parts at a time, aborted
   if they fail or are cancelled.
+- **Versions.** In a versioned bucket, an object's panel lists its versions,
+  to download, restore (copy over the key, as S3 clients do) or delete for
+  good; **Deleted objects** lists the keys hidden by a delete marker, so they
+  can be restored.
 - **Share links** are ordinary presigned S3 GET URLs (SigV4, up to 7 days),
   signed with the caller's key. They point at `s3.public_url` when set, or else
   at the host the console was opened on, with the S3 port.
