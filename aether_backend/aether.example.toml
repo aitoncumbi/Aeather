@@ -92,6 +92,12 @@ bytes_per_sec = 67108864 # 64 MiB/s
 # encrypted stay readable.
 # previous_keys = []
 
+[lifecycle]
+# Apply buckets' lifecycle rules this often, in seconds. 0 disables.
+interval_secs = 3600
+# Seconds in a lifecycle "day". Only change it to test rules quickly.
+day_secs = 86400
+
 [log]
 # Filter directive; RUST_LOG overrides it. The S3 protocol library's own
 # per-request error logs stay off unless named, e.g. "info,s3s=debug".

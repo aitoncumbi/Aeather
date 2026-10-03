@@ -78,6 +78,10 @@ pub struct EngineConfig {
     pub scrub_rate: u64,
     /// Master keys for encryption at rest. Set: every new object is encrypted.
     pub keyring: Option<Arc<Keyring>>,
+    /// How often lifecycle rules are applied. Zero disables the job.
+    pub lifecycle_interval: Duration,
+    /// The length of a lifecycle "day" (shorter only for testing).
+    pub lifecycle_day: Duration,
 }
 
 impl Default for EngineConfig {
@@ -96,6 +100,8 @@ impl Default for EngineConfig {
             scrub_interval: Duration::from_secs(7 * 24 * 60 * 60),
             scrub_rate: 64 * 1024 * 1024,
             keyring: None,
+            lifecycle_interval: Duration::from_secs(60 * 60),
+            lifecycle_day: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -123,6 +129,8 @@ pub struct EngineStats {
     pub scrub_blocks_checked: AtomicU64,
     pub scrub_bytes_checked: AtomicU64,
     pub scrub_corrupt_blocks: AtomicU64,
+    /// Objects, versions and delete markers removed by lifecycle rules.
+    pub lifecycle_expired: AtomicU64,
     /// Metadata write transactions committed; each carries one or more writes.
     pub meta_commits: AtomicU64,
     pub meta_writes: AtomicU64,
@@ -517,6 +525,12 @@ impl Engine {
             Outcome::DeletedMany(results) => Ok(results),
             other => unreachable!("DeleteObjects returned {other:?}"),
         }
+    }
+
+    /// Replaces the bucket's lifecycle rules; an empty list removes them.
+    pub async fn set_bucket_lifecycle(&self, name: &str, rules: Vec<crate::meta::LifecycleRule>) -> Result<()> {
+        self.apply(Command::SetBucketLifecycle { bucket: name.to_owned(), rules }).await?;
+        Ok(())
     }
 
     /// Enables or suspends versioning (it cannot be turned off once enabled).
@@ -940,6 +954,9 @@ impl Engine {
         if !self.config.scrub_interval.is_zero() {
             handles.push(tokio::spawn(scrub::run_periodically(Arc::clone(self))));
         }
+        if !self.config.lifecycle_interval.is_zero() {
+            handles.push(tokio::spawn(lifecycle::run_periodically(Arc::clone(self), self.config.lifecycle_interval)));
+        }
         BackgroundTasks { handles }
     }
 
@@ -1258,8 +1275,11 @@ pub fn validate_part_number(part_number: u32) -> Result<()> {
 }
 
 mod keys;
+mod lifecycle;
 mod scrub;
 mod writer;
+
+pub use self::lifecycle::LifecycleReport;
 
 pub use self::scrub::{CorruptBlock, ScrubReport};
 

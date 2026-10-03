@@ -29,6 +29,19 @@ export type Bucket = {
   noncurrent_bytes: number;
   keys?: BucketKey[];
   cors?: CorsRule[];
+  lifecycle?: LifecycleRule[];
+};
+
+export type LifecycleRule = {
+  id: string | null;
+  enabled: boolean;
+  filter: { prefix: string; tags: Record<string, string> };
+  expiration_days: number | null;
+  expiration_date: number | null;
+  expired_object_delete_marker: boolean;
+  noncurrent_days: number | null;
+  newer_noncurrent_versions: number | null;
+  abort_upload_days: number | null;
 };
 
 /** `null` is no limit. */

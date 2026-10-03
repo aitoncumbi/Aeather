@@ -26,6 +26,24 @@ pub struct Config {
     pub scrub: ScrubConfig,
     pub log: LogConfig,
     pub encryption: EncryptionConfig,
+    pub lifecycle: LifecycleConfig,
+}
+
+/// The background job that applies buckets' lifecycle rules.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LifecycleConfig {
+    /// Apply lifecycle rules this often. 0 disables the job.
+    pub interval_secs: u64,
+    /// Seconds in a lifecycle "day". Only for testing rules quickly.
+    pub day_secs: u64,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        let engine = EngineConfig::default();
+        Self { interval_secs: engine.lifecycle_interval.as_secs(), day_secs: engine.lifecycle_day.as_secs() }
+    }
 }
 
 /// Encryption at rest. With a master key, every new object is encrypted.
@@ -330,6 +348,9 @@ impl Config {
             return invalid("gc.interval_secs and gc.sweep_interval_secs must be positive");
         }
         self.encryption.keyring()?;
+        if self.lifecycle.day_secs == 0 {
+            return invalid("lifecycle.day_secs must be positive");
+        }
         if self.tls.cert_file.is_some() != self.tls.key_file.is_some() {
             return invalid("tls.cert_file and tls.key_file must be set together");
         }
@@ -368,6 +389,8 @@ impl Config {
             scrub_interval: Duration::from_secs(self.scrub.interval_secs),
             scrub_rate: self.scrub.bytes_per_sec,
             keyring: self.encryption.keyring().expect("validated when loaded").map(std::sync::Arc::new),
+            lifecycle_interval: Duration::from_secs(self.lifecycle.interval_secs),
+            lifecycle_day: Duration::from_secs(self.lifecycle.day_secs),
             ..EngineConfig::default()
         }
     }

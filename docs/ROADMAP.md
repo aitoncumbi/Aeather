@@ -79,7 +79,7 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Encryption at rest: SSE-S3 (master key from config)
 - [ ] SSE-C (customer-provided keys)
 - [x] Encrypt stored access-key secrets under the master key
-- [ ] Lifecycle rules: expire objects, expire noncurrent versions, abort incomplete uploads
+- [x] Lifecycle rules: expire objects, expire noncurrent versions, abort incomplete uploads
 - [x] Object tagging
 
 ## v3: clustering

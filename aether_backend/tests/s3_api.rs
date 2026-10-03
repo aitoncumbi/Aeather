@@ -1572,3 +1572,69 @@ async fn versioning_through_the_s3_api() {
     let err = c.delete_bucket().bucket("bkt").send().await.unwrap_err();
     assert_eq!(code(err), "BucketNotEmpty");
 }
+
+#[tokio::test]
+async fn lifecycle_configuration_through_the_s3_api() {
+    use aws_sdk_s3::types::{
+        AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration,
+        LifecycleRule, LifecycleRuleFilter, NoncurrentVersionExpiration, StorageClass, Transition,
+    };
+    let s = start().await;
+    let c = &s.client;
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let err = c.get_bucket_lifecycle_configuration().bucket("bkt").send().await.unwrap_err();
+    assert_eq!(code(err), "NoSuchLifecycleConfiguration");
+
+    let logs = LifecycleRule::builder()
+        .id("logs")
+        .status(ExpirationStatus::Enabled)
+        .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+        .expiration(LifecycleExpiration::builder().days(30).build())
+        .noncurrent_version_expiration(
+            NoncurrentVersionExpiration::builder().noncurrent_days(7).newer_noncurrent_versions(2).build(),
+        )
+        .build()
+        .unwrap();
+    let uploads = LifecycleRule::builder()
+        .status(ExpirationStatus::Enabled)
+        .filter(LifecycleRuleFilter::builder().prefix("").build())
+        .abort_incomplete_multipart_upload(AbortIncompleteMultipartUpload::builder().days_after_initiation(3).build())
+        .build()
+        .unwrap();
+    let config = BucketLifecycleConfiguration::builder().rules(logs).rules(uploads).build().unwrap();
+    c.put_bucket_lifecycle_configuration().bucket("bkt").lifecycle_configuration(config).send().await.unwrap();
+
+    let got = c.get_bucket_lifecycle_configuration().bucket("bkt").send().await.unwrap();
+    let rules = got.rules();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].id(), Some("logs"));
+    assert_eq!(rules[0].expiration().unwrap().days(), Some(30));
+    assert_eq!(rules[0].noncurrent_version_expiration().unwrap().newer_noncurrent_versions(), Some(2));
+    assert!(rules[1].id().is_some_and(|id| !id.is_empty()), "rules without an ID get one");
+    assert_eq!(rules[1].abort_incomplete_multipart_upload().unwrap().days_after_initiation(), Some(3));
+
+    // Invalid rules are refused; transitions need storage classes Aether does not have.
+    let bad = |rule: LifecycleRule| {
+        c.put_bucket_lifecycle_configuration()
+            .bucket("bkt")
+            .lifecycle_configuration(BucketLifecycleConfiguration::builder().rules(rule).build().unwrap())
+            .send()
+    };
+    let base = || {
+        LifecycleRule::builder()
+            .status(ExpirationStatus::Enabled)
+            .filter(LifecycleRuleFilter::builder().prefix("").build())
+    };
+    let err =
+        bad(base().expiration(LifecycleExpiration::builder().days(0).build()).build().unwrap()).await.unwrap_err();
+    assert_eq!(code(err), "InvalidArgument");
+    let err = bad(base().build().unwrap()).await.unwrap_err();
+    assert_eq!(code(err), "InvalidRequest");
+    let transition = Transition::builder().days(30).storage_class(StorageClass::Glacier.as_str().into()).build();
+    let err = bad(base().transitions(transition).build().unwrap()).await.unwrap_err();
+    assert_eq!(code(err), "NotImplemented");
+
+    c.delete_bucket_lifecycle().bucket("bkt").send().await.unwrap();
+    let err = c.get_bucket_lifecycle_configuration().bucket("bkt").send().await.unwrap_err();
+    assert_eq!(code(err), "NoSuchLifecycleConfiguration");
+}

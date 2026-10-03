@@ -224,6 +224,9 @@ pub struct BucketView {
     /// CORS rules (set through the S3 API); only in single-bucket responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cors: Option<Vec<CorsRule>>,
+    /// Lifecycle rules (set through the S3 API); only in single-bucket responses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Vec<crate::meta::LifecycleRule>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -325,6 +328,7 @@ fn bucket_view(bucket: BucketRecord, usage: BucketUsage, keys: &[AccessKeyRecord
         noncurrent_bytes: usage.noncurrent_bytes,
         keys: None,
         cors: None,
+        lifecycle: None,
     }
 }
 
@@ -571,6 +575,7 @@ async fn create_bucket(
 async fn get_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> ApiResult<Json<BucketView>> {
     let (bucket, usage) = s.engine.bucket_usage(&name).await?;
     let cors = bucket.cors.clone();
+    let lifecycle = bucket.lifecycle.clone();
     let all_keys = s.engine.access_keys();
     let keys = all_keys
         .iter()
@@ -580,7 +585,8 @@ async fn get_bucket(State(s): State<AdminState>, Path(name): Path<String>) -> Ap
             Some(BucketKeyView { access_key_id: key.access_key_id.clone(), name: key.name.clone(), grant })
         })
         .collect();
-    Ok(Json(BucketView { keys: Some(keys), cors: Some(cors), ..bucket_view(bucket, usage, &all_keys) }))
+    let view = bucket_view(bucket, usage, &all_keys);
+    Ok(Json(BucketView { keys: Some(keys), cors: Some(cors), lifecycle: Some(lifecycle), ..view }))
 }
 
 /// `{"max_bytes": n | null, "max_objects": n | null}`; null is no limit.

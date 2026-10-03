@@ -393,6 +393,7 @@ are read from the engine at scrape time.
 | `aether_gc_deleted_blocks_total`, `aether_orphan_removed_blocks_total`, `aether_aborted_uploads_total` | |
 | `aether_scrub_checked_blocks_total`, `aether_scrub_checked_bytes_total`, `aether_scrub_corrupt_blocks_total`, `aether_scrub_last_finished_timestamp_seconds` | |
 | `aether_metadata_commits_total`, `aether_metadata_writes_total` (writes ÷ commits = average group-commit batch) | |
+| `aether_lifecycle_expired_total` (objects, versions and delete markers removed by lifecycle rules) | |
 | `aether_build_info`, `aether_uptime_seconds` | `version` |
 
 ### Scrubbing
@@ -489,6 +490,28 @@ later suspend it (never undo it), as in S3.
   noncurrent never fails a quota check, so deletes always succeed.
 - A versioned bucket can only be deleted once every version and delete
   marker is gone. The scrubber checks noncurrent versions' blocks too.
+
+### Lifecycle rules
+
+`PutBucketLifecycleConfiguration` stores up to 1000 rules on the bucket record;
+a background job applies them every `lifecycle.interval_secs` (an hour).
+
+- **Filters:** a prefix, tags and object size bounds; every condition given
+  must hold. Rules set with the deprecated top-level `<Prefix>` are returned
+  the same way, and rules without an ID get one.
+- **Actions:** expire current objects N days after they were written or on a
+  date (a plain delete: a delete marker in versioned buckets); expire
+  noncurrent versions N days after they became noncurrent (when the next
+  newer version was written), optionally keeping the newest few; remove a
+  delete marker once no other version of its key is left; abort multipart
+  uploads N days after they started. Transitions need storage classes Aether
+  does not have and fail with `NotImplemented`.
+- **Safety:** the job walks every version of every key in buckets with
+  rules, and each removal is conditional on what it read (the ETag, time and
+  size of a current object), so data written meanwhile is never removed.
+- Days are counted from the write time; S3 rounds up to the next midnight
+  UTC, Aether does not. `lifecycle.day_secs` shortens a day for tests (Ceph's
+  s3-tests use 10 seconds).
 
 ### Encryption at rest
 

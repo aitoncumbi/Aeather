@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useState, type FormEvent } from "react";
 
-import { api, ApiError, paths, type Bucket, type CorsRule } from "@/lib/api";
+import { api, ApiError, paths, type Bucket, type CorsRule, type LifecycleRule } from "@/lib/api";
 import { bytes, count, date, percent } from "@/lib/format";
 import { useApi } from "@/lib/hooks";
 import { BucketIcon, ChevronRightIcon, PlusIcon, SearchIcon, TrashIcon } from "./icons";
@@ -245,6 +245,7 @@ function BucketDetail({
           <QuotaSetting bucket={b} onChanged={detail.reload} />
           <CorsSetting rules={b?.cors} />
           <VersioningSetting bucket={b} onChanged={detail.reload} />
+          <LifecycleSetting rules={b?.lifecycle} />
         </div>
       </div>
 
@@ -418,6 +419,46 @@ function VersioningSetting({ bucket, onChanged }: { bucket: Bucket | undefined; 
       <button type="button" className="btn btn-sm" disabled={!bucket || busy} onClick={toggle}>
         {on ? "Suspend" : "Enable"}
       </button>
+    </div>
+  );
+}
+
+/** What one lifecycle rule does, in a few words. */
+function describeRule(r: LifecycleRule): string {
+  const scope = r.filter.prefix ? `${r.filter.prefix}*` : "every object";
+  const acts = [
+    r.expiration_days != null && `expire after ${r.expiration_days} d`,
+    r.expiration_date != null && `expire on ${new Date(r.expiration_date).toISOString().slice(0, 10)}`,
+    r.noncurrent_days != null && `old versions after ${r.noncurrent_days} d`,
+    r.expired_object_delete_marker && "remove lone delete markers",
+    r.abort_upload_days != null && `abort uploads after ${r.abort_upload_days} d`,
+  ].filter(Boolean);
+  return `${scope}: ${acts.join(", ")}${r.enabled ? "" : " (disabled)"}`;
+}
+
+/** Read-only: rules are set with the S3 API (PutBucketLifecycleConfiguration). */
+function LifecycleSetting({ rules }: { rules: LifecycleRule[] | undefined }) {
+  return (
+    <div className="row">
+      <div className="row-text">
+        <span className="row-title">Lifecycle</span>
+        <span className="row-hint">
+          {!rules ? (
+            " "
+          ) : rules.length === 0 ? (
+            <>
+              No rules. Set them with <code>aws s3api put-bucket-lifecycle-configuration</code>.
+            </>
+          ) : (
+            rules.map((r) => describeRule(r)).join(" · ")
+          )}
+        </span>
+      </div>
+      {rules && rules.length > 0 && (
+        <span className="chip">
+          {rules.length} rule{rules.length === 1 ? "" : "s"}
+        </span>
+      )}
     </div>
   );
 }
