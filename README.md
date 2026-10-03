@@ -7,7 +7,7 @@ servers or containers and need object storage for internal applications.
 > node works with the AWS SDKs, the AWS CLI, boto3 and rclone: multipart uploads,
 > server-side copies, per-application access keys, HTTPS, Prometheus metrics, a
 > Docker image and a web console. CI drives those clients against a live server
-> and runs 310 of Ceph's s3-tests. See the [roadmap](docs/ROADMAP.md) for what
+> and runs 321 of Ceph's s3-tests. See the [roadmap](docs/ROADMAP.md) for what
 > comes next.
 
 No AWS account or cloud service is involved: Aether runs on your servers, and
@@ -67,6 +67,13 @@ encrypted too, so a copy of the database alone does not reveal working keys. **L
 up separately. To rotate, set a new `encryption.master_key` and move the old one
 to `encryption.previous_keys`. The server refuses to start without every key
 that has encrypted stored data.
+
+Clients can also bring their own key per object (SSE-C, with the
+`x-amz-server-side-encryption-customer-*` headers). Aether stores only a salted
+HMAC of it, so the key is needed for every read. Since the key is in the request
+headers, SSE-C needs HTTPS; behind a proxy that terminates TLS, set
+`s3.allow_sse_c_over_http = true`. The web console cannot download these
+objects.
 
 ### HTTPS
 
@@ -173,7 +180,7 @@ Current limitations:
   virtual-hosted style (`http://bucket.s3.example.com/key`), set
   `s3.domains = ["s3.example.com"]` with wildcard DNS for `*.s3.example.com`
   (and a wildcard certificate with TLS).
-- **Not supported yet:** SSE-KMS and SSE-C (v2 on the roadmap); lifecycle
+- **Not supported yet:** SSE-KMS; lifecycle
   transitions (Aether has one storage class); ACLs and bucket policies
   (per-key bucket permissions replace them); object lock; browser POST uploads.
   Requests that need these fail with `NotImplemented` rather than being ignored.

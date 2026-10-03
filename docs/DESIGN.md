@@ -538,15 +538,34 @@ SSE-S3: with `encryption.master_key` set, every new object is encrypted.
   configured, rather than failing on every read.
 - **S3.** Responses for encrypted objects carry
   `x-amz-server-side-encryption: AES256`; `GetBucketEncryption` reports SSE-S3
-  when a master key is set. Requests for SSE-S3 without a master key, SSE-KMS
-  or SSE-C fail with `NotImplemented`.
+  when a master key is set. Requests for SSE-S3 without a master key or for
+  SSE-KMS fail with `NotImplemented`.
+
+### Customer-provided keys (SSE-C)
+
+- **Framing.** The same 64 KiB AES-256-GCM frames, with the client's key in
+  place of a sealed data key. It works with or without a master key.
+- **Nothing to recover the key.** The record keeps the key's MD5 (returned in
+  responses, as S3 does) and an HMAC-SHA256 of a random salt under the key.
+  Every request is checked against the HMAC in constant time before any data
+  is read.
+- **Errors.** No key for an SSE-C object, a key for an object that is not
+  SSE-C, or the wrong key: 400 `InvalidRequest`, as Ceph returns. A key whose
+  MD5 does not match: 400 `InvalidArgument`. Asking for SSE-S3 and SSE-C
+  together: 400.
+- **Multipart.** The upload records the key's HMAC; every part must send the
+  same key.
+- **Copy.** Copying from or to an SSE-C object decrypts and re-encrypts. The
+  source key is sent in the `x-amz-copy-source-server-side-encryption-customer-*`
+  headers, so a copy can change the key or remove encryption. That includes
+  copying an object onto itself.
+- **HTTPS only.** Keys travel in request headers, so they are refused over
+  plain HTTP (400 `InvalidRequest`) unless `s3.allow_sse_c_over_http = true`,
+  for tests or a TLS-terminating proxy.
+- **Console.** The admin API has no key, so its download and share-link
+  endpoints refuse SSE-C objects with a clear error.
 
 ## Planned designs
-
-### SSE-C (v2)
-
-Customer-provided keys will reuse the framing of encryption at rest (below),
-with the client's key in place of a stored data key.
 
 ### Clustering (v3)
 

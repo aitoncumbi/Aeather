@@ -31,7 +31,8 @@ use uuid::Uuid;
 use self::keys::KeyCache;
 pub use self::keys::NewKey;
 use crate::blocks::{BlockStore, BlockWriter};
-use crate::crypto::{DataKey, FRAME, FrameCipher, Keyring, SealedKey, TAG};
+use crate::crypto::{CustomerKey, DataKey, FRAME, FrameCipher, Keyring, SealedKey, SseCustomer, TAG};
+pub use crate::error::CustomerKeyProblem;
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
     BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
@@ -334,8 +335,23 @@ impl Engine {
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
     {
-        let key = self.new_data_key()?;
-        self.stage_with(body, self.config.inline_threshold, key).await
+        self.stage_with_customer_key(body, None).await
+    }
+
+    /// Like `stage`, encrypted with the client's key instead (SSE-C) if given.
+    pub async fn stage_with_customer_key<S, E>(&self, body: S, customer: Option<&CustomerKey>) -> Result<StagedObject>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<BoxError>,
+    {
+        let protection = match customer {
+            Some(customer) => Protection::Customer(customer.data_key().clone(), customer.check()?),
+            None => match self.new_data_key()? {
+                Some((key, sealed)) => Protection::Sealed(key, sealed),
+                None => Protection::None,
+            },
+        };
+        self.stage_with(body, self.config.inline_threshold, protection).await
     }
 
     /// A new data key, if encryption at rest is configured.
@@ -353,22 +369,45 @@ impl Engine {
 
     /// Like [`stage`](Self::stage), for a part of a multipart upload. Parts are
     /// never inlined, since the completed object is a sequence of blocks.
-    /// Stages a part of `upload`, encrypted under the upload's data key if it has one.
     pub async fn stage_part<S, E>(&self, body: S, upload: &UploadRecord) -> Result<StagedObject>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
         E: Into<BoxError>,
     {
-        let key =
-            upload.sse.as_ref().map(|sealed| Ok::<_, Error>((self.open_key(sealed)?, sealed.clone()))).transpose()?;
-        self.stage_with(body, 0, key).await
+        self.stage_part_with(body, upload, None).await
+    }
+
+    /// Parts of an SSE-C upload need the upload's customer key.
+    pub async fn stage_part_with<S, E>(
+        &self,
+        body: S,
+        upload: &UploadRecord,
+        customer: Option<&CustomerKey>,
+    ) -> Result<StagedObject>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+        E: Into<BoxError>,
+    {
+        let protection = match (&upload.sse_customer, customer) {
+            (Some(stored), Some(customer)) if stored.matches(customer) => {
+                Protection::Customer(customer.data_key().clone(), stored.clone())
+            }
+            (Some(_), Some(_)) => return Err(Error::CustomerKey(CustomerKeyProblem::Mismatch)),
+            (Some(_), None) => return Err(Error::CustomerKey(CustomerKeyProblem::Missing)),
+            (None, Some(_)) => return Err(Error::CustomerKey(CustomerKeyProblem::NotEncrypted)),
+            (None, None) => match &upload.sse {
+                Some(sealed) => Protection::Sealed(self.open_key(sealed)?, sealed.clone()),
+                None => Protection::None,
+            },
+        };
+        self.stage_with(body, 0, protection).await
     }
 
     async fn stage_with<S, E>(
         &self,
         mut body: S,
         inline_threshold: usize,
-        key: Option<(DataKey, SealedKey)>,
+        protection: Protection,
     ) -> Result<StagedObject>
     where
         S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -381,9 +420,20 @@ impl Engine {
             data: ObjectData::Inline(Vec::new()),
             block_ids: Vec::new(),
             committed: false,
-            sse: key.as_ref().map(|(_, sealed)| sealed.clone()),
+            sse: None,
+            sse_customer: None,
         };
-        let data_key = key.map(|(data_key, _)| data_key);
+        let data_key = match protection {
+            Protection::None => None,
+            Protection::Sealed(key, sealed) => {
+                staged.sse = Some(sealed);
+                Some(key)
+            }
+            Protection::Customer(key, stored) => {
+                staged.sse_customer = Some(stored);
+                Some(key)
+            }
+        };
         let mut md5 = Md5::new();
         let mut inline = Some(Vec::new());
         let mut sink = BlockSink { engine: self, writer: None, blocks: Vec::new(), key: data_key.as_ref() };
@@ -440,6 +490,7 @@ impl Engine {
             part_sizes: Vec::new(),
             upload_id: None,
             sse: staged.sse.clone(),
+            sse_customer: staged.sse_customer.clone(),
         };
         let command = Command::PutObject {
             bucket: bucket.to_owned(),
@@ -581,6 +632,7 @@ impl Engine {
             upload_id: None,
             // The copy shares the source's blocks, so it shares their key too.
             sse: source.sse.clone(),
+            sse_customer: source.sse_customer.clone(),
         };
         let command = Command::CopyObject {
             src_bucket: src_bucket.to_owned(),
@@ -608,6 +660,19 @@ impl Engine {
         checksum_algorithm: Option<String>,
         checksum_type: Option<String>,
     ) -> Result<UploadRecord> {
+        self.create_upload_with(bucket, key, attrs, checksum_algorithm, checksum_type, None).await
+    }
+
+    /// With a customer key (SSE-C), every part must be sent with that key.
+    pub async fn create_upload_with(
+        &self,
+        bucket: &str,
+        key: &str,
+        attrs: ObjectAttrs,
+        checksum_algorithm: Option<String>,
+        checksum_type: Option<String>,
+        customer: Option<&CustomerKey>,
+    ) -> Result<UploadRecord> {
         validate_key(key)?;
         let upload = UploadRecord {
             upload_id: Uuid::now_v7(),
@@ -616,7 +681,11 @@ impl Engine {
             attrs,
             checksum_algorithm,
             checksum_type,
-            sse: self.new_data_key()?.map(|(_, sealed)| sealed),
+            sse: match customer {
+                Some(_) => None,
+                None => self.new_data_key()?.map(|(_, sealed)| sealed),
+            },
+            sse_customer: customer.map(CustomerKey::check).transpose()?,
         };
         self.apply(Command::CreateUpload { bucket: bucket.to_owned(), upload: upload.clone() }).await?;
         Ok(upload)
@@ -740,6 +809,7 @@ impl Engine {
             part_sizes: completion.parts.iter().map(|(_, p)| p.size).collect(),
             upload_id: Some(completion.upload.upload_id),
             sse: completion.upload.sse.clone(),
+            sse_customer: completion.upload.sse_customer.clone(),
         };
         let command = Command::CompleteUpload {
             bucket: bucket.to_owned(),
@@ -814,7 +884,22 @@ impl Engine {
 
     /// Streams `range` (already validated against `record.size`) of an object.
     pub fn read_object(&self, record: &ObjectRecord, range: Range<u64>) -> BoxStream<'static, io::Result<Bytes>> {
-        let key = match record.sse.as_ref().map(|sealed| self.open_key(sealed)).transpose() {
+        self.read_object_with(record, range, None)
+    }
+
+    /// Reads an SSE-C object with its customer key (callers check the key first).
+    pub fn read_object_with(
+        &self,
+        record: &ObjectRecord,
+        range: Range<u64>,
+        customer: Option<&CustomerKey>,
+    ) -> BoxStream<'static, io::Result<Bytes>> {
+        let key = match (&record.sse_customer, customer) {
+            (Some(stored), Some(customer)) if stored.matches(customer) => Ok(Some(customer.data_key().clone())),
+            (Some(_), _) => Err(Error::CustomerKey(CustomerKeyProblem::Missing)),
+            (None, _) => record.sse.as_ref().map(|sealed| self.open_key(sealed)).transpose(),
+        };
+        let key = match key {
             Ok(key) => key,
             Err(e) => return stream::once(async move { Err(io::Error::other(e.to_string())) }).boxed(),
         };
@@ -1028,6 +1113,15 @@ pub struct StagedObject {
     block_ids: Vec<Uuid>,
     committed: bool,
     sse: Option<SealedKey>,
+    sse_customer: Option<SseCustomer>,
+}
+
+/// How staged data is encrypted: not at all, under a sealed data key
+/// (SSE-S3), or under the client's key (SSE-C).
+enum Protection {
+    None,
+    Sealed(DataKey, SealedKey),
+    Customer(DataKey, SseCustomer),
 }
 
 impl StagedObject {

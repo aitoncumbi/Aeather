@@ -49,6 +49,7 @@ mod tests {
             part_sizes: vec![3],
             upload_id: Some(Uuid::now_v7()),
             sse: None,
+            sse_customer: None,
         };
         let back: ObjectRecord = decode(&encode(&record)).unwrap();
         assert_eq!(back, record);

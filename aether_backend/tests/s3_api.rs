@@ -1638,3 +1638,189 @@ async fn lifecycle_configuration_through_the_s3_api() {
     let err = c.get_bucket_lifecycle_configuration().bucket("bkt").send().await.unwrap_err();
     assert_eq!(code(err), "NoSuchLifecycleConfiguration");
 }
+
+#[tokio::test]
+async fn sse_c_customer_keys() {
+    let key_a = [7u8; 32];
+    let key_b = [9u8; 32];
+    let b64 = |k: &[u8; 32]| STANDARD.encode(k);
+    let md5 = |k: &[u8; 32]| STANDARD.encode(Md5::digest(k));
+
+    // Over plain HTTP, SSE-C is refused unless allowed explicitly.
+    let s = start().await;
+    s.client.create_bucket().bucket("bkt").send().await.unwrap();
+    let err = s
+        .client
+        .put_object()
+        .bucket("bkt")
+        .key("doc")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "InvalidRequest");
+
+    let s = start_with(|config| config.s3.allow_sse_c_over_http = true).await;
+    let c = &s.client;
+    c.create_bucket().bucket("bkt").send().await.unwrap();
+    let data = pattern(200_000);
+    let put = c
+        .put_object()
+        .bucket("bkt")
+        .key("doc")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .body(ByteStream::from(data.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.sse_customer_key_md5(), Some(md5(&key_a).as_str()));
+
+    let get = |key: Option<&[u8; 32]>| {
+        let mut req = c.get_object().bucket("bkt").key("doc");
+        if let Some(k) = key {
+            req = req.sse_customer_algorithm("AES256").sse_customer_key(b64(k)).sse_customer_key_md5(md5(k));
+        }
+        req.send()
+    };
+    let got = get(Some(&key_a)).await.unwrap();
+    assert_eq!(got.sse_customer_algorithm(), Some("AES256"));
+    assert!(got.body.collect().await.unwrap().into_bytes() == data);
+    assert_eq!(code(get(None).await.unwrap_err()), "InvalidRequest");
+    assert_eq!(code(get(Some(&key_b)).await.unwrap_err()), "InvalidRequest");
+    let head = c
+        .head_object()
+        .bucket("bkt")
+        .key("doc")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(data.len() as i64));
+
+    // A wrong MD5 is refused before anything is stored.
+    let err = c
+        .put_object()
+        .bucket("bkt")
+        .key("other")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_b))
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "InvalidArgument");
+
+    // A key for an object that is not SSE-C.
+    c.put_object().bucket("bkt").key("plain").body(ByteStream::from_static(b"plain")).send().await.unwrap();
+    let err = c
+        .get_object()
+        .bucket("bkt")
+        .key("plain")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(code(err), "InvalidRequest");
+
+    // Copy re-encrypts: from key A to key B, and from SSE-C to plain.
+    c.copy_object()
+        .bucket("bkt")
+        .key("copy")
+        .copy_source("bkt/doc")
+        .copy_source_sse_customer_algorithm("AES256")
+        .copy_source_sse_customer_key(b64(&key_a))
+        .copy_source_sse_customer_key_md5(md5(&key_a))
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_b))
+        .sse_customer_key_md5(md5(&key_b))
+        .send()
+        .await
+        .unwrap();
+    let copy = c
+        .get_object()
+        .bucket("bkt")
+        .key("copy")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_b))
+        .sse_customer_key_md5(md5(&key_b))
+        .send()
+        .await
+        .unwrap();
+    assert!(copy.body.collect().await.unwrap().into_bytes() == data);
+    let err = c.copy_object().bucket("bkt").key("x").copy_source("bkt/doc").send().await.unwrap_err();
+    assert_eq!(code(err), "InvalidRequest", "copying needs the source key");
+    c.copy_object()
+        .bucket("bkt")
+        .key("decrypted")
+        .copy_source("bkt/doc")
+        .copy_source_sse_customer_algorithm("AES256")
+        .copy_source_sse_customer_key(b64(&key_a))
+        .copy_source_sse_customer_key_md5(md5(&key_a))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_bytes(c, "bkt", "decrypted").await, data);
+
+    // Multipart: every part needs the upload's key.
+    let up = c
+        .create_multipart_upload()
+        .bucket("bkt")
+        .key("multi")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .send()
+        .await
+        .unwrap();
+    let id = up.upload_id().unwrap();
+    let part = |n: i32, key: Option<&[u8; 32]>, body: Vec<u8>| {
+        let mut req = c.upload_part().bucket("bkt").key("multi").upload_id(id).part_number(n);
+        if let Some(k) = key {
+            req = req.sse_customer_algorithm("AES256").sse_customer_key(b64(k)).sse_customer_key_md5(md5(k));
+        }
+        req.body(ByteStream::from(body)).send()
+    };
+    let first = pattern(5 * 1024 * 1024);
+    let second = other_pattern(1000);
+    assert_eq!(code(part(1, None, first.clone()).await.unwrap_err()), "InvalidRequest");
+    assert_eq!(code(part(1, Some(&key_b), first.clone()).await.unwrap_err()), "InvalidRequest");
+    let e1 = part(1, Some(&key_a), first.clone()).await.unwrap().e_tag().unwrap().to_string();
+    let e2 = part(2, Some(&key_a), second.clone()).await.unwrap().e_tag().unwrap().to_string();
+    c.complete_multipart_upload()
+        .bucket("bkt")
+        .key("multi")
+        .upload_id(id)
+        .multipart_upload(completed(&[(1, e1), (2, e2)]))
+        .send()
+        .await
+        .unwrap();
+    let got = c
+        .get_object()
+        .bucket("bkt")
+        .key("multi")
+        .range("bytes=5242870-5242889")
+        .sse_customer_algorithm("AES256")
+        .sse_customer_key(b64(&key_a))
+        .sse_customer_key_md5(md5(&key_a))
+        .send()
+        .await
+        .unwrap();
+    let mut whole = first;
+    whole.extend_from_slice(&second);
+    assert!(got.body.collect().await.unwrap().into_bytes() == whole[5242870..5242890]);
+
+    // Nothing on disk holds the key: the record keeps only its MD5 and a salted HMAC.
+    let record = s.engine.get_object("bkt", "doc").await.unwrap();
+    assert_eq!(record.sse_customer.as_ref().unwrap().key_md5, md5(&key_a));
+    assert!(record.sse.is_none());
+}

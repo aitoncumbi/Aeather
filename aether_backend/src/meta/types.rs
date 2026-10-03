@@ -160,6 +160,9 @@ pub struct ObjectRecord {
     /// The data key when the object is encrypted at rest (SSE-S3).
     #[serde(default)]
     pub sse: Option<crate::crypto::SealedKey>,
+    /// Encrypted with a key the client sends with every request (SSE-C).
+    #[serde(default)]
+    pub sse_customer: Option<crate::crypto::SseCustomer>,
 }
 
 impl ObjectRecord {
@@ -181,6 +184,7 @@ impl ObjectRecord {
             part_sizes: Vec::new(),
             upload_id: None,
             sse: None,
+            sse_customer: None,
         }
     }
 }
@@ -398,6 +402,9 @@ pub struct UploadRecord {
     /// Every part is encrypted under this data key; the object inherits it.
     #[serde(default)]
     pub sse: Option<crate::crypto::SealedKey>,
+    /// SSE-C: every part must be sent with this customer key.
+    #[serde(default)]
+    pub sse_customer: Option<crate::crypto::SseCustomer>,
 }
 
 /// One uploaded part. Parts are never stored inline.

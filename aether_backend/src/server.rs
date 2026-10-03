@@ -101,7 +101,8 @@ fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Rou
     s3_config.put_object_max_size = Some(config.s3.max_object_size);
     s3_config.enable_sig_v2 = config.s3.allow_sig_v2;
 
-    let s3 = AetherS3::new(Arc::clone(&engine), Arc::clone(&auth), config.s3.region.clone());
+    let sse_c_allowed = config.tls.files().is_some() || config.s3.allow_sse_c_over_http;
+    let s3 = AetherS3::new(Arc::clone(&engine), Arc::clone(&auth), config.s3.region.clone(), sse_c_allowed);
     let mut builder = S3ServiceBuilder::new(s3);
     builder.set_auth(S3Credentials(Arc::clone(&auth)));
     builder.set_access(S3Permissions(auth));
