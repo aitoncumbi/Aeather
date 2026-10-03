@@ -312,8 +312,11 @@ built from and fails with a conflict if a part was replaced in the meantime, so 
 completed object can never point at released blocks.
 
 The object's ETag is the MD5 of the parts' MD5s followed by `-<part count>`, as in
-S3, and the object keeps each part's size so `GetObject?partNumber=N` can serve a
-single part. It also keeps the id of the upload that created it: a client whose
+S3, and the object keeps each part's size and checksums, so
+`GetObject?partNumber=N` can serve a single part and `GetObjectAttributes` can
+list them (paged with `max-parts` and `part-number-marker`). A part number the
+object does not have is 400 `InvalidPart`, as Ceph answers (AWS: 416
+`InvalidPartNumber`). It also keeps the id of the upload that created it: a client whose
 `CompleteMultipartUpload` response was lost retries after the upload is gone,
 and gets the same success response as long as the key still holds that object.
 

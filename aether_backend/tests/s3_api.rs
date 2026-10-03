@@ -594,7 +594,29 @@ async fn multipart_upload_round_trip() {
     assert_eq!(part3.content_range(), Some(format!("bytes {}-{}/{}", 10 * MIB, whole.len() - 1, whole.len()).as_str()));
     assert_eq!(part3.body.collect().await.unwrap().into_bytes().as_ref(), data[2].as_slice());
     let err = c.get_object().bucket("bkt").key("videos/big.bin").part_number(4).send().await.unwrap_err();
-    assert_eq!(err.code(), Some("InvalidPartNumber"));
+    assert_eq!(err.code(), Some("InvalidPart"));
+
+    use aws_sdk_s3::types::ObjectAttributes;
+    let attrs = c
+        .get_object_attributes()
+        .bucket("bkt")
+        .key("videos/big.bin")
+        .object_attributes(ObjectAttributes::ObjectSize)
+        .object_attributes(ObjectAttributes::ObjectParts)
+        .object_attributes(ObjectAttributes::Etag)
+        .part_number_marker("1")
+        .max_parts(1)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(attrs.object_size(), Some(whole.len() as i64));
+    assert_eq!(Some(attrs.e_tag().unwrap()), done.e_tag().map(|e| e.trim_matches('"')));
+    let parts = attrs.object_parts().unwrap();
+    assert_eq!((parts.total_parts_count(), parts.is_truncated()), (Some(3), Some(true)));
+    assert_eq!(
+        parts.parts().iter().map(|p| (p.part_number(), p.size())).collect::<Vec<_>>(),
+        [(Some(2), Some(5 * MIB as i64))]
+    );
 
     assert!(c.list_multipart_uploads().bucket("bkt").send().await.unwrap().uploads().is_empty());
 }

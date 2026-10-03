@@ -131,9 +131,13 @@ fn required(operation: &str) -> Required {
     match operation {
         "ListBuckets" | "CreateBucket" => Required::Handler,
         "HeadBucket" | "GetBucketLocation" | "GetBucketVersioning" | "GetBucketTagging" => Required::Any,
-        "ListObjects" | "ListObjectsV2" | "ListObjectVersions" | "GetObject" | "HeadObject" | "GetObjectTagging" => {
-            Required::Read
-        }
+        "ListObjects"
+        | "ListObjectsV2"
+        | "ListObjectVersions"
+        | "GetObject"
+        | "HeadObject"
+        | "GetObjectTagging"
+        | "GetObjectAttributes" => Required::Read,
         "ListMultipartUploads" | "ListParts" => Required::ReadOrWrite,
         "PutObject"
         | "PutObjectTagging"

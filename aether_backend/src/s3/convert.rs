@@ -221,13 +221,9 @@ pub fn select(record: &ObjectRecord, part_number: Option<i32>, range: Option<&dt
         }
         (Some(n), None) => {
             let index = usize::try_from(n).ok().filter(|&n| n >= 1 && n <= record.part_sizes.len());
+            // AWS answers 416 InvalidPartNumber; Ceph (and its s3-tests) 400 InvalidPart.
             let Some(index) = index else {
-                let mut e = S3Error::with_message(
-                    S3ErrorCode::Custom("InvalidPartNumber".into()),
-                    "the requested part number is not satisfiable",
-                );
-                e.set_status_code(axum::http::StatusCode::RANGE_NOT_SATISFIABLE);
-                return Err(e);
+                return Err(s3_error!(InvalidPart, "the object has no part {n}"));
             };
             let start: u64 = record.part_sizes[..index - 1].iter().sum();
             let r = start..start + record.part_sizes[index - 1];

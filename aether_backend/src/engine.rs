@@ -494,6 +494,7 @@ impl Engine {
             upload_id: None,
             sse: staged.sse.clone(),
             sse_customer: staged.sse_customer.clone(),
+            part_checksums: Vec::new(),
         };
         let command = Command::PutObject {
             bucket: bucket.to_owned(),
@@ -636,6 +637,7 @@ impl Engine {
             // The copy shares the source's blocks, so it shares their key too.
             sse: source.sse.clone(),
             sse_customer: source.sse_customer.clone(),
+            part_checksums: source.part_checksums.clone(),
         };
         let command = Command::CopyObject {
             src_bucket: src_bucket.to_owned(),
@@ -813,6 +815,7 @@ impl Engine {
             upload_id: Some(completion.upload.upload_id),
             sse: completion.upload.sse.clone(),
             sse_customer: completion.upload.sse_customer.clone(),
+            part_checksums: completion.parts.iter().map(|(_, p)| p.checksums.clone()).collect(),
         };
         let command = Command::CompleteUpload {
             bucket: bucket.to_owned(),
