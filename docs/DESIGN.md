@@ -244,7 +244,8 @@ Notes:
   Staged blocks travel with their command and the writer marks them committed,
   so a client that disconnects mid-commit cannot get committed blocks deleted.
   With 32 clients, small PUTs went from 166 to about 1,900 per second on a disk
-  with slow fsyncs ([BENCHMARKS.md](BENCHMARKS.md)).
+  with slow fsyncs, and from about 1,500 to 6,000 per second on a 4-vCPU VM
+  ([BENCHMARKS.md](BENCHMARKS.md)).
 
 `ObjectRecord` holds: version id, size, ETag, last-modified, content headers
 (type, encoding, disposition, language, cache-control, expires), user metadata,
