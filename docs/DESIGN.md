@@ -190,7 +190,10 @@ so the write ordering below is enforced in exactly one place.
 
 ### Metadata store
 
-All metadata lives in one redb database (`<data_dir>/meta.redb`).
+All metadata lives in one redb database (`<data_dir>/meta.redb`). It changes
+only through commands, so it holds exactly the state that replicas will share
+(v3): what belongs to this node alone, such as when it last scrubbed, lives in
+`<data_dir>/node.redb` instead.
 
 | Table | Key | Value |
 |---|---|---|
@@ -203,7 +206,7 @@ All metadata lives in one redb database (`<data_dir>/meta.redb`).
 | `access_keys` | access key id | `AccessKeyRecord` (secret, sealed with encryption at rest; roles; per-bucket permissions) |
 | `versions` | bucket_id ‖ object key ‖ 0x00 ‖ inverted version id | `ObjectRecord` (noncurrent versions and delete markers) |
 | `bucket_usage` | bucket_id | object count and bytes (current and noncurrent), updated by every write |
-| `system` | name | schema version and other node-level values |
+| `system` | name | schema version, latest commit stamp, master keys that sealed data |
 
 
 The schema version is checked at startup and older databases are migrated in place
@@ -212,6 +215,15 @@ The schema version is checked at startup and older databases are migrated in pla
 Object keys may not contain NUL: S3's XML responses cannot carry it, and the
 `uploads` key uses it as a separator so uploads sort by key, then by start time
 (upload ids are UUIDv7, which are time-ordered).
+
+New versions and delete markers are stamped at commit: just before applying a
+batch, the writer gives each its Last-Modified time (the clock, but never
+earlier than the previous stamp, which `system` keeps) and its version id (a
+UUIDv7 of that time with a 42-bit counter). The `versions` order is therefore
+the commit order, even when the clock steps back. `MetaStore::digest` hashes
+every table and `MetaStore::replica_snapshot` copies them exactly; a test
+replays the writer's commands on a second store and checks that both digests
+match, as Raft followers will rely on.
 
 Notes:
 
@@ -244,7 +256,8 @@ Notes:
   Staged blocks travel with their command and the writer marks them committed,
   so a client that disconnects mid-commit cannot get committed blocks deleted.
   With 32 clients, small PUTs went from 166 to about 1,900 per second on a disk
-  with slow fsyncs ([BENCHMARKS.md](BENCHMARKS.md)).
+  with slow fsyncs, and from about 1,500 to 6,000 per second on a 4-vCPU VM
+  ([BENCHMARKS.md](BENCHMARKS.md)).
 
 `ObjectRecord` holds: version id, size, ETag, last-modified, content headers
 (type, encoding, disposition, language, cache-control, expires), user metadata,

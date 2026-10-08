@@ -68,8 +68,8 @@ anything from a 1 KB document to a 100 GB file.
 - [x] Web console on the admin API, embedded in the binary: overview with usage and
   activity charts, buckets, object browser (upload, download, presigned share links),
   keys and permissions; sign-in sessions; end-to-end tests in CI
-- [x] Group commit for metadata writes (small PUTs are capped by one fsync'd transaction
-  at a time; see [BENCHMARKS.md](BENCHMARKS.md))
+- [x] Group commit for metadata writes (small PUTs were capped by one fsync'd transaction
+  at a time; now about four times as many per second, see [BENCHMARKS.md](BENCHMARKS.md))
 - [x] Per-bucket CORS (needed for browser uploads with presigned URLs)
 - [x] Bucket quotas
 - [x] Virtual-hosted-style addressing
@@ -90,10 +90,21 @@ anything from a 1 KB document to a 100 GB file.
 ## v3: clustering
 Design: [CLUSTERING.md](CLUSTERING.md).
 
-- [ ] Raft-replicated metadata (openraft) using the existing command model
+- [x] Single-node groundwork: node-local state in `node.redb`; version ids and
+  Last-Modified stamped at commit, in commit order; exact metadata snapshots and
+  a state digest
+- [ ] Internal API and node identity (port 9002, shared-secret authentication)
+- [ ] Raft-replicated metadata (openraft) using the existing command model: the
+  leader stamps and proposes batches, followers serve linearizable reads, exact
+  snapshots are built by log size
 - [ ] Cluster layout, node join/leave, failure detection
-- [ ] Block replication (3 copies by default) with rendezvous-hash placement
-- [ ] Rebalancing and repair after node loss
+- [ ] Block replication (3 copies, written to at least 2) with rendezvous-hash
+  placement, a persistent repair queue, and staging leases so the orphan sweeper
+  never deletes copies of an upload in progress
+- [ ] Rebalancing that keeps blocks readable across every unsettled layout
+  version; repair from the repair queues, an hourly block-list comparison and the
+  scrubber; an orphan sweeper that waits until its node has caught up
+- [ ] `aether cluster recover`: restart from a survivor after losing a majority
 - [ ] Any node serves any request
 
 ## Later

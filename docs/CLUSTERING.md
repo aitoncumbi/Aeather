@@ -1,8 +1,9 @@
 # Clustering design (v3)
 
-**Status: proposal, for review before any code.** It turns the single node of
-v1–v2.1 into a cluster of 3 or more nodes that keeps working when a node or a
-disk fails. [DESIGN.md](DESIGN.md) describes the single node this builds on;
+**Status: reviewed; step 0 (single-node groundwork) done.** It turns
+the single node of v1–v2.1 into a cluster of 3 or more nodes that keeps
+working when a node or a disk fails. The fixes from the review are folded into
+the sections below and listed in [Review](#review). [DESIGN.md](DESIGN.md) describes the single node this builds on;
 the roadmap items are in [ROADMAP.md](ROADMAP.md#v3-clustering).
 
 ## Goals
@@ -57,6 +58,36 @@ things are new:
           internal API (port 9002): Raft RPCs, block put/get, health
 ```
 
+## Where everything lives
+
+Every node keeps, in its own data directory:
+
+| File | Contents | Replicated |
+|---|---|---|
+| `meta.redb` | All metadata: buckets, objects, versions, uploads, keys, block reference counts, GC queue. The same tables as today, complete on every node, voters and learners alike | Yes: identical on every node, through the Raft log |
+| `raft.redb` | The Raft log and vote | Yes: it is the replication |
+| `node.redb` | This node's own state: node id, last scrub, repair queue, staging leases | No |
+| `blocks/` | The blocks this node owns: about 3/N of all data | Each block on 3 nodes |
+
+A write is acknowledged only when its metadata is on disk on a majority of
+voters and its blocks on at least 2 of their 3 owners:
+
+```
+client ──PUT──► B
+                B ── blocks ──► their 3 owners          waits until 2 have them on disk
+                B ── command ──► A (leader)
+                A ── log entry ──► other voters         waits until a majority has it on disk
+                every node applies the entry to its meta.redb, in log order
+client ◄─200── B
+```
+
+So no data and no metadata exist on one node only. When a node fails, the
+others still hold all metadata and at least one other copy of each of its
+blocks (see [Failure handling](#failure-handling)). When it returns, it
+replays the log entries it missed, or installs a snapshot if it is too far
+behind, and repair restores the copies it missed. A replacement node starts
+from a snapshot and receives its share of blocks by rebalancing.
+
 ## Metadata: one Raft group
 
 ### What is replicated
@@ -77,17 +108,43 @@ The last applied log id is stored in the `system` table **in the same redb
 transaction** as the commands it applied. A crash therefore never applies an
 entry twice or skips one.
 
+**Version ids and times come from the leader.** S3 lists versions newest
+first, and lifecycle rules use that order and those times ("keep the 3 newest
+noncurrent versions", "expire 30 days after becoming noncurrent"). If every
+gateway stamped its own commands, clock differences between nodes would order
+versions differently from the order they were committed in, and such a rule
+could delete the wrong versions. So the writer that proposes a batch stamps
+every command that creates a version (PutObject, CopyObject, CompleteUpload
+and delete markers): Last-Modified is its clock, never earlier than the
+previous stamp, and the version id is a UUIDv7 built from that time and a
+counter, so ids increase strictly in commit order. The last stamp is stored
+with the commands, so a restarted node or a new leader continues after it.
+Followers apply stamped commands as they are.
+
 ### Storage
 
 - **Raft log and vote:** a separate `raft.redb` in the data directory, so
   appending to the log (fsynced before acknowledging) does not contend with
   state-machine transactions. Applied entries are purged once a snapshot
   covers them.
-- **Snapshots:** the existing `MetaStore::snapshot` (used by `aether backup`)
-  copies every table from one read transaction into a new database file. A
-  snapshot *is* a backup's `meta.redb`. It is streamed to a lagging follower
-  and installed by swapping the file in. Snapshots are built every 10,000
-  entries by default.
+- **Node-local state:** `node.redb` holds what belongs to one node (node id,
+  last scrub, repair queue, staging leases). It is never replicated or
+  snapshotted, so `meta.redb` holds only state that every replica shares.
+- **Snapshots are exact copies** of every replicated table, including the GC
+  queue and unreferenced blocks. They are *not* the backup snapshot:
+  `aether backup` leaves those out because a restored node has no deletions
+  pending, but a replica without them would differ from the leader (its GC
+  would never delete those blocks, and the same command could succeed on one
+  node and fail on another). A digest over the replicated tables checks that
+  two replicas at the same applied index agree; tests use it, and so does
+  `aether cluster status`.
+- **When:** a snapshot is built when the log since the last one exceeds
+  `cluster.snapshot_log_bytes` (default 1 GiB), not every N entries. One
+  entry is a whole group-commit batch, and at about 700 batches per second
+  ([BENCHMARKS.md](BENCHMARKS.md)) 10,000 entries would mean a full copy of
+  the metadata every 15 seconds. A follower receives a snapshot only when it
+  needs entries that were already purged; it is streamed from one read
+  transaction and installed by swapping the file in.
 
 ### Writes
 
@@ -152,9 +209,17 @@ internal API. Each owner writes it as today (tmp file, fsync, rename) and
 answers with the CRC32C. The block counts as written once **W** owners
 (`cluster.write_quorum`, default 2 of 3) have it.
 
-- A missing copy (an owner that was down or slow) is recorded in a local
-  repair queue on the gateway, and the repair job copies it later. The read
-  path and the scrubber find any copy that is still missing.
+- A missing copy (an owner that was down or slow) is recorded in the
+  gateway's repair queue in `node.redb`, so it survives a restart, and the
+  repair job copies it as soon as the owner is back. If the gateway is lost
+  as well, the block-list comparison ([Rebalancing and repair](#rebalancing-and-repair))
+  finds the missing copy.
+- **Staging leases:** each owner records the blocks it receives for an
+  upload that is not committed yet, with a lease that the gateway renews
+  while the upload runs (10 minutes by default). The orphan sweeper leaves
+  leased blocks alone, so a slow multi-gigabyte upload cannot lose its copies.
+  If the gateway dies, the lease expires and the blocks become ordinary
+  orphan candidates.
 - If fewer than W owners succeed, the upload fails with 503 `SlowDown` and the
   copies that were written are left to the orphan sweeper.
 - Encryption happens on the gateway before blocks leave it, so blocks are
@@ -175,7 +240,13 @@ The `blocks` reference counts and `gc_queue` are metadata, so they are
 replicated. Only the leader runs the GC job: it proposes `ForgetBlocks` for
 due blocks. Each node, after applying it, deletes its own copies of those
 blocks. If a node crashes in between, the orphan sweeper removes the files
-later, because the block is no longer known. Backups on any node pause GC
+later, because the block is no longer known.
+
+The orphan sweeper deletes a block file only if it is older than the grace
+period, has no live staging lease, and is unknown to a state machine that has
+applied at least up to the leader's commit index at the start of the sweep (a
+read index). A node catching up after downtime therefore never takes a
+recently committed block for an orphan. Backups on any node pause GC
 cluster-wide: the pause is a replicated flag with an expiry.
 
 ## Layout and membership
@@ -218,14 +289,22 @@ already is:
 3. **Drop** copies a node no longer owns, only after the layout is settled
    and a grace period has passed.
 
-Until then, readers try owners under the new layout first and fall back to
-the previous one, so nothing is unreadable during a move.
+Until then, readers try the owners under every layout version that has not
+settled yet, newest first, so blocks stay readable however many changes are
+in flight (adding two nodes one after the other, say). Versions settle in
+order, oldest first.
 
-**Repair** reuses the same machinery: the scrubber already re-reads every
-local block weekly. In a cluster, a corrupt or missing copy is fetched from
-another owner and rewritten, and blocks with fewer than `R` copies are copied
-to the owners that lack them. `aether cluster status` and the metrics report
-under-replicated blocks.
+**Repair** has three sources:
+
+- the repair queues, for copies a write missed;
+- a block-list comparison that each node runs every hour
+  (`cluster.anti_entropy_interval`) with the other owners of its blocks: they
+  exchange hashes of block-id ranges and list only the ranges that differ, so
+  a copy missing for any reason is found within the hour;
+- the weekly scrubber, which re-reads every local copy and replaces a corrupt
+  one from another owner.
+
+`aether cluster status` and the metrics report under-replicated blocks.
 
 ## Failure handling
 
@@ -236,7 +315,7 @@ under-replicated blocks.
 | A disk fails on one node | Same as a crash for that node's blocks | Replace the disk; the node rejoins empty and repair refills it, or `cluster remove` it |
 | A node is gone for good | Its blocks have 2 copies until handled | `aether cluster remove` → rebalancing makes third copies elsewhere |
 | Network partition | The side with a majority of voters keeps working; the minority answers 503 for writes and linearizable reads | Heals automatically; minority nodes catch up from the log |
-| Two of three nodes down | No metadata quorum: writes and reads fail with 503 | Bring a node back. Losing the data of two of three nodes at once is beyond what 3 copies protect against. Restore from a backup |
+| Two of three nodes down | No metadata quorum: writes and reads fail with 503 | Bring a node back. If neither can come back, `aether cluster recover` on the survivor makes it the only voter: it keeps everything it had applied, but writes it had not yet received are lost. Losing the disks of two of three nodes at once is beyond what 3 copies protect against |
 
 Nodes report health to the leader every second. A node is shown as down after
 10 seconds, but it stays in the layout. Data is not moved off a node that may
@@ -277,6 +356,8 @@ replicas = 3                # copies of each block
 write_quorum = 2            # copies written before an upload succeeds
 lease_reads = false         # linearizable reads by lease instead of read index
 rebalance_bytes_per_sec = "100MB"
+snapshot_log_bytes = "1GiB"  # build a metadata snapshot when the log grows past this
+anti_entropy_interval = "1h" # compare block lists with the other owners
 # auto_remove_after = "24h"
 ```
 
@@ -293,6 +374,8 @@ rebalance_bytes_per_sec = "100MB"
 
 - **Storage:** openraft's storage test suite runs against the redb-backed log
   and state machine.
+- **Determinism:** every test that runs commands on several replicas, or
+  installs a snapshot, compares the replicas' state digests.
 - **In-process clusters:** integration tests start 3 to 5 nodes in one process
   over an in-memory network that can drop, delay and partition messages. They
   check acknowledged writes survive leader changes, partitions and restarts,
@@ -306,18 +389,42 @@ rebalance_bytes_per_sec = "100MB"
 
 One PR each, as in the [roadmap](ROADMAP.md#v3-clustering):
 
+0. **Single-node groundwork (done):** `node.redb` for node-local
+   state; version ids and Last-Modified stamped by the writer in commit order;
+   exact metadata snapshots and a state digest. These change nothing for
+   clients, and on one node they already keep version order right when the
+   clock steps back.
 1. **Internal API and node identity:** port 9002, `cluster.secret`
    authentication, node ids, health.
 2. **Raft metadata:** openraft over `raft.redb` and the existing tables;
-   leader forwarding; follower reads; `cluster init` / `join`; snapshots from
-   `MetaStore::snapshot`. Blocks still local, so this step runs only in
-   tests.
+   the leader stamps and proposes batches; leader forwarding; follower reads;
+   `cluster init` / `join`; exact snapshots by log size. Blocks still local,
+   so this step runs only in tests.
 3. **Layout and placement:** layout commands, HRW with zones and weights,
-   block put/get over the internal API, W-of-R writes, reads with failover.
-4. **Rebalancing and repair:** layout versions, throttled moves, settle and
-   drop; scrubber repair from replicas; under-replication metrics.
-5. **Operations:** `aether cluster` commands, Cluster page in the console,
-   cluster-wide GC pause for backups, the Compose chaos test in CI, and docs.
+   block put/get over the internal API, W-of-R writes, reads with failover,
+   the persistent repair queue and staging leases.
+4. **Rebalancing and repair:** layout versions (reads across every unsettled
+   one), throttled moves, settle and drop; block-list comparison; scrubber
+   repair from replicas; the orphan sweeper gated on the read index;
+   under-replication metrics.
+5. **Operations:** `aether cluster` commands including `recover`, Cluster
+   page in the console, cluster-wide GC pause for backups, the Compose chaos
+   test in CI, and docs.
+
+## Review
+
+The first draft had these problems. Each is fixed in the section named.
+
+| Problem | Fix | Step |
+|---|---|---|
+| Version ids and Last-Modified came from the clock of the node that took the request, so versions could be ordered differently from their commits, and lifecycle rules could expire the wrong ones | [Stamped by the proposing writer in commit order](#what-is-replicated) | 0, 2 |
+| Raft snapshots reused the backup snapshot, which leaves out the GC queue and unreferenced blocks, so a follower installed from one would differ from the leader | [Exact snapshots and a state digest](#storage) | 0, 2 |
+| A full snapshot every 10,000 entries, each entry a batch: about every 15 seconds | [Snapshots by log size, sent only when needed](#storage) | 2 |
+| The scrubber writes its last-run time into `meta.redb` outside the command model, so replicas would differ | [`node.redb` for node-local state](#storage) | 0 |
+| The orphan sweeper could delete copies of an upload in progress on another node, or recent blocks on a node catching up | [Staging leases; sweeper gated on the read index](#deleting-blocks) | 3, 4 |
+| Reads fell back only one layout version, so two changes in a row could make blocks unreadable | [Owners under every unsettled version](#rebalancing-and-repair) | 4 |
+| The queue of missing copies lived in memory, and only the weekly scrub found the rest | [Persistent repair queue; hourly block-list comparison](#rebalancing-and-repair) | 3, 4 |
+| No way back after losing two of three nodes | [`aether cluster recover`](#failure-handling) | 5 |
 
 ## Decisions to confirm
 

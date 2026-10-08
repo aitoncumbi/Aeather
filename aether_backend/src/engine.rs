@@ -35,11 +35,12 @@ use crate::crypto::{CustomerKey, DataKey, FRAME, FrameCipher, Keyring, SealedKey
 pub use crate::error::CustomerKeyProblem;
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
-    BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
-    ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery, UploadPage,
-    UploadRecord, WriteCondition, usage_after,
+    BlockRef, BucketRecord, BucketUsage, Command, CommitClock, CorsRule, DeleteCondition, ListPage, ListQuery,
+    MetaStore, Millis, ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery,
+    UploadPage, UploadRecord, WriteCondition, usage_after,
 };
 pub use crate::meta::{Deleted, VersionRef, Versioning, VersionsPage, VersionsQuery};
+use crate::node::{self, NodeStore};
 
 /// S3's limit for one ListObjects page.
 pub const MAX_LIST_KEYS: usize = 1000;
@@ -83,6 +84,35 @@ pub struct EngineConfig {
     pub lifecycle_interval: Duration,
     /// The length of a lifecycle "day" (shorter only for testing).
     pub lifecycle_day: Duration,
+    /// The time new versions get. The writer stamps them with it at commit,
+    /// never earlier than the previous stamp; tests replace it.
+    pub wall_clock: WallClock,
+}
+
+/// A source of the current time in Unix milliseconds.
+#[derive(Clone)]
+pub struct WallClock(Arc<dyn Fn() -> Millis + Send + Sync>);
+
+impl WallClock {
+    pub fn new(now: impl Fn() -> Millis + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub fn now(&self) -> Millis {
+        (self.0)()
+    }
+}
+
+impl Default for WallClock {
+    fn default() -> Self {
+        Self::new(now_millis)
+    }
+}
+
+impl std::fmt::Debug for WallClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WallClock")
+    }
 }
 
 impl Default for EngineConfig {
@@ -103,12 +133,15 @@ impl Default for EngineConfig {
             keyring: None,
             lifecycle_interval: Duration::from_secs(60 * 60),
             lifecycle_day: Duration::from_secs(24 * 60 * 60),
+            wall_clock: WallClock::default(),
         }
     }
 }
 
 pub struct Engine {
     meta: Arc<MetaStore>,
+    /// This node's own state (`node.redb`); never replicated.
+    node: Arc<NodeStore>,
     writer: writer::Writer,
     blocks: Arc<BlockStore>,
     keys: Arc<KeyCache>,
@@ -139,6 +172,21 @@ pub struct EngineStats {
     pub meta_writes: AtomicU64,
 }
 
+/// Moves node-local values that older versions kept in `meta.redb` into
+/// `node.redb`. Copy first, then remove: after a crash in between, the next
+/// start finds the copy and only removes the original.
+fn move_node_values(meta: &MetaStore, node: &NodeStore) -> Result<()> {
+    for name in node::MOVED_FROM_META {
+        if let Some(value) = meta.legacy_node_value(name)? {
+            if node.get(name)?.is_none() {
+                node.set(name, value)?;
+            }
+            meta.remove_legacy_node_value(name)?;
+        }
+    }
+    Ok(())
+}
+
 fn count(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
 }
@@ -151,6 +199,13 @@ impl Engine {
         // store clears the staging directory.
         let meta_path = config.data_dir.join("meta.redb");
         let meta = tokio::task::spawn_blocking(move || MetaStore::open(&meta_path)).await??;
+        let node_path = config.data_dir.join("node.redb");
+        let (meta, node) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let node = NodeStore::open(&node_path)?;
+            move_node_values(&meta, &node)?;
+            Ok((meta, node))
+        })
+        .await??;
         let blocks = BlockStore::open(&config.data_dir).await?;
         let missing: Vec<String> = meta
             .sealing_key_ids()?
@@ -169,8 +224,14 @@ impl Engine {
         let meta = Arc::new(meta);
         let stats = Arc::new(EngineStats::default());
         let engine = Self {
-            writer: writer::Writer::start(Arc::clone(&meta), Arc::clone(&stats)),
+            writer: writer::Writer::start(
+                Arc::clone(&meta),
+                Arc::clone(&stats),
+                CommitClock::after(meta.last_stamp()?),
+                config.wall_clock.clone(),
+            ),
             meta,
+            node: Arc::new(node),
             blocks: Arc::new(blocks),
             keys: Arc::new(keys),
             stats,
@@ -480,7 +541,7 @@ impl Engine {
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
         validate_key(key)?;
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
             versioned: false,
@@ -543,7 +604,7 @@ impl Engine {
         version: Option<VersionRef>,
         condition: DeleteCondition,
     ) -> Result<Deleted> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let command = Command::DeleteObject {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -572,7 +633,7 @@ impl Engine {
         bucket: &str,
         objects: Vec<(String, Option<VersionRef>, DeleteCondition)>,
     ) -> Result<Vec<Option<Deleted>>> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let objects = objects.into_iter().map(|(key, version, cond)| (key, version, cond, Uuid::now_v7())).collect();
         let command =
             Command::DeleteObjects { bucket: bucket.to_owned(), objects, now, gc_due_at: now + self.gc_grace_millis() };
@@ -622,7 +683,7 @@ impl Engine {
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
         validate_key(dst_key)?;
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
             versioned: false,
@@ -798,7 +859,7 @@ impl Engine {
         checksum_type: Option<String>,
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let mut attrs = completion.upload.attrs.clone();
         attrs.checksums = checksums;
         attrs.checksum_type = checksum_type;
@@ -1066,6 +1127,16 @@ impl Engine {
     /// request could delete the blocks of a committed object.
     async fn commit_staged(&self, staged: StagedObject, command: Command) -> Result<Outcome> {
         self.writer.apply(command, Some(staged)).await
+    }
+
+    async fn node_value(&self, name: &'static str) -> Result<Option<i64>> {
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || node.get(name)).await?
+    }
+
+    async fn set_node_value(&self, name: &'static str, value: i64) -> Result<()> {
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || node.set(name, value)).await?
     }
 
     async fn read<T, F>(&self, f: F) -> Result<T>

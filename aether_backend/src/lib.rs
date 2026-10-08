@@ -13,6 +13,7 @@ pub mod http;
 pub mod logger;
 pub mod meta;
 pub mod metrics;
+pub mod node;
 pub mod observe;
 pub mod s3;
 pub mod server;

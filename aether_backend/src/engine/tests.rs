@@ -312,6 +312,138 @@ async fn reopen_keeps_data() {
 }
 
 #[tokio::test]
+async fn node_local_values_move_out_of_the_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta_path = dir.path().join("meta.redb");
+    {
+        let meta = MetaStore::open(&meta_path).unwrap();
+        meta.set_legacy_node_value(node::LAST_SCRUB, 1234).unwrap();
+    }
+    let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
+    {
+        let engine = Engine::open(config.clone()).await.unwrap();
+        assert_eq!(engine.node_value(node::LAST_SCRUB).await.unwrap(), Some(1234));
+        engine.set_node_value(node::LAST_SCRUB, 5678).await.unwrap();
+    }
+    // Gone from meta.redb; reopening keeps the node's own value.
+    assert_eq!(MetaStore::open(&meta_path).unwrap().legacy_node_value(node::LAST_SCRUB).unwrap(), None);
+    let engine = Engine::open(config).await.unwrap();
+    assert_eq!(engine.node_value(node::LAST_SCRUB).await.unwrap(), Some(5678));
+}
+
+#[tokio::test]
+async fn versions_follow_commit_order_when_the_clock_goes_back() {
+    use std::sync::atomic::AtomicI64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let time = Arc::new(AtomicI64::new(1_000_000));
+    let clock = {
+        let time = Arc::clone(&time);
+        WallClock::new(move || time.load(Ordering::SeqCst))
+    };
+    let config = EngineConfig { data_dir: dir.path().to_path_buf(), wall_clock: clock, ..Default::default() };
+    let mut written = Vec::new();
+    {
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.create_bucket("bkt").await.unwrap();
+        engine.set_bucket_versioning("bkt", Versioning::Enabled).await.unwrap();
+        for (wall, data) in [(1_000_000, b"one"), (999_000, b"two"), (1_000_000, b"thr")] {
+            time.store(wall, Ordering::SeqCst);
+            written.push(put(&engine, "bkt", "k", data).await);
+        }
+        time.store(500_000, Ordering::SeqCst);
+        engine.delete_object("bkt", "k").await.unwrap();
+    }
+    // Restarted with the clock still behind.
+    let engine = Engine::open(config).await.unwrap();
+    written.push(put(&engine, "bkt", "k", b"fiv").await);
+
+    let times: Vec<Millis> = written.iter().map(|r| r.last_modified).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "times went back: {times:?}");
+    let page = engine
+        .list_versions("bkt", VersionsQuery { prefix: String::new(), max_keys: 100, ..Default::default() })
+        .await
+        .unwrap();
+    // Newest first: the last put, the delete marker, then the puts in reverse.
+    let listed: Vec<(bool, u64)> = page.versions.iter().map(|v| (v.record.delete_marker, v.record.size)).collect();
+    assert_eq!(listed, [(false, 3), (true, 0), (false, 3), (false, 3), (false, 3)]);
+    let ids: Vec<Uuid> = page.versions.iter().map(|v| v.record.version_id).collect();
+    assert_eq!(ids[0], written[3].version_id);
+    assert_eq!(&ids[2..], [written[2].version_id, written[1].version_id, written[0].version_id]);
+    assert!(page.versions[1].record.last_modified >= written[2].last_modified);
+    assert!(page.versions[0].is_latest);
+    assert_eq!(read_all(&engine, &engine.get_object("bkt", "k").await.unwrap(), 0..3).await, b"fiv");
+}
+
+/// What a Raft follower does: apply the commands the writer committed, in
+/// order, to another store. It must end up with identical metadata, and an
+/// exact snapshot must too; a backup snapshot need not.
+#[tokio::test]
+async fn replaying_the_commands_gives_identical_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        block_size: 1000,
+        inline_threshold: 100,
+        min_part_size: 1000,
+        ..Default::default()
+    };
+    let engine = Engine::open(config).await.unwrap();
+
+    // Something in every table: overwrites (GC queue), inline and block data,
+    // versions and a delete marker, a copy, tags, multipart uploads (one
+    // completed, one left open), a key with a grant, and failed commands.
+    engine.create_bucket("bkt").await.unwrap();
+    engine.create_bucket("history").await.unwrap();
+    engine.set_bucket_versioning("history", Versioning::Enabled).await.unwrap();
+    put(&engine, "bkt", "a", &pattern(2500)).await;
+    let small = put(&engine, "bkt", "a", b"tiny").await;
+    put(&engine, "history", "k", b"one").await;
+    put(&engine, "history", "k", &pattern(1500)).await;
+    engine.delete_object("history", "k").await.unwrap();
+    engine
+        .copy_object("bkt", "a", &small, "history", "copy", ObjectAttrs::default(), WriteCondition::None)
+        .await
+        .unwrap();
+    engine.set_object_tags("bkt", "a", None, BTreeMap::from([("team".into(), "x".into())])).await.unwrap();
+    let id = engine.create_upload("bkt", "video", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "video", id, 1, &pattern(1500)).await;
+    let p2 = upload_part(&engine, "video", id, 2, &pattern(700)).await;
+    complete(&engine, "video", id, &[(1, &p1), (2, &p2)]).await.unwrap();
+    let open = engine.create_upload("bkt", "open", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    upload_part(&engine, "open", open, 1, &pattern(1200)).await;
+    let key = engine.create_key(NewKey { name: "app".into(), ..Default::default() }).await.unwrap();
+    engine.set_grant(&key.access_key_id, "bkt", BucketGrant { read: true, write: true, owner: false }).await.unwrap();
+    let refused =
+        engine.put_object("bkt", "a", body(b"x", 1), ObjectAttrs::default(), WriteCondition::IfNoneMatchAny).await;
+    assert!(matches!(refused, Err(Error::PreconditionFailed)));
+    assert!(engine.create_bucket("bkt").await.is_err());
+
+    let commands = engine.writer.applied.lock().unwrap().clone();
+    let replica = MetaStore::open(&dir.path().join("replica.redb")).unwrap();
+    for command in commands {
+        // Refused commands are refused on the replica too, and change nothing.
+        let _ = replica.apply(command);
+    }
+    let digest = engine.meta.digest().unwrap();
+    assert_eq!(replica.digest().unwrap(), digest);
+
+    let exact = dir.path().join("exact.redb");
+    engine.meta.replica_snapshot(&exact).unwrap();
+    assert_eq!(MetaStore::open(&exact).unwrap().digest().unwrap(), digest);
+    assert!(engine.meta.replica_snapshot(&exact).is_err(), "never overwrites");
+
+    // A backup leaves out the GC queue the overwrite created.
+    let backup = dir.path().join("backup.redb");
+    engine.meta.snapshot(&backup).unwrap();
+    assert_ne!(MetaStore::open(&backup).unwrap().digest().unwrap(), digest);
+
+    // Any change shows in the digest.
+    engine.delete_object("bkt", "a").await.unwrap();
+    assert_ne!(engine.meta.digest().unwrap(), digest);
+}
+
+#[tokio::test]
 async fn second_process_cannot_open_same_data_dir() {
     let (_engine, dir) = test_engine().await;
     let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
