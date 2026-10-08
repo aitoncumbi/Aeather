@@ -88,6 +88,8 @@ anything from a 1 KB document to a 100 GB file.
 - [x] `GetObjectAttributes` (size, ETag, checksums, parts with their checksums), and part-number GETs answered as Ceph does
 
 ## v3: clustering
+Design: [CLUSTERING.md](CLUSTERING.md).
+
 - [ ] Raft-replicated metadata (openraft) using the existing command model
 - [ ] Cluster layout, node join/leave, failure detection
 - [ ] Block replication (3 copies by default) with rendezvous-hash placement
@@ -98,7 +100,12 @@ anything from a 1 KB document to a 100 GB file.
 - Erasure coding
 - Webhook/queue notifications on object changes
 - Object lock (WORM retention, legal hold)
-- Multiple disks per node
+- Multiple disks per node, with redundancy across them (like RAID 1): each block
+  on two disks, so a node keeps serving all its data when one disk fails, and a
+  replaced disk is refilled from the other
+- Automated backups: `aether backup` on a schedule (`backup.schedule`,
+  `backup.dir`), dated directories, retention (keep the last N daily and
+  weekly), and the last result in `aether status` and the metrics
 - Compression, deduplication
 - Bucket replication between clusters
 - External KMS for encryption keys
