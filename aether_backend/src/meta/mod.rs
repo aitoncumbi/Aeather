@@ -7,6 +7,7 @@
 
 mod codec;
 mod keys;
+mod stamp;
 mod types;
 mod usage;
 mod versions;
@@ -24,6 +25,7 @@ use uuid::Uuid;
 
 pub use self::keys::prefix_successor;
 use self::keys::{gc_key, object_key, parse_gc_key, parse_part_number, parse_upload_key, part_key, upload_key};
+pub use self::stamp::CommitClock;
 pub use self::types::*;
 pub use self::usage::replaced as usage_after;
 pub use self::versions::{Deleted, key_of as version_key_of};
@@ -53,6 +55,9 @@ const SYSTEM: TableDefinition<&str, &[u8]> = TableDefinition::new("system");
 
 /// 1: initial layout. 2: adds `access_keys` and `bucket_usage`.
 const SCHEMA_VERSION: u32 = 2;
+
+/// `system` key of the latest commit stamp.
+const LAST_STAMP: &str = "last_stamp";
 
 // Commands and outcomes are short-lived; boxing the large variants buys nothing.
 #[allow(clippy::large_enum_variant)]
@@ -289,6 +294,14 @@ impl MetaStore {
                 results[i] = Some(Err(e));
                 pending.retain(|&j| j != i);
                 continue;
+            }
+            // The latest stamp commits with the commands, so a writer that
+            // starts later (or another node's) continues after it.
+            let latest = done.iter().filter_map(|(i, _)| commands[*i].stamped_at()).max();
+            if let Some(latest) = latest
+                && let Err(e) = note_stamp(&txn, latest)
+            {
+                return fail_all(results, &pending, &e);
             }
             if let Err(e) = txn.commit() {
                 return fail_all(results, &pending, &e.into());
@@ -608,6 +621,16 @@ fn apply_in(txn: &WriteTransaction, command: Command) -> Result<Outcome> {
     Ok(outcome)
 }
 
+/// Keeps the latest commit stamp (see [`CommitClock`]).
+fn note_stamp(txn: &WriteTransaction, stamp: Millis) -> Result<()> {
+    let mut system = txn.open_table(SYSTEM)?;
+    let last: Option<Millis> = system.get(LAST_STAMP)?.map(|v| codec::decode(v.value())).transpose()?;
+    if last.is_none_or(|last| stamp > last) {
+        system.insert(LAST_STAMP, codec::encode(&stamp).as_slice())?;
+    }
+    Ok(())
+}
+
 /// Records which master key sealed stored data, so a server started without
 /// it refuses to run instead of failing on every read.
 fn note_sealing_key(txn: &WriteTransaction, sealed: Option<&crate::crypto::SealedKey>) -> Result<()> {
@@ -659,6 +682,13 @@ impl MetaStore {
             None => older.next().ok_or(Error::NoSuchKey),
             Some(v) => older.find(|r| v.matches(r)).ok_or(Error::NoSuchVersion),
         }
+    }
+
+    /// The latest commit stamp; 0 before the first stamped write.
+    pub fn last_stamp(&self) -> Result<Millis> {
+        let txn = self.db.begin_read()?;
+        let system = txn.open_table(SYSTEM)?;
+        Ok(system.get(LAST_STAMP)?.map(|v| codec::decode(v.value())).transpose()?.unwrap_or(0))
     }
 
     /// Fingerprints of every master key that has encrypted stored data.

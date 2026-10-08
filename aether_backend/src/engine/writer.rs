@@ -5,6 +5,10 @@
 //! writer instead takes every command that is waiting and applies them in one
 //! transaction ([`MetaStore::apply_batch`]): while one batch is being synced,
 //! the next one gathers. Alone, a write commits as soon as it arrives.
+//!
+//! Just before applying a batch, the writer stamps the commands that create
+//! versions ([`Command::stamp`]), so versions are ordered by commit, not by
+//! the clock at the time each request arrived.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -12,9 +16,9 @@ use std::thread::JoinHandle;
 
 use tokio::sync::oneshot;
 
-use super::{EngineStats, StagedObject, count};
+use super::{EngineStats, StagedObject, WallClock, count};
 use crate::error::{Error, Result};
-use crate::meta::{Command, MetaStore, Outcome};
+use crate::meta::{Command, CommitClock, MetaStore, Outcome};
 
 /// Most commands in one transaction, so one batch cannot hold the others' replies for long.
 const MAX_BATCH: usize = 256;
@@ -34,7 +38,13 @@ pub(super) struct Writer {
 }
 
 impl Writer {
-    pub(super) fn start(meta: Arc<MetaStore>, stats: Arc<EngineStats>) -> Self {
+    /// `clock` continues after the latest stamp `meta` has committed.
+    pub(super) fn start(
+        meta: Arc<MetaStore>,
+        stats: Arc<EngineStats>,
+        mut clock: CommitClock,
+        wall: WallClock,
+    ) -> Self {
         let (jobs, queue) = mpsc::channel::<Job>();
         // Dropped uncommitted blocks are deleted by a task on the runtime.
         let runtime = tokio::runtime::Handle::try_current().ok();
@@ -45,8 +55,12 @@ impl Writer {
                 while let Ok(first) = queue.recv() {
                     let mut batch = vec![first];
                     batch.extend(queue.try_iter().take(MAX_BATCH - 1));
-                    let (commands, rest): (Vec<_>, Vec<_>) =
+                    let (mut commands, rest): (Vec<_>, Vec<_>) =
                         batch.into_iter().map(|job| (job.command, (job.staged, job.reply))).unzip();
+                    let now = wall.now();
+                    for command in &mut commands {
+                        command.stamp(&mut clock, now);
+                    }
                     count(&stats.meta_writes, commands.len() as u64);
                     count(&stats.meta_commits, 1);
                     let results = meta.apply_batch(commands);

@@ -332,6 +332,50 @@ async fn node_local_values_move_out_of_the_metadata() {
 }
 
 #[tokio::test]
+async fn versions_follow_commit_order_when_the_clock_goes_back() {
+    use std::sync::atomic::AtomicI64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let time = Arc::new(AtomicI64::new(1_000_000));
+    let clock = {
+        let time = Arc::clone(&time);
+        WallClock::new(move || time.load(Ordering::SeqCst))
+    };
+    let config = EngineConfig { data_dir: dir.path().to_path_buf(), wall_clock: clock, ..Default::default() };
+    let mut written = Vec::new();
+    {
+        let engine = Engine::open(config.clone()).await.unwrap();
+        engine.create_bucket("bkt").await.unwrap();
+        engine.set_bucket_versioning("bkt", Versioning::Enabled).await.unwrap();
+        for (wall, data) in [(1_000_000, b"one"), (999_000, b"two"), (1_000_000, b"thr")] {
+            time.store(wall, Ordering::SeqCst);
+            written.push(put(&engine, "bkt", "k", data).await);
+        }
+        time.store(500_000, Ordering::SeqCst);
+        engine.delete_object("bkt", "k").await.unwrap();
+    }
+    // Restarted with the clock still behind.
+    let engine = Engine::open(config).await.unwrap();
+    written.push(put(&engine, "bkt", "k", b"fiv").await);
+
+    let times: Vec<Millis> = written.iter().map(|r| r.last_modified).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "times went back: {times:?}");
+    let page = engine
+        .list_versions("bkt", VersionsQuery { prefix: String::new(), max_keys: 100, ..Default::default() })
+        .await
+        .unwrap();
+    // Newest first: the last put, the delete marker, then the puts in reverse.
+    let listed: Vec<(bool, u64)> = page.versions.iter().map(|v| (v.record.delete_marker, v.record.size)).collect();
+    assert_eq!(listed, [(false, 3), (true, 0), (false, 3), (false, 3), (false, 3)]);
+    let ids: Vec<Uuid> = page.versions.iter().map(|v| v.record.version_id).collect();
+    assert_eq!(ids[0], written[3].version_id);
+    assert_eq!(&ids[2..], [written[2].version_id, written[1].version_id, written[0].version_id]);
+    assert!(page.versions[1].record.last_modified >= written[2].last_modified);
+    assert!(page.versions[0].is_latest);
+    assert_eq!(read_all(&engine, &engine.get_object("bkt", "k").await.unwrap(), 0..3).await, b"fiv");
+}
+
+#[tokio::test]
 async fn second_process_cannot_open_same_data_dir() {
     let (_engine, dir) = test_engine().await;
     let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };

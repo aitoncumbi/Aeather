@@ -35,9 +35,9 @@ use crate::crypto::{CustomerKey, DataKey, FRAME, FrameCipher, Keyring, SealedKey
 pub use crate::error::CustomerKeyProblem;
 use crate::error::{BoxError, Error, Result};
 use crate::meta::{
-    BlockRef, BucketRecord, BucketUsage, Command, CorsRule, DeleteCondition, ListPage, ListQuery, MetaStore, Millis,
-    ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery, UploadPage,
-    UploadRecord, WriteCondition, usage_after,
+    BlockRef, BucketRecord, BucketUsage, Command, CommitClock, CorsRule, DeleteCondition, ListPage, ListQuery,
+    MetaStore, Millis, ObjectAttrs, ObjectData, ObjectRecord, Outcome, PartRecord, PartsPage, Quota, UploadListQuery,
+    UploadPage, UploadRecord, WriteCondition, usage_after,
 };
 pub use crate::meta::{Deleted, VersionRef, Versioning, VersionsPage, VersionsQuery};
 use crate::node::{self, NodeStore};
@@ -84,6 +84,35 @@ pub struct EngineConfig {
     pub lifecycle_interval: Duration,
     /// The length of a lifecycle "day" (shorter only for testing).
     pub lifecycle_day: Duration,
+    /// The time new versions get. The writer stamps them with it at commit,
+    /// never earlier than the previous stamp; tests replace it.
+    pub wall_clock: WallClock,
+}
+
+/// A source of the current time in Unix milliseconds.
+#[derive(Clone)]
+pub struct WallClock(Arc<dyn Fn() -> Millis + Send + Sync>);
+
+impl WallClock {
+    pub fn new(now: impl Fn() -> Millis + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    pub fn now(&self) -> Millis {
+        (self.0)()
+    }
+}
+
+impl Default for WallClock {
+    fn default() -> Self {
+        Self::new(now_millis)
+    }
+}
+
+impl std::fmt::Debug for WallClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WallClock")
+    }
 }
 
 impl Default for EngineConfig {
@@ -104,6 +133,7 @@ impl Default for EngineConfig {
             keyring: None,
             lifecycle_interval: Duration::from_secs(60 * 60),
             lifecycle_day: Duration::from_secs(24 * 60 * 60),
+            wall_clock: WallClock::default(),
         }
     }
 }
@@ -194,7 +224,12 @@ impl Engine {
         let meta = Arc::new(meta);
         let stats = Arc::new(EngineStats::default());
         let engine = Self {
-            writer: writer::Writer::start(Arc::clone(&meta), Arc::clone(&stats)),
+            writer: writer::Writer::start(
+                Arc::clone(&meta),
+                Arc::clone(&stats),
+                CommitClock::after(meta.last_stamp()?),
+                config.wall_clock.clone(),
+            ),
             meta,
             node: Arc::new(node),
             blocks: Arc::new(blocks),
@@ -506,7 +541,7 @@ impl Engine {
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
         validate_key(key)?;
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
             versioned: false,
@@ -569,7 +604,7 @@ impl Engine {
         version: Option<VersionRef>,
         condition: DeleteCondition,
     ) -> Result<Deleted> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let command = Command::DeleteObject {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -598,7 +633,7 @@ impl Engine {
         bucket: &str,
         objects: Vec<(String, Option<VersionRef>, DeleteCondition)>,
     ) -> Result<Vec<Option<Deleted>>> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let objects = objects.into_iter().map(|(key, version, cond)| (key, version, cond, Uuid::now_v7())).collect();
         let command =
             Command::DeleteObjects { bucket: bucket.to_owned(), objects, now, gc_due_at: now + self.gc_grace_millis() };
@@ -648,7 +683,7 @@ impl Engine {
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
         validate_key(dst_key)?;
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let record = ObjectRecord {
             version_id: Uuid::now_v7(),
             versioned: false,
@@ -824,7 +859,7 @@ impl Engine {
         checksum_type: Option<String>,
         condition: WriteCondition,
     ) -> Result<ObjectRecord> {
-        let now = now_millis();
+        let now = self.config.wall_clock.now();
         let mut attrs = completion.upload.attrs.clone();
         attrs.checksums = checksums;
         attrs.checksum_type = checksum_type;
