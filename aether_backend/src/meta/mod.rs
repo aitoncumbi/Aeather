@@ -16,11 +16,13 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::path::Path;
 
+use redb::TableHandle;
 use redb::{
     Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
     WriteTransaction,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use self::keys::prefix_successor;
@@ -55,6 +57,24 @@ const SYSTEM: TableDefinition<&str, &[u8]> = TableDefinition::new("system");
 
 /// 1: initial layout. 2: adds `access_keys` and `bucket_usage`.
 const SCHEMA_VERSION: u32 = 2;
+
+/// Calls `$f(args.., TABLE)?` for every table. All of `meta.redb` is
+/// replicated state (node-local values live in `node.redb`), so snapshots and
+/// digests cover every table; a test checks none is missing.
+macro_rules! each_table {
+    ($f:ident $(, $arg:expr)*) => {{
+        $f($($arg,)* BUCKETS)?;
+        $f($($arg,)* OBJECTS)?;
+        $f($($arg,)* BLOCKS)?;
+        $f($($arg,)* UPLOADS)?;
+        $f($($arg,)* PARTS)?;
+        $f($($arg,)* GC_QUEUE)?;
+        $f($($arg,)* ACCESS_KEYS)?;
+        $f($($arg,)* VERSIONS)?;
+        $f($($arg,)* BUCKET_USAGE)?;
+        $f($($arg,)* SYSTEM)?;
+    }};
+}
 
 /// `system` key of the latest commit stamp.
 const LAST_STAMP: &str = "last_stamp";
@@ -1040,8 +1060,35 @@ impl MetaStore {
         Ok(out)
     }
 
+    /// An exact copy of the metadata as of now, in a new database at `path`:
+    /// every table, the GC queue and unreferenced blocks included, so a
+    /// replica that installs it is identical to this one ([`MetaStore::digest`]
+    /// says so). Unlike [`MetaStore::snapshot`], which makes a backup.
+    pub fn replica_snapshot(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            return Err(Error::InvalidArgument(format!("{} already exists", path.display())));
+        }
+        let read = self.db.begin_read()?;
+        let out = Database::create(path)?;
+        let write = out.begin_write()?;
+        each_table!(copy_table, &read, &write);
+        write.commit()?;
+        Ok(())
+    }
+
+    /// SHA-256 over every table, in order: two stores have the same digest
+    /// exactly when they hold the same metadata, so replicas that applied the
+    /// same commands, or installed the same snapshot, can be compared.
+    pub fn digest(&self) -> Result<String> {
+        let read = self.db.begin_read()?;
+        let mut hasher = Sha256::new();
+        each_table!(hash_table, &read, &mut hasher);
+        Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    }
+
     /// Writes the metadata as of now to a new database at `path`, leaving out
-    /// blocks waiting for GC. Returns the blocks it references.
+    /// blocks waiting for GC. Returns the blocks it references. This is a
+    /// backup, not a replica: see [`MetaStore::replica_snapshot`].
     pub fn snapshot(&self, path: &Path) -> Result<Vec<Uuid>> {
         let read = self.db.begin_read()?;
         let out = Database::create(path)?;
@@ -1097,6 +1144,26 @@ impl MetaStore {
         let txn = self.db.begin_read()?;
         Ok(txn.open_table(GC_QUEUE)?.len()?)
     }
+}
+
+fn hash_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    read: &ReadTransaction,
+    hasher: &mut Sha256,
+    table: TableDefinition<K, V>,
+) -> Result<()> {
+    let name = table.name().as_bytes();
+    hasher.update((name.len() as u64).to_le_bytes());
+    hasher.update(name);
+    for entry in read.open_table(table)?.iter()? {
+        let (k, v) = entry?;
+        for bytes in [K::as_bytes(&k.value()).as_ref(), V::as_bytes(&v.value()).as_ref()] {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+    }
+    // Ends the table, so entries cannot shift from one table to the next.
+    hasher.update(u64::MAX.to_le_bytes());
+    Ok(())
 }
 
 fn copy_table<K: redb::Key + 'static, V: redb::Value + 'static>(
@@ -1268,4 +1335,35 @@ pub(super) fn as_slice_bounds(range: &(Bound<Vec<u8>>, Bound<Vec<u8>>)) -> (Boun
 
 pub(super) fn utf8(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| Error::Corrupt("object key is not UTF-8".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name_of<K: redb::Key + 'static, V: redb::Value + 'static>(
+        names: &mut Vec<String>,
+        table: TableDefinition<K, V>,
+    ) -> Result<()> {
+        names.push(table.name().to_owned());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshots_and_digests_cover_every_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = MetaStore::open(&dir.path().join("meta.redb")).unwrap();
+        let covered = (|| -> Result<Vec<String>> {
+            let mut names = Vec::new();
+            each_table!(name_of, &mut names);
+            Ok(names)
+        })()
+        .unwrap();
+        let mut present: Vec<String> =
+            meta.db.begin_read().unwrap().list_tables().unwrap().map(|t| t.name().to_owned()).collect();
+        present.sort();
+        let mut covered_sorted = covered.clone();
+        covered_sorted.sort();
+        assert_eq!(present, covered_sorted, "a table is missing from each_table!");
+    }
 }

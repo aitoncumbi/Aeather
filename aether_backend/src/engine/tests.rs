@@ -375,6 +375,74 @@ async fn versions_follow_commit_order_when_the_clock_goes_back() {
     assert_eq!(read_all(&engine, &engine.get_object("bkt", "k").await.unwrap(), 0..3).await, b"fiv");
 }
 
+/// What a Raft follower does: apply the commands the writer committed, in
+/// order, to another store. It must end up with identical metadata, and an
+/// exact snapshot must too; a backup snapshot need not.
+#[tokio::test]
+async fn replaying_the_commands_gives_identical_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        data_dir: dir.path().to_path_buf(),
+        block_size: 1000,
+        inline_threshold: 100,
+        min_part_size: 1000,
+        ..Default::default()
+    };
+    let engine = Engine::open(config).await.unwrap();
+
+    // Something in every table: overwrites (GC queue), inline and block data,
+    // versions and a delete marker, a copy, tags, multipart uploads (one
+    // completed, one left open), a key with a grant, and failed commands.
+    engine.create_bucket("bkt").await.unwrap();
+    engine.create_bucket("history").await.unwrap();
+    engine.set_bucket_versioning("history", Versioning::Enabled).await.unwrap();
+    put(&engine, "bkt", "a", &pattern(2500)).await;
+    let small = put(&engine, "bkt", "a", b"tiny").await;
+    put(&engine, "history", "k", b"one").await;
+    put(&engine, "history", "k", &pattern(1500)).await;
+    engine.delete_object("history", "k").await.unwrap();
+    engine
+        .copy_object("bkt", "a", &small, "history", "copy", ObjectAttrs::default(), WriteCondition::None)
+        .await
+        .unwrap();
+    engine.set_object_tags("bkt", "a", None, BTreeMap::from([("team".into(), "x".into())])).await.unwrap();
+    let id = engine.create_upload("bkt", "video", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    let p1 = upload_part(&engine, "video", id, 1, &pattern(1500)).await;
+    let p2 = upload_part(&engine, "video", id, 2, &pattern(700)).await;
+    complete(&engine, "video", id, &[(1, &p1), (2, &p2)]).await.unwrap();
+    let open = engine.create_upload("bkt", "open", ObjectAttrs::default(), None, None).await.unwrap().upload_id;
+    upload_part(&engine, "open", open, 1, &pattern(1200)).await;
+    let key = engine.create_key(NewKey { name: "app".into(), ..Default::default() }).await.unwrap();
+    engine.set_grant(&key.access_key_id, "bkt", BucketGrant { read: true, write: true, owner: false }).await.unwrap();
+    let refused =
+        engine.put_object("bkt", "a", body(b"x", 1), ObjectAttrs::default(), WriteCondition::IfNoneMatchAny).await;
+    assert!(matches!(refused, Err(Error::PreconditionFailed)));
+    assert!(engine.create_bucket("bkt").await.is_err());
+
+    let commands = engine.writer.applied.lock().unwrap().clone();
+    let replica = MetaStore::open(&dir.path().join("replica.redb")).unwrap();
+    for command in commands {
+        // Refused commands are refused on the replica too, and change nothing.
+        let _ = replica.apply(command);
+    }
+    let digest = engine.meta.digest().unwrap();
+    assert_eq!(replica.digest().unwrap(), digest);
+
+    let exact = dir.path().join("exact.redb");
+    engine.meta.replica_snapshot(&exact).unwrap();
+    assert_eq!(MetaStore::open(&exact).unwrap().digest().unwrap(), digest);
+    assert!(engine.meta.replica_snapshot(&exact).is_err(), "never overwrites");
+
+    // A backup leaves out the GC queue the overwrite created.
+    let backup = dir.path().join("backup.redb");
+    engine.meta.snapshot(&backup).unwrap();
+    assert_ne!(MetaStore::open(&backup).unwrap().digest().unwrap(), digest);
+
+    // Any change shows in the digest.
+    engine.delete_object("bkt", "a").await.unwrap();
+    assert_ne!(engine.meta.digest().unwrap(), digest);
+}
+
 #[tokio::test]
 async fn second_process_cannot_open_same_data_dir() {
     let (_engine, dir) = test_engine().await;

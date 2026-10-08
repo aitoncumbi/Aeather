@@ -35,6 +35,9 @@ struct Job {
 pub(super) struct Writer {
     jobs: Option<mpsc::Sender<Job>>,
     thread: Option<JoinHandle<()>>,
+    /// Every command applied, as stamped: tests replay them on another store.
+    #[cfg(test)]
+    pub(super) applied: Arc<std::sync::Mutex<Vec<Command>>>,
 }
 
 impl Writer {
@@ -46,6 +49,10 @@ impl Writer {
         wall: WallClock,
     ) -> Self {
         let (jobs, queue) = mpsc::channel::<Job>();
+        #[cfg(test)]
+        let applied = Arc::new(std::sync::Mutex::new(Vec::new()));
+        #[cfg(test)]
+        let log = Arc::clone(&applied);
         // Dropped uncommitted blocks are deleted by a task on the runtime.
         let runtime = tokio::runtime::Handle::try_current().ok();
         let thread = std::thread::Builder::new()
@@ -61,6 +68,8 @@ impl Writer {
                     for command in &mut commands {
                         command.stamp(&mut clock, now);
                     }
+                    #[cfg(test)]
+                    log.lock().expect("not poisoned").extend(commands.iter().cloned());
                     count(&stats.meta_writes, commands.len() as u64);
                     count(&stats.meta_commits, 1);
                     let results = meta.apply_batch(commands);
@@ -73,7 +82,12 @@ impl Writer {
                 }
             })
             .expect("start the metadata writer thread");
-        Self { jobs: Some(jobs), thread: Some(thread) }
+        Self {
+            jobs: Some(jobs),
+            thread: Some(thread),
+            #[cfg(test)]
+            applied,
+        }
     }
 
     pub(super) async fn apply(&self, command: Command, staged: Option<StagedObject>) -> Result<Outcome> {

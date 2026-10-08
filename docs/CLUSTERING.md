@@ -1,6 +1,6 @@
 # Clustering design (v3)
 
-**Status: reviewed; step 0 (single-node groundwork) in progress.** It turns
+**Status: reviewed; step 0 (single-node groundwork) done.** It turns
 the single node of v1–v2.1 into a cluster of 3 or more nodes that keeps
 working when a node or a disk fails. The fixes from the review are folded into
 the sections below and listed in [Review](#review). [DESIGN.md](DESIGN.md) describes the single node this builds on;
@@ -389,7 +389,7 @@ anti_entropy_interval = "1h" # compare block lists with the other owners
 
 One PR each, as in the [roadmap](ROADMAP.md#v3-clustering):
 
-0. **Single-node groundwork (in progress):** `node.redb` for node-local
+0. **Single-node groundwork (done):** `node.redb` for node-local
    state; version ids and Last-Modified stamped by the writer in commit order;
    exact metadata snapshots and a state digest. These change nothing for
    clients, and on one node they already keep version order right when the

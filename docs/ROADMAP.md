@@ -90,7 +90,7 @@ anything from a 1 KB document to a 100 GB file.
 ## v3: clustering
 Design: [CLUSTERING.md](CLUSTERING.md).
 
-- [ ] Single-node groundwork: node-local state in `node.redb`; version ids and
+- [x] Single-node groundwork: node-local state in `node.redb`; version ids and
   Last-Modified stamped at commit, in commit order; exact metadata snapshots and
   a state digest
 - [ ] Internal API and node identity (port 9002, shared-secret authentication)
