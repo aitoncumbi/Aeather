@@ -90,10 +90,21 @@ anything from a 1 KB document to a 100 GB file.
 ## v3: clustering
 Design: [CLUSTERING.md](CLUSTERING.md).
 
-- [ ] Raft-replicated metadata (openraft) using the existing command model
+- [ ] Single-node groundwork: node-local state in `node.redb`; version ids and
+  Last-Modified stamped at commit, in commit order; exact metadata snapshots and
+  a state digest
+- [ ] Internal API and node identity (port 9002, shared-secret authentication)
+- [ ] Raft-replicated metadata (openraft) using the existing command model: the
+  leader stamps and proposes batches, followers serve linearizable reads, exact
+  snapshots are built by log size
 - [ ] Cluster layout, node join/leave, failure detection
-- [ ] Block replication (3 copies by default) with rendezvous-hash placement
-- [ ] Rebalancing and repair after node loss
+- [ ] Block replication (3 copies, written to at least 2) with rendezvous-hash
+  placement, a persistent repair queue, and staging leases so the orphan sweeper
+  never deletes copies of an upload in progress
+- [ ] Rebalancing that keeps blocks readable across every unsettled layout
+  version; repair from the repair queues, an hourly block-list comparison and the
+  scrubber; an orphan sweeper that waits until its node has caught up
+- [ ] `aether cluster recover`: restart from a survivor after losing a majority
 - [ ] Any node serves any request
 
 ## Later
