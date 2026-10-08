@@ -40,6 +40,7 @@ use crate::meta::{
     UploadRecord, WriteCondition, usage_after,
 };
 pub use crate::meta::{Deleted, VersionRef, Versioning, VersionsPage, VersionsQuery};
+use crate::node::{self, NodeStore};
 
 /// S3's limit for one ListObjects page.
 pub const MAX_LIST_KEYS: usize = 1000;
@@ -109,6 +110,8 @@ impl Default for EngineConfig {
 
 pub struct Engine {
     meta: Arc<MetaStore>,
+    /// This node's own state (`node.redb`); never replicated.
+    node: Arc<NodeStore>,
     writer: writer::Writer,
     blocks: Arc<BlockStore>,
     keys: Arc<KeyCache>,
@@ -139,6 +142,21 @@ pub struct EngineStats {
     pub meta_writes: AtomicU64,
 }
 
+/// Moves node-local values that older versions kept in `meta.redb` into
+/// `node.redb`. Copy first, then remove: after a crash in between, the next
+/// start finds the copy and only removes the original.
+fn move_node_values(meta: &MetaStore, node: &NodeStore) -> Result<()> {
+    for name in node::MOVED_FROM_META {
+        if let Some(value) = meta.legacy_node_value(name)? {
+            if node.get(name)?.is_none() {
+                node.set(name, value)?;
+            }
+            meta.remove_legacy_node_value(name)?;
+        }
+    }
+    Ok(())
+}
+
 fn count(counter: &AtomicU64, n: u64) {
     counter.fetch_add(n, Ordering::Relaxed);
 }
@@ -151,6 +169,13 @@ impl Engine {
         // store clears the staging directory.
         let meta_path = config.data_dir.join("meta.redb");
         let meta = tokio::task::spawn_blocking(move || MetaStore::open(&meta_path)).await??;
+        let node_path = config.data_dir.join("node.redb");
+        let (meta, node) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let node = NodeStore::open(&node_path)?;
+            move_node_values(&meta, &node)?;
+            Ok((meta, node))
+        })
+        .await??;
         let blocks = BlockStore::open(&config.data_dir).await?;
         let missing: Vec<String> = meta
             .sealing_key_ids()?
@@ -171,6 +196,7 @@ impl Engine {
         let engine = Self {
             writer: writer::Writer::start(Arc::clone(&meta), Arc::clone(&stats)),
             meta,
+            node: Arc::new(node),
             blocks: Arc::new(blocks),
             keys: Arc::new(keys),
             stats,
@@ -1066,6 +1092,16 @@ impl Engine {
     /// request could delete the blocks of a committed object.
     async fn commit_staged(&self, staged: StagedObject, command: Command) -> Result<Outcome> {
         self.writer.apply(command, Some(staged)).await
+    }
+
+    async fn node_value(&self, name: &'static str) -> Result<Option<i64>> {
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || node.get(name)).await?
+    }
+
+    async fn set_node_value(&self, name: &'static str, value: i64) -> Result<()> {
+        let node = Arc::clone(&self.node);
+        tokio::task::spawn_blocking(move || node.set(name, value)).await?
     }
 
     async fn read<T, F>(&self, f: F) -> Result<T>

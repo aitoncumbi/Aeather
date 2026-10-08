@@ -970,17 +970,29 @@ impl MetaStore {
         objects.get(raw_key)?.map(|v| codec::decode(v.value())).transpose()
     }
 
-    /// A node-local value in the `system` table. These are not commands: they
-    /// describe this node (e.g. when it last scrubbed), not the shared state.
-    pub fn system_value(&self, name: &str) -> Result<Option<i64>> {
+    /// A node-local value that older versions kept in the `system` table
+    /// (see [`crate::node`]); read once, when it moves to `node.redb`.
+    pub fn legacy_node_value(&self, name: &str) -> Result<Option<i64>> {
         let txn = self.db.begin_read()?;
         let system = txn.open_table(SYSTEM)?;
         system.get(name)?.map(|v| codec::decode(v.value())).transpose()
     }
 
-    pub fn set_system_value(&self, name: &str, value: i64) -> Result<()> {
+    /// Writes a value the way versions before `node.redb` did.
+    #[cfg(test)]
+    pub fn set_legacy_node_value(&self, name: &str, value: i64) -> Result<()> {
         let txn = self.db.begin_write()?;
         txn.open_table(SYSTEM)?.insert(name, codec::encode(&value).as_slice())?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Removes a legacy node-local value once `node.redb` has it. Like the
+    /// schema migrations in [`MetaStore::open`], this runs before any command
+    /// and does the same on every node, so replicas stay identical.
+    pub fn remove_legacy_node_value(&self, name: &str) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.open_table(SYSTEM)?.remove(name)?;
         txn.commit()?;
         Ok(())
     }

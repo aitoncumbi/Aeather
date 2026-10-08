@@ -18,12 +18,12 @@ use uuid::Uuid;
 use super::{Engine, count, now_millis};
 use crate::error::{Error, Result};
 use crate::meta::{BlockRef, Millis};
+use crate::node::LAST_SCRUB;
 
 const BATCH: usize = 256;
 const READ_BUFFER: usize = 1024 * 1024;
 /// Corrupt blocks listed in a report; the counters keep counting past this.
 const MAX_REPORTED: usize = 1000;
-const LAST_SCRUB: &str = "last_scrub_finished";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScrubReport {
@@ -128,7 +128,7 @@ impl Engine {
         report.finished_at = Some(now_millis());
         self.set_scrub_report(report.clone());
         let finished = now_millis();
-        self.read(move |meta| meta.set_system_value(LAST_SCRUB, finished)).await?;
+        self.set_node_value(LAST_SCRUB, finished).await?;
         info!(
             objects = report.objects_checked,
             blocks = report.blocks_checked,
@@ -180,12 +180,12 @@ impl Engine {
 pub(super) async fn run_periodically(engine: Arc<Engine>) {
     let interval = engine.config.scrub_interval;
     loop {
-        let last = match engine.read(|meta| meta.system_value(LAST_SCRUB)).await {
+        let last = match engine.node_value(LAST_SCRUB).await {
             Ok(Some(last)) => last,
             Ok(None) => {
                 // A new data directory: start counting from now.
                 let now = now_millis();
-                if let Err(e) = engine.read(move |meta| meta.set_system_value(LAST_SCRUB, now)).await {
+                if let Err(e) = engine.set_node_value(LAST_SCRUB, now).await {
                     warn!(error = %e, "cannot record scrub time");
                 }
                 now

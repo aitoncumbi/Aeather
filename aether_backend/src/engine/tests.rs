@@ -312,6 +312,26 @@ async fn reopen_keeps_data() {
 }
 
 #[tokio::test]
+async fn node_local_values_move_out_of_the_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta_path = dir.path().join("meta.redb");
+    {
+        let meta = MetaStore::open(&meta_path).unwrap();
+        meta.set_legacy_node_value(node::LAST_SCRUB, 1234).unwrap();
+    }
+    let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
+    {
+        let engine = Engine::open(config.clone()).await.unwrap();
+        assert_eq!(engine.node_value(node::LAST_SCRUB).await.unwrap(), Some(1234));
+        engine.set_node_value(node::LAST_SCRUB, 5678).await.unwrap();
+    }
+    // Gone from meta.redb; reopening keeps the node's own value.
+    assert_eq!(MetaStore::open(&meta_path).unwrap().legacy_node_value(node::LAST_SCRUB).unwrap(), None);
+    let engine = Engine::open(config).await.unwrap();
+    assert_eq!(engine.node_value(node::LAST_SCRUB).await.unwrap(), Some(5678));
+}
+
+#[tokio::test]
 async fn second_process_cannot_open_same_data_dir() {
     let (_engine, dir) = test_engine().await;
     let config = EngineConfig { data_dir: dir.path().to_path_buf(), ..Default::default() };
