@@ -27,7 +27,40 @@ pub struct Config {
     pub log: LogConfig,
     pub encryption: EncryptionConfig,
     pub lifecycle: LifecycleConfig,
+    pub cluster: ClusterConfig,
 }
+
+/// Clustering (v3, being built; see docs/CLUSTERING.md). For now this runs
+/// the internal API that nodes will use to talk to each other.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    /// The internal API: Raft, block transfers and health between nodes.
+    pub listen: SocketAddr,
+    /// Shared by every node; every internal request is signed with it.
+    pub secret: Secret,
+    /// The failure domain (rack, room) this node is in, if any.
+    pub zone: Option<String>,
+    /// PEM certificates that other nodes' TLS certificates must chain to;
+    /// without it, the system's trusted roots.
+    pub ca_file: Option<PathBuf>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: SocketAddr::from(([0, 0, 0, 0], 9002)),
+            secret: Secret::default(),
+            zone: None,
+            ca_file: None,
+        }
+    }
+}
+
+/// Shortest `cluster.secret`: every node can sign requests with it.
+pub const MIN_CLUSTER_SECRET: usize = 32;
 
 /// The background job that applies buckets' lifecycle rules.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -376,6 +409,19 @@ impl Config {
         if [http.header_timeout_secs, http.handshake_timeout_secs, http.body_timeout_secs].contains(&0) {
             return invalid("http timeouts must be positive");
         }
+        let cluster = &self.cluster;
+        if cluster.enabled && cluster.secret.expose().len() < MIN_CLUSTER_SECRET {
+            return invalid(
+                "cluster.secret must have 32+ characters (e.g. `openssl rand -base64 32`) and be the same on every \
+                 node; prefer AETHER_CLUSTER__SECRET",
+            );
+        }
+        let zone_ok = |z: &str| {
+            !z.is_empty() && z.len() <= 64 && z.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        };
+        if cluster.zone.as_deref().is_some_and(|z| !zone_ok(z)) {
+            return invalid("cluster.zone must be 1-64 letters, digits, '-', '_' or '.'");
+        }
         Ok(())
     }
 
@@ -477,6 +523,29 @@ mod tests {
             jail.set_env("AETHER_ENCRYPTION__MASTER_KEY", "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=");
             assert!(Config::load(None).unwrap().encryption.keyring().unwrap().is_some());
             jail.set_env("AETHER_ENCRYPTION__MASTER_KEY", "too-short");
+            assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cluster_needs_a_long_secret_when_enabled() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("AETHER_S3__ACCESS_KEY", "admin");
+            jail.set_env("AETHER_S3__SECRET_KEY", "change-me-please");
+            let config = Config::load(None).unwrap();
+            assert!(!config.cluster.enabled);
+            assert_eq!(config.cluster.listen, "0.0.0.0:9002".parse().unwrap());
+            jail.set_env("AETHER_CLUSTER__ENABLED", "true");
+            assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))));
+            jail.set_env("AETHER_CLUSTER__SECRET", "short");
+            assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))));
+            jail.set_env("AETHER_CLUSTER__SECRET", "a-cluster-secret-of-32-characters!");
+            jail.set_env("AETHER_CLUSTER__ZONE", "rack-1");
+            let config = Config::load(None).unwrap();
+            assert_eq!(config.cluster.zone.as_deref(), Some("rack-1"));
+            assert!(!format!("{config:?}").contains("of-32-characters"));
+            jail.set_env("AETHER_CLUSTER__ZONE", "rack 1");
             assert!(matches!(Config::load(None), Err(ConfigError::Invalid(_))));
             Ok(())
         });

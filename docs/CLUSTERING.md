@@ -1,6 +1,6 @@
 # Clustering design (v3)
 
-**Status: reviewed; step 0 (single-node groundwork) done.** It turns
+**Status: reviewed; steps 0 (single-node groundwork) and 1 (internal API) done.** It turns
 the single node of v1–v2.1 into a cluster of 3 or more nodes that keeps
 working when a node or a disk fails. The fixes from the review are folded into
 the sections below and listed in [Review](#review). [DESIGN.md](DESIGN.md) describes the single node this builds on;
@@ -260,6 +260,7 @@ Changes are commands: `AddNode`, `UpdateNode` and `RemoveNode`.
 aether cluster init                          # on the first node (existing data stays)
 aether cluster join https://node-a:9002      # on each new node; needs cluster.secret
 aether cluster status                        # nodes, roles, health, rebalancing progress
+aether cluster ping http://node-b:9002       # reachable, same secret? (step 1)
 aether cluster remove <node-id>              # drain a node, or forget a dead one
 ```
 
@@ -268,9 +269,17 @@ aether cluster remove <node-id>              # drain a node, or forget a dead on
   address changes.
 - **Internal API:** HTTP/2 on its own port (`cluster.listen`, default 9002).
   It carries Raft RPCs, block put/get/list, read-index requests and health.
-  Every request is authenticated with the shared `cluster.secret` (an HMAC
-  over the request), and uses TLS when `tls.cert_file` is set. A node that
-  does not know the secret cannot join or read blocks.
+  It uses TLS when `tls.cert_file` is set (other nodes trust `cluster.ca_file`
+  or the system roots); without TLS it warns, since traffic is then signed but
+  not encrypted. Every request is signed with a key derived from the shared
+  `cluster.secret`: an HMAC-SHA256 over the method, path and query, the
+  sender's node id, the time, a random nonce and the SHA-256 of the body
+  (headers `x-aether-node`, `-date`, `-nonce`, `-content-sha256`,
+  `-signature`). The receiver refuses a request whose time is more than 5
+  minutes from its own clock, or whose nonce it has already seen, so a
+  captured request is accepted at most once. Unsigned requests get 401 on
+  every path. A node that does not know the secret cannot join or read
+  blocks; the secret proves membership, not which member is speaking.
 - **Joining** adds the node as a learner, waits for it to catch up (snapshot,
   then log), then adds it to the layout. If there are fewer than 3 voters in
   distinct zones, it is promoted. Adding the node changes the layout, which
@@ -348,9 +357,11 @@ today, and clustering stays off.
 
 ```toml
 [cluster]
+enabled = true
 listen = "0.0.0.0:9002"     # internal API
 secret = ""                 # shared by every node; prefer AETHER_CLUSTER__SECRET
 zone = "rack-1"             # optional; copies go to distinct zones first
+ca_file = "/etc/aether/cluster-ca.pem"  # other nodes' TLS certificates chain to these
 capacity = "8TB"            # placement weight; default: the data disk's size
 replicas = 3                # copies of each block
 write_quorum = 2            # copies written before an upload succeeds
@@ -394,8 +405,10 @@ One PR each, as in the [roadmap](ROADMAP.md#v3-clustering):
    exact metadata snapshots and a state digest. These change nothing for
    clients, and on one node they already keep version order right when the
    clock steps back.
-1. **Internal API and node identity:** port 9002, `cluster.secret`
-   authentication, node ids, health.
+1. **Internal API and node identity (done):** port 9002 (HTTP/2, TLS when
+   configured), signed requests with replay protection, node ids in
+   `node.redb` (shown by `aether status`), an authenticated health endpoint,
+   and `aether cluster ping`.
 2. **Raft metadata:** openraft over `raft.redb` and the existing tables;
    the leader stamps and proposes batches; leader forwarding; follower reads;
    `cluster init` / `join`; exact snapshots by log size. Blocks still local,

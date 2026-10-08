@@ -93,7 +93,8 @@ Design: [CLUSTERING.md](CLUSTERING.md).
 - [x] Single-node groundwork: node-local state in `node.redb`; version ids and
   Last-Modified stamped at commit, in commit order; exact metadata snapshots and
   a state digest
-- [ ] Internal API and node identity (port 9002, shared-secret authentication)
+- [x] Internal API and node identity (port 9002, signed requests with replay
+  protection, node ids, `aether cluster ping`)
 - [ ] Raft-replicated metadata (openraft) using the existing command model: the
   leader stamps and proposes batches, followers serve linearizable reads, exact
   snapshots are built by log size

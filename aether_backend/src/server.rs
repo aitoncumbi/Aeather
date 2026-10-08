@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::admin::AdminSettings;
 use crate::auth::{Authorizer, S3Credentials, S3Permissions};
+use crate::cluster::{ClusterKey, ClusterSettings};
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::history::History;
@@ -54,25 +55,35 @@ pub async fn run(config: Config, shutdown: impl Future<Output = ()> + Send + 'st
 
     info!(data_dir = %config.storage.data_dir.display(), region = %config.s3.region, "starting");
     let s3_listener = http::bind(config.s3.listen, "S3 API", tls.is_some()).await?;
-    let s3 = http::serve(s3_listener, routers.s3, tls, limits, shutdown.clone());
+    let mut servers = vec![http::serve(s3_listener, routers.s3, tls.clone(), limits, shutdown.clone()).boxed()];
     if config.admin.enabled {
         if !config.admin.listen.ip().is_loopback() && admin_tls.is_none() {
             warn!("the admin API is reachable from the network without TLS; set tls.admin = true");
         }
         let admin_listener = http::bind(config.admin.listen, "admin API", admin_tls.is_some()).await?;
-        let admin = http::serve(admin_listener, routers.admin, admin_tls, limits, shutdown);
-        tokio::try_join!(s3, admin)?;
-    } else {
-        s3.await?;
+        servers.push(http::serve(admin_listener, routers.admin, admin_tls, limits, shutdown.clone()).boxed());
     }
+    if let Some(cluster) = routers.cluster {
+        if !config.cluster.listen.ip().is_loopback() && tls.is_none() {
+            warn!(
+                "internal API traffic is signed but not encrypted; set tls.cert_file and tls.key_file, or keep \
+                 the nodes on a private network"
+            );
+        }
+        let listener = http::bind(config.cluster.listen, "internal API", tls.is_some()).await?;
+        servers.push(http::serve(listener, cluster, tls, limits, shutdown).boxed());
+    }
+    futures::future::try_join_all(servers).await?;
     info!("shut down");
     Ok(())
 }
 
-/// The two HTTP applications, sharing one engine and one set of identities.
+/// The HTTP applications, sharing one engine and one set of identities.
 pub struct Routers {
     pub s3: Router,
     pub admin: Router,
+    /// The internal API, when `cluster.enabled`.
+    pub cluster: Option<Router>,
     /// Feeds the console's charts once its sampler is spawned.
     pub history: Arc<History>,
 }
@@ -91,9 +102,17 @@ pub fn routers(engine: Arc<Engine>, config: &Config) -> Routers {
         .layer(middleware::from_fn_with_state(observer("s3", "x-amz-request-id"), observe));
     let history = History::new(Arc::clone(&metrics));
     let settings = AdminSettings::from_config(config);
+    let cluster = config.cluster.enabled.then(|| {
+        let settings = ClusterSettings {
+            key: ClusterKey::derive(config.cluster.secret.expose()),
+            zone: config.cluster.zone.clone(),
+        };
+        crate::cluster::api::router(Arc::clone(&engine), settings)
+            .layer(middleware::from_fn_with_state(observer("cluster", "x-request-id"), observe))
+    });
     let admin = crate::admin::router(engine, auth, Arc::clone(&metrics), Arc::clone(&history), settings)
         .layer(middleware::from_fn_with_state(observer("admin", "x-request-id"), observe));
-    Routers { s3, admin, history }
+    Routers { s3, admin, cluster, history }
 }
 
 fn s3_router(engine: Arc<Engine>, auth: Arc<Authorizer>, config: &Config) -> Router {

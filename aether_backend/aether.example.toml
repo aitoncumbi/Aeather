@@ -102,6 +102,23 @@ interval_secs = 3600
 # Seconds in a lifecycle "day". Only change it to test rules quickly.
 day_secs = 86400
 
+[cluster]
+# Clustering is being built (docs/CLUSTERING.md). So far this runs the
+# internal API that nodes use to talk to each other; check that two nodes can
+# reach each other with `aether cluster ping http://other-node:9002`.
+enabled = false
+# The internal API. Other nodes must reach it; nothing else should. It uses
+# TLS when tls.cert_file is set, and warns otherwise.
+listen = "0.0.0.0:9002"
+# Shared by every node (32+ characters, e.g. `openssl rand -base64 32`); every
+# internal request is signed with it. Prefer AETHER_CLUSTER__SECRET.
+# secret = ""
+# This node's failure domain (rack, room), if any.
+# zone = "rack-1"
+# PEM certificates that other nodes' TLS certificates chain to, if not the
+# system's trusted roots.
+# ca_file = "/etc/aether/cluster-ca.pem"
+
 [log]
 # Filter directive; RUST_LOG overrides it. The S3 protocol library's own
 # per-request error logs stay off unless named, e.g. "info,s3s=debug".

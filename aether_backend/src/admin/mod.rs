@@ -251,6 +251,9 @@ pub struct CreateBucketRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StatusView {
     pub version: String,
+    /// This node's identity (kept in `node.redb`).
+    #[serde(default)]
+    pub node_id: uuid::Uuid,
     pub uptime_secs: u64,
     pub buckets: usize,
     pub objects: u64,
@@ -356,6 +359,7 @@ async fn status(State(s): State<AdminState>, headers: HeaderMap) -> ApiResult<Js
     let disk = metrics::disk_space(&config.data_dir).ok();
     Ok(Json(StatusView {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        node_id: s.engine.node_id(),
         uptime_secs: s.started.elapsed().as_secs(),
         buckets: buckets.len(),
         objects: buckets.iter().map(|(_, u)| u.objects).sum(),

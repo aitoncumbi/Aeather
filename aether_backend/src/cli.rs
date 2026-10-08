@@ -14,6 +14,7 @@ use clap::{Args, Subcommand};
 use reqwest::Method;
 use serde_json::{Value, json};
 
+use crate::cluster::{ClusterClient, ClusterKey};
 use crate::config::Config;
 use crate::meta::BucketGrant;
 
@@ -315,6 +316,42 @@ fn http_client(ca_cert: Option<&Path>, accept_invalid_certs: bool) -> anyhow::Re
     Ok(builder.build()?)
 }
 
+/// `aether cluster …`: talks to nodes' internal APIs, signing with the
+/// `cluster.secret` from the config file or environment.
+#[derive(Subcommand)]
+pub enum ClusterCommand {
+    /// Check that a node's internal API answers and shares this cluster.secret
+    Ping {
+        /// The node's internal API, e.g. http://node-b:9002
+        url: String,
+    },
+}
+
+pub async fn cluster(command: ClusterCommand, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let config = Config::load(config_path)?;
+    let secret = config.cluster.secret.expose();
+    if secret.len() < crate::config::MIN_CLUSTER_SECRET {
+        bail!("set cluster.secret (or AETHER_CLUSTER__SECRET) to the cluster's shared secret");
+    }
+    let client = ClusterClient::new(ClusterKey::derive(secret), "cli", config.cluster.ca_file.as_deref())?;
+    match command {
+        ClusterCommand::Ping { url } => {
+            let started = std::time::Instant::now();
+            let health = client.health(&url).await?;
+            let zone = health.zone.as_deref().map(|z| format!(" in zone {z}")).unwrap_or_default();
+            println!(
+                "{url}: node {}{zone}, version {}, {}, up {}s ({:.1} ms)",
+                health.node_id,
+                health.version,
+                if health.ready { "ready" } else { "NOT READY" },
+                health.uptime_secs,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `aether health`: exits successfully when the S3 listener reports ready.
 /// Meant for container health checks, so it trusts any certificate: it
 /// connects to its own server over loopback.
@@ -546,6 +583,7 @@ fn format_bucket(bucket: &Value) -> String {
 fn format_status(status: &Value) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Version:     {}", text(&status["version"]));
+    let _ = writeln!(out, "Node:        {}", text(&status["node_id"]));
     let _ = writeln!(out, "Uptime:      {}s", text(&status["uptime_secs"]));
     let _ = writeln!(out, "Buckets:     {}", text(&status["buckets"]));
     let _ = writeln!(out, "Objects:     {}", text(&status["objects"]));

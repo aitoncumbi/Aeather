@@ -50,7 +50,7 @@ impl RequestFacts {
 
 #[derive(Clone)]
 pub struct Observer {
-    /// `s3` or `admin`: the metrics label and log field.
+    /// `s3`, `admin` or `cluster`: the metrics label and log field.
     pub api: &'static str,
     /// `x-amz-request-id` for S3 (what SDKs report in errors), `x-request-id` otherwise.
     pub id_header: HeaderName,
@@ -130,7 +130,10 @@ async fn add_request_id_to_error(response: Response, id: &str) -> Response {
 /// signature failures) and for admin API requests. Labels must come from a
 /// small set: arbitrary paths would grow the metrics without bound.
 fn default_operation(api: &str, path: &str, method: &str) -> String {
-    if path.starts_with("/_aether/") || path == "/metrics" {
+    if api == "cluster" {
+        // Its handlers record their own; anything else is not a route.
+        "other".into()
+    } else if path.starts_with("/_aether/") || path == "/metrics" {
         "internal".into()
     } else if api == "s3" {
         "unauthenticated".into()
@@ -165,5 +168,6 @@ mod tests {
         assert_eq!(default_operation("s3", "/_aether/health/ready", "GET"), "internal");
         assert_eq!(default_operation("s3", "/bucket/key", "GET"), "unauthenticated");
         assert_eq!(default_operation("admin", "/_next/static/chunks/x.js", "GET"), "console");
+        assert_eq!(default_operation("cluster", "/internal/v1/anything/at/all", "GET"), "other");
     }
 }

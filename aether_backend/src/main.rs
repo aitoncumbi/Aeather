@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use aether_backend::cli::{self, BucketCommand, ClientArgs, KeyCommand};
+use aether_backend::cli::{self, BucketCommand, ClientArgs, ClusterCommand, KeyCommand};
 use aether_backend::config::Config;
 use aether_backend::{logger, server};
 use clap::{Parser, Subcommand};
@@ -54,6 +54,11 @@ enum Command {
         #[command(flatten)]
         client: ClientArgs,
     },
+    /// Talk to other nodes' internal APIs (clustering, in progress)
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
     /// Exit successfully if the server is ready (for container health checks)
     Health {
         /// S3 endpoint [default: from s3.listen in the config file]
@@ -73,6 +78,15 @@ async fn main() -> ExitCode {
         Some(Command::Status { client }) => (cli::Request::Status, client),
         Some(Command::Scrub { client }) => (cli::Request::Scrub, client),
         Some(Command::Backup { dir, client }) => (cli::Request::Backup(dir), client),
+        Some(Command::Cluster { command }) => {
+            return match cli::cluster(command, config_path).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("aether: {e:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Some(Command::Health { url }) => {
             return match cli::health(url.as_deref(), config_path).await {
                 Ok(()) => ExitCode::SUCCESS,

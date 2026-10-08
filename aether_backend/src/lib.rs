@@ -4,6 +4,7 @@ pub mod admin;
 pub mod auth;
 pub mod blocks;
 pub mod cli;
+pub mod cluster;
 pub mod config;
 pub mod crypto;
 pub mod engine;

@@ -33,7 +33,7 @@ memchr = "2"
 prometheus-client = "0.25"
 redb = "4"
 ring = "0.17"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
 rmp-serde = "1"
 rustix = { version = "1", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

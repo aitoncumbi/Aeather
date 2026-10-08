@@ -115,7 +115,7 @@ neither has a private backdoor.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /api/v1/status` | Version, uptime, counts, disk, storage settings, GC queue, scrub report, the S3 endpoint |
+| `GET /api/v1/status` | Version, node id, uptime, counts, disk, storage settings, GC queue, scrub report, the S3 endpoint |
 | `GET /api/v1/stats?range=1h\|24h\|7d` | Request rates by kind, latency percentiles, bandwidth, errors and object counts over time |
 | `POST /api/v1/scrub` | Start a scrub now (`409` while one runs) |
 | `POST /api/v1/backup` | Back the node up to a directory on the server: `{"dir": "/abs/path"}`. Answers when done |

@@ -142,6 +142,7 @@ pub struct Engine {
     meta: Arc<MetaStore>,
     /// This node's own state (`node.redb`); never replicated.
     node: Arc<NodeStore>,
+    node_id: Uuid,
     writer: writer::Writer,
     blocks: Arc<BlockStore>,
     keys: Arc<KeyCache>,
@@ -200,10 +201,11 @@ impl Engine {
         let meta_path = config.data_dir.join("meta.redb");
         let meta = tokio::task::spawn_blocking(move || MetaStore::open(&meta_path)).await??;
         let node_path = config.data_dir.join("node.redb");
-        let (meta, node) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (meta, node, node_id) = tokio::task::spawn_blocking(move || -> Result<_> {
             let node = NodeStore::open(&node_path)?;
             move_node_values(&meta, &node)?;
-            Ok((meta, node))
+            let node_id = node.node_id()?;
+            Ok((meta, node, node_id))
         })
         .await??;
         let blocks = BlockStore::open(&config.data_dir).await?;
@@ -232,6 +234,7 @@ impl Engine {
             ),
             meta,
             node: Arc::new(node),
+            node_id,
             blocks: Arc::new(blocks),
             keys: Arc::new(keys),
             stats,
@@ -244,6 +247,11 @@ impl Engine {
             tracing::info!(keys = sealed, "sealed access key secrets under the current master key");
         }
         Ok(engine)
+    }
+
+    /// This node's identity (see [`NodeStore::node_id`]).
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
     }
 
     pub fn config(&self) -> &EngineConfig {
