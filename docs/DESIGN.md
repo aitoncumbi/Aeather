@@ -605,13 +605,9 @@ SSE-S3: with `encryption.master_key` set, every new object is encrypted.
 
 ### Clustering (v3)
 
-- **Metadata.** The redb tables become the state machine of a Raft group
-  (openraft). Gateways submit `meta::Command`s to the leader. If one group becomes
-  the bottleneck, metadata is later sharded by bucket.
-- **Blocks.** Placed on nodes by rendezvous hashing of the block id over the cluster
-  layout, replicated 3 ways by default. Layout changes trigger rebalancing. Erasure
-  coding comes later to reduce storage overhead.
-- **Gateways** stay stateless, so any node can serve any request.
+Proposed in [CLUSTERING.md](CLUSTERING.md): metadata replicated with Raft
+(openraft) over the existing tables and commands, blocks stored on 3 nodes
+chosen by rendezvous hashing, and any node serving any request.
 
 ## Configuration
 
