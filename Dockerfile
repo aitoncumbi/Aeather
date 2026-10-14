@@ -17,7 +17,7 @@ RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY console/ ./
 RUN npm run build
 
-FROM rust:1.98-slim-bookworm AS build
+FROM rust:1.99-slim-bookworm AS build
 WORKDIR /src
 COPY aether_backend/ ./
 COPY --from=console /console/out /console
