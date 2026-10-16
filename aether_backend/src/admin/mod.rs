@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -140,6 +140,7 @@ pub fn router(
         .route("/buckets/{name}/uploads/{upload_id}", delete(objects::abort_upload))
         .route("/buckets/{name}/uploads/{upload_id}/parts/{part}", put(objects::upload_part))
         .route("/buckets/{name}/uploads/{upload_id}/complete", post(objects::complete_upload))
+        .layer(DefaultBodyLimit::disable())
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         // Without credentials:
         .route("/health", get(health))
