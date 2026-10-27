@@ -60,10 +60,19 @@ export function upload(bucket: string, key: string, file: File, onProgress: (p: 
   let uploadId: string | null = null;
   const contentType = file.type || "application/octet-stream";
 
+  let lastReport = 0;
+  const reportProgress = (p: Progress) => {
+    const now = Date.now();
+    if (p.sent === p.total || now - lastReport > 100) {
+      lastReport = now;
+      onProgress(p);
+    }
+  };
+
   const done = (async () => {
     if (file.size <= SINGLE_LIMIT) {
-      await put(`/api/v1${paths.object(bucket, key)}`, file, contentType, (loaded) => onProgress({ sent: loaded || file.size, total: file.size }), xhrs);
-      onProgress({ sent: file.size, total: file.size });
+      await put(`/api/v1${paths.object(bucket, key)}`, file, contentType, (loaded) => reportProgress({ sent: loaded || file.size, total: file.size }), xhrs);
+      reportProgress({ sent: file.size, total: file.size });
       return;
     }
 
@@ -84,7 +93,7 @@ export function upload(bucket: string, key: string, file: File, onProgress: (p: 
     const report = () => {
       let sent = finishedBytes;
       for (const loaded of inFlight.values()) sent += loaded;
-      onProgress({ sent, total: file.size, part: { done: finished, count } });
+      reportProgress({ sent, total: file.size, part: { done: finished, count } });
     };
 
     let next = 0;
