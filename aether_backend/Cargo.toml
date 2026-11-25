@@ -30,8 +30,8 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["server-auto", "server-graceful", "service", "tokio", "http1", "http2"] }
 md-5 = "0.11"
 memchr = "2"
-prometheus-client = "0.25"
-redb = "4"
+prometheus-client = "0.26"
+redb = "5"
 ring = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rmp-serde = "1"
